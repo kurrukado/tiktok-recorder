@@ -1,0 +1,28 @@
+﻿# Private Credentials
+config.json
+cookies.json
+
+# Large media & binaries
+*.mp4
+*.mkv
+*.flv
+*.ts
+*.part
+*.exe
+ffmpeg.exe
+
+# Cache & system
+__pycache__/
+*.pyc
+*.log
+.tempmediaStorage/
+*.png
+
+# Subfolders
+_tiktok_recorder/
+github_recorder/
+gradio_space/
+huggingface_space/
+islizanx/
+itsme_kate0110/
+urielhui38/

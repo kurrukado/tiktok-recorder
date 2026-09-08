@@ -1,0 +1,3 @@
+TikTokLive>=7.0.0
+curl_cffi>=0.16.0
+requests>=2.31.0
