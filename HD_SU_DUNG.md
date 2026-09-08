@@ -119,14 +119,35 @@ python api_server.py
 | `DELETE` | `/api/users/{username}` | Xóa streamer khỏi danh sách |
 | `GET` | `/api/stream/{username}` | Lấy link stream CDN trực tiếp để tải/xem tốc độ cao |
 | `POST` | `/api/record/start` | Kích hoạt bắt đầu ghi hình ngay lập tức |
-| `GET` | `/api/recordings` | Lấy danh sách toàn bộ file video đã quay |
+| `GET` | `/api/recordings` | Lấy danh sách toàn bộ file video đã quay (kèm thời lượng, dung lượng, link thumbnail) |
+| `GET` | `/api/thumbnail/{user}/{filename}` | **Lấy ảnh xem trước (Thumbnail)** tự động cắt từ chính giữa video (50% thời lượng) |
 | `GET` | `/api/download/{user}/{filename}` | Tải file video về máy (Hỗ trợ IDM, đa luồng) |
 
 ---
 
 ### Code mẫu JavaScript để nhúng vào Website của bạn:
 
-#### 1. Thêm streamer mới:
+#### 1. Hiển thị danh sách video kèm ảnh xem trước (Thumbnail):
+```javascript
+async function loadVideoCards() {
+  const res = await fetch('http://localhost:8000/api/recordings');
+  const data = await res.json();
+  
+  const container = document.getElementById('video-list');
+  data.recordings.forEach(vid => {
+    container.innerHTML += `
+      <div class="video-card">
+        <!-- Ảnh xem trước tự động cắt từ giữa video -->
+        <img src="http://localhost:8000${vid.thumbnail_url}" style="width: 250px; border-radius: 8px;" />
+        <p><b>${vid.user}</b> - Thời lượng: ${vid.duration_formatted} (${vid.size_mb} MB)</p>
+        <a href="http://localhost:8000${vid.download_url}" download>Tải xuống</a>
+      </div>
+    `;
+  });
+}
+```
+
+#### 2. Thêm streamer mới:
 ```javascript
 async function addStreamer(username) {
   const res = await fetch('http://localhost:8000/api/users', {
@@ -139,7 +160,7 @@ async function addStreamer(username) {
 }
 ```
 
-#### 2. Lấy link CDN tải tốc độ cao:
+#### 3. Lấy link CDN tải tốc độ cao:
 ```javascript
 async function getHighSpeedDownload(username) {
   const res = await fetch(`http://localhost:8000/api/stream/${username}`);

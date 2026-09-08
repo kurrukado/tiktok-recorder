@@ -116,12 +116,12 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
     except Exception:
         pass
 
-    # Initiate Resumable Upload Session
     init_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable"
+    mime_type = "image/jpeg" if file_name.lower().endswith((".jpg", ".jpeg")) else "video/mp4"
     init_headers = {
         "Authorization": f"Bearer {access_token}",
         "Content-Type": "application/json",
-        "X-Upload-Content-Type": "video/mp4",
+        "X-Upload-Content-Type": mime_type,
         "X-Upload-Content-Length": str(file_size)
     }
     meta = {

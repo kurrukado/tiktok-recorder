@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import json
 import time
@@ -137,20 +137,37 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                         if output_file and os.path.exists(output_file):
                             log(f"[✓] Ghi hình hoàn tất: {os.path.basename(output_file)}")
 
+                            # Tự động cắt ảnh xem trước (thumbnail) từ giữa video
+                            thumb_file = None
+                            try:
+                                from api_server import extract_middle_thumbnail
+                                thumb_file = extract_middle_thumbnail(output_file)
+                                if thumb_file and os.path.exists(thumb_file):
+                                    log(f"[✓] Đã tạo ảnh xem trước (thumbnail): {os.path.basename(thumb_file)}")
+                            except Exception as th_err:
+                                log(f"[!] Không thể tạo thumbnail: {th_err}")
+
                             # Tự động tải lên Google Drive
                             try:
-                                log(f"[*] Đang tải video lên Google Drive (tiktok-record/{user}/)...")
+                                log(f"[*] Đang tải video & ảnh xem trước lên Google Drive (tiktok-record/{user}/)...")
                                 tok = gdrive_manager.get_access_token()
                                 if tok:
                                     r_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
                                     s_id = gdrive_manager.find_or_create_folder(user, parent_id=r_id, access_token=tok)
                                     ok = gdrive_manager.upload_file_to_drive(output_file, s_id, access_token=tok)
                                     if ok:
-                                        log(f"[✓] Đã lưu thành công lên Google Drive: {os.path.basename(output_file)}")
-                                        # Xóa ngay file tạm để tránh tràn đĩa GitHub Runner
+                                        log(f"[✓] Đã lưu video thành công lên Google Drive: {os.path.basename(output_file)}")
                                         try:
                                             os.remove(output_file)
-                                            log(f"🗑️ Đã xóa file tạm để giải phóng ổ cứng.")
+                                            log(f"🗑️ Đã xóa file video tạm để giải phóng ổ cứng.")
+                                        except Exception:
+                                            pass
+
+                                    # Tải tiếp thumbnail lên Google Drive
+                                    if thumb_file and os.path.exists(thumb_file):
+                                        gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
+                                        try:
+                                            os.remove(thumb_file)
                                         except Exception:
                                             pass
                             except Exception as up_err:
