@@ -64,45 +64,70 @@ def get_video_codec(filepath):
 
 def ensure_h264(filepath):
     """
-    Ensures the video is encoded in H.264.
-    If it's already H.264, does nothing.
-    If it's HEVC or another format, converts it to H.264 in-place with GPU acceleration.
+    Ensures the video is encoded in standard H.264 (AVC) and finalized for mobile devices.
+    1. Fixes the '0:00' duration bug by rebuilding the moov atom at file start (+faststart).
+    2. Rebuilds frame index sample table (stco/stsz) to eliminate phone decoding stuttering.
+    3. If non-H.264 (HEVC/H.265), re-encodes with GPU/CPU to standard H.264.
     """
     if not os.path.exists(filepath):
         return filepath
 
+    filename = os.path.basename(filepath)
     codec = get_video_codec(filepath)
+    temp_out = filepath + ".fixed.tmp.mp4"
+
+    # Case 1: Video is already H.264 -> Fast remux with +faststart (instant, 0.5s)
     if codec == "h264":
+        cmd = [
+            FFMPEG_PATH, "-y",
+            "-fflags", "+genpts",
+            "-i", filepath,
+            "-c:v", "copy",
+            "-c:a", "copy",
+            "-movflags", "+faststart",
+            temp_out
+        ]
+        try:
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            if proc.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 1024:
+                os.remove(filepath)
+                os.rename(temp_out, filepath)
+                print(f"  [✓] Đã tối ưu MP4 (+faststart): Hiển thị chuẩn thời lượng & mượt mà trên iPhone/Android.")
+                return filepath
+        except Exception as e:
+            print(f"  [!] Lỗi khi remux +faststart: {e}")
+        if os.path.exists(temp_out):
+            try:
+                os.remove(temp_out)
+            except Exception:
+                pass
         return filepath
 
-    filename = os.path.basename(filepath)
+    # Case 2: Video is HEVC/H.265 or other -> Full transcode to H.264
     encoder = get_best_h264_encoder()
     enc_desc = "GPU NVIDIA NVENC" if encoder == "h264_nvenc" else f"bộ mã hóa {encoder}"
     print(f"[*] Chuyển đổi định dạng ({codec.upper()} ➔ H.264) bằng {enc_desc}: {filename}...")
 
-    temp_out = filepath + ".h264.tmp.mp4"
-    
-    # Build encoder arguments
     cmd = [FFMPEG_PATH, "-y", "-i", filepath]
     if encoder == "h264_nvenc":
-        cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22"])
+        cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22", "-pix_fmt", "yuv420p"])
     elif encoder == "libx264":
-        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "22"])
+        cmd.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "22", "-pix_fmt", "yuv420p"])
     else:
-        cmd.extend(["-c:v", encoder, "-b:v", "2500k"])
+        cmd.extend(["-c:v", encoder, "-b:v", "2500k", "-pix_fmt", "yuv420p"])
 
     cmd.extend(["-c:a", "copy", "-movflags", "+faststart", temp_out])
 
     start_t = time.time()
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
         if proc.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 1024:
             if os.path.exists(filepath):
                 os.remove(filepath)
             os.rename(temp_out, filepath)
             elapsed = time.time() - start_t
             final_mb = os.path.getsize(filepath) / (1024 * 1024)
-            print(f"  [✓] Đã chuyển đổi thành công sang H.264 ({final_mb:.2f} MB, {elapsed:.1f}s)")
+            print(f"  [✓] Đã chuyển đổi thành công sang H.264 (+faststart) ({final_mb:.2f} MB, {elapsed:.1f}s)")
             return filepath
         else:
             if os.path.exists(temp_out):
