@@ -99,7 +99,12 @@ def extract_middle_thumbnail(video_path, output_thumb=None):
         return output_thumb
 
     duration = get_video_duration(video_path)
-    seek_time = (duration / 2.0) if duration and duration > 2 else 5.0
+    if duration and duration > 2:
+        seek_time = duration / 2.0
+    elif duration and duration > 0.5:
+        seek_time = duration / 2.0
+    else:
+        seek_time = 1.0
 
     mins, secs = divmod(seek_time, 60)
     hours, mins = divmod(mins, 60)
@@ -119,6 +124,22 @@ def extract_middle_thumbnail(video_path, output_thumb=None):
             return output_thumb
     except Exception as e:
         print(f"[!] Lỗi khi cắt thumbnail: {e}")
+
+    # Dự phòng: Cắt frame ngay đầu video nếu vị trí giữa video không thành công
+    try:
+        cmd_fallback = [
+            FFMPEG_PATH, "-y",
+            "-ss", "00:00:00.500",
+            "-i", video_path,
+            "-vframes", "1",
+            "-q:v", "2",
+            output_thumb
+        ]
+        proc = subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        if proc.returncode == 0 and os.path.exists(output_thumb) and os.path.getsize(output_thumb) > 500:
+            return output_thumb
+    except Exception:
+        pass
 
     return None
 

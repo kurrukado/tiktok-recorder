@@ -2,7 +2,7 @@ name: TikTok 24-7 Auto Recorder
 
 on:
   schedule:
-    - cron: '0 */4 * * *'
+    - cron: '*/30 * * * *'
   workflow_dispatch:
 
 concurrency:
@@ -42,6 +42,8 @@ jobs:
           GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
           TIKTOK_SESSION_ID: ${{ secrets.TIKTOK_SESSION_ID }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           python -c "
           import os, json
@@ -73,14 +75,18 @@ jobs:
           "
 
       - name: Run TikTok 24-7 Recorder
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: |
           python -u cloud_daemon.py --duration-minutes 230 --interval 20
 
       - name: Trigger Next Run (Continuous 24-7 Loop)
         if: always()
         run: |
+          TOKEN="${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}"
           curl -X POST \
             -H "Accept: application/vnd.github+v3+json" \
-            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Authorization: Bearer $TOKEN" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/recorder.yml/dispatches \
             -d '{"ref":"main"}' || true

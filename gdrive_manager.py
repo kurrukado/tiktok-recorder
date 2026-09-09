@@ -2,6 +2,7 @@ import os
 import sys
 import json
 import time
+import threading
 import requests
 
 if sys.platform == "win32":
@@ -17,6 +18,11 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
+_CACHED_ACCESS_TOKEN = {"token": None, "expires_at": 0}
+_TOKEN_LOCK = threading.Lock()
+_FOLDER_CACHE = {}
+_FOLDER_CACHE_LOCK = threading.Lock()
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -26,33 +32,49 @@ def load_config():
             pass
     return {}
 
-def get_access_token():
-    cfg = load_config()
-    refresh_token = os.environ.get("GDRIVE_REFRESH_TOKEN") or cfg.get("gdrive_refresh_token")
-    if not refresh_token:
+def get_access_token(force_refresh=False):
+    global _CACHED_ACCESS_TOKEN
+    now = time.time()
+    with _TOKEN_LOCK:
+        if not force_refresh and _CACHED_ACCESS_TOKEN["token"] and now < _CACHED_ACCESS_TOKEN["expires_at"]:
+            return _CACHED_ACCESS_TOKEN["token"]
+
+        cfg = load_config()
+        refresh_token = os.environ.get("GDRIVE_REFRESH_TOKEN") or cfg.get("gdrive_refresh_token")
+        if not refresh_token:
+            return None
+
+        client_id = os.environ.get("GOOGLE_CLIENT_ID") or cfg.get("google_client_id") or CLIENT_ID
+        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET") or cfg.get("google_client_secret") or CLIENT_SECRET
+
+        url = "https://oauth2.googleapis.com/token"
+        data = {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token"
+        }
+        try:
+            res = requests.post(url, data=data, timeout=15)
+            if res.status_code == 200:
+                res_data = res.json()
+                token = res_data.get("access_token")
+                expires_in = res_data.get("expires_in", 3600)
+                _CACHED_ACCESS_TOKEN["token"] = token
+                _CACHED_ACCESS_TOKEN["expires_at"] = now + max(expires_in - 120, 60)
+                return token
+            else:
+                print(f"[!] Lỗi khi lấy Access Token từ Google: {res.text}")
+        except Exception as e:
+            print(f"[!] Lỗi kết nối Google OAuth: {e}")
         return None
 
-    client_id = os.environ.get("GOOGLE_CLIENT_ID") or cfg.get("google_client_id") or CLIENT_ID
-    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET") or cfg.get("google_client_secret") or CLIENT_SECRET
-
-    url = "https://oauth2.googleapis.com/token"
-    data = {
-        "client_id": client_id,
-        "client_secret": client_secret,
-        "refresh_token": refresh_token,
-        "grant_type": "refresh_token"
-    }
-    try:
-        res = requests.post(url, data=data, timeout=15)
-        if res.status_code == 200:
-            return res.json().get("access_token")
-        else:
-            print(f"[!] Lỗi khi lấy Access Token từ Google: {res.text}")
-    except Exception as e:
-        print(f"[!] Lỗi kết nối Google OAuth: {e}")
-    return None
-
 def find_or_create_folder(folder_name, parent_id=None, access_token=None):
+    cache_key = (folder_name, parent_id)
+    with _FOLDER_CACHE_LOCK:
+        if cache_key in _FOLDER_CACHE:
+            return _FOLDER_CACHE[cache_key]
+
     if not access_token:
         access_token = get_access_token()
     if not access_token:
@@ -70,7 +92,10 @@ def find_or_create_folder(folder_name, parent_id=None, access_token=None):
     if res.status_code == 200:
         files = res.json().get("files", [])
         if files:
-            return files[0]["id"]
+            fid = files[0]["id"]
+            with _FOLDER_CACHE_LOCK:
+                _FOLDER_CACHE[cache_key] = fid
+            return fid
 
     # Create folder if not found
     meta = {
@@ -87,7 +112,10 @@ def find_or_create_folder(folder_name, parent_id=None, access_token=None):
         timeout=15
     )
     if create_res.status_code in [200, 201]:
-        return create_res.json()["id"]
+        fid = create_res.json()["id"]
+        with _FOLDER_CACHE_LOCK:
+            _FOLDER_CACHE[cache_key] = fid
+        return fid
     else:
         raise RuntimeError(f"Không thể tạo folder '{folder_name}' trên Drive: {create_res.text}")
 
