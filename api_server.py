@@ -6,13 +6,14 @@ import shutil
 import threading
 import subprocess
 import re
+import requests
 import concurrent.futures
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response, RedirectResponse
 
 if sys.platform == "win32":
     try:
@@ -475,8 +476,80 @@ def stop_record(req: AddUserRequest):
         "username": user
     }
 
+def list_recordings_from_drive(access_token=None):
+    """
+    Quét danh sách toàn bộ video và thumbnail đã lưu trên Google Drive.
+    """
+    recordings = []
+    try:
+        if not access_token:
+            access_token = gdrive_manager.get_access_token()
+        if not access_token:
+            return recordings
+            
+        root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=access_token)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        
+        q_folders = f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        res_f = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_folders, "fields": "files(id,name)"}, timeout=10)
+        folders = res_f.json().get("files", [])
+        
+        for fold in folders:
+            uname = fold["name"]
+            fid = fold["id"]
+            q_files = f"'{fid}' in parents and trashed = false"
+            res_files = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_files, "fields": "files(id,name,mimeType,size,createdTime)"}, timeout=10)
+            files = res_files.json().get("files", [])
+            thumbs = {f["name"]: f["id"] for f in files if f["name"].endswith(".jpg")}
+            
+            for f in files:
+                fname = f["name"]
+                if fname.endswith(".mp4"):
+                    base_name = fname.replace(".mp4", "")
+                    thumb_name = base_name + ".jpg"
+                    thumb_id = thumbs.get(thumb_name)
+                    
+                    # Parse ngày giờ trước khi bắt đầu bấm máy quay từ tên file {user}_{YYYY-MM-DD}_{HH-MM-SS}
+                    recorded_at = None
+                    date_match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", fname)
+                    if date_match:
+                        d_str, t_str = date_match.groups()
+                        recorded_at = f"{d_str} {t_str.replace('-', ':')}"
+                    else:
+                        recorded_at = f.get("createdTime", "")
+                        
+                    sz_bytes = int(f.get("size", 0))
+                    recordings.append({
+                        "filename": fname,
+                        "user": uname,
+                        "size_bytes": sz_bytes,
+                        "size_mb": round(sz_bytes / (1024 * 1024), 2),
+                        "recorded_at": recorded_at,
+                        "created_at": f.get("createdTime"),
+                        "thumbnail_url": f"/api/thumbnail/{uname}/{fname}",
+                        "download_url": f"/api/download/{uname}/{fname}",
+                        "drive_file_id": f["id"],
+                        "drive_thumb_id": thumb_id,
+                        "source": "google_drive"
+                    })
+    except Exception as e:
+        print(f"[!] Lỗi lấy danh sách video từ Google Drive: {e}")
+    return recordings
+
 @app.get("/api/recordings")
 def list_recordings():
+    """
+    Trả về danh sách toàn bộ video đã ghi hình (từ cả Google Drive và ổ đĩa máy tính).
+    Bao gồm: Ngày giờ bắt đầu quay (recorded_at), dung lượng, link ảnh thumbnail ở giữa video (50%).
+    """
+    merged_files = {}
+
+    # 1. Lấy từ Google Drive (nơi Bot 24/7 tải video lên)
+    drive_recordings = list_recordings_from_drive()
+    for item in drive_recordings:
+        merged_files[item["filename"]] = item
+
+    # 2. Lấy từ ổ đĩa máy tính (nếu có)
     users_set = set()
     try:
         drive_users = gdrive_manager.load_streamers_from_drive()
@@ -490,10 +563,8 @@ def list_recordings():
         item_path = os.path.join(BASE_DIR, item)
         if os.path.isdir(item_path) and not item.startswith((".", "_")):
             users_set.add(item)
-    users = list(users_set)
 
-    files_list = []
-    for u in users:
+    for u in users_set:
         u_dir = os.path.join(BASE_DIR, u)
         if os.path.exists(u_dir):
             for f in os.listdir(u_dir):
@@ -503,30 +574,38 @@ def list_recordings():
                     dur = get_video_duration(fp)
                     dur_fmt = f"{int(dur//60):02d}:{int(dur%60):02d}" if dur else "00:00"
                     
-                    # Check or generate thumbnail
-                    thumb_name = os.path.splitext(f)[0] + ".jpg"
-                    thumb_path = os.path.join(u_dir, thumb_name)
-                    has_thumb = os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 500
+                    # Parse recorded_at từ tên file
+                    recorded_at = None
+                    date_match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", f)
+                    if date_match:
+                        d_str, t_str = date_match.groups()
+                        recorded_at = f"{d_str} {t_str.replace('-', ':')}"
+                    else:
+                        recorded_at = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
 
-                    files_list.append({
+                    merged_files[f] = {
                         "filename": f,
                         "user": u,
                         "size_bytes": st.st_size,
                         "size_mb": round(st.st_size / (1024 * 1024), 2),
                         "duration_seconds": dur,
                         "duration_formatted": dur_fmt,
+                        "recorded_at": recorded_at,
                         "created_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
                         "thumbnail_url": f"/api/thumbnail/{u}/{f}",
-                        "download_url": f"/api/download/{u}/{f}"
-                    })
-    files_list.sort(key=lambda x: x["created_at"], reverse=True)
+                        "download_url": f"/api/download/{u}/{f}",
+                        "source": "local"
+                    }
+
+    files_list = list(merged_files.values())
+    files_list.sort(key=lambda x: x.get("recorded_at") or x.get("created_at") or "", reverse=True)
     return {"total_files": len(files_list), "recordings": files_list}
 
 @app.get("/api/thumbnail/{user}/{filename}")
 def get_thumbnail(user: str, filename: str):
     """
     Trả về ảnh xem trước được cắt từ chính giữa video (50% thời lượng).
-    Nếu ảnh chưa có sẵn, hệ thống sẽ tự động cắt trong 0.1s và lưu cache.
+    Hỗ trợ đọc từ cả ổ đĩa local và Google Drive.
     """
     user = user.strip().replace("@", "").lower()
     clean_name = filename.replace(".jpg", "").replace(".mp4", "")
@@ -534,15 +613,46 @@ def get_thumbnail(user: str, filename: str):
     video_path = os.path.join(BASE_DIR, user, clean_name + ".mp4")
     thumb_path = os.path.join(BASE_DIR, user, clean_name + ".jpg")
 
-    # Nếu thumbnail đã có sẵn
+    # 1. Nếu thumbnail đã có sẵn dưới máy local
     if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 500:
         return FileResponse(path=thumb_path, media_type="image/jpeg", filename=clean_name + ".jpg")
 
-    # Nếu chưa có nhưng video tồn tại -> Cắt thumbnail ngay lập tức từ giữa video
+    # 2. Nếu chưa có nhưng video local tồn tại -> Cắt thumbnail ngay lập tức từ giữa video
     if os.path.exists(video_path):
         out = extract_middle_thumbnail(video_path, thumb_path)
         if out and os.path.exists(out):
             return FileResponse(path=out, media_type="image/jpeg", filename=clean_name + ".jpg")
+
+    # 3. Tìm thumbnail hoặc video trên Google Drive
+    try:
+        tok = gdrive_manager.get_access_token()
+        if tok:
+            root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
+            user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
+            headers = {"Authorization": f"Bearer {tok}"}
+            
+            # Tìm ảnh .jpg trước
+            q_thumb = f"name = '{clean_name}.jpg' and '{user_fid}' in parents and trashed = false"
+            res_th = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_thumb, "fields": "files(id)"}, timeout=10)
+            th_files = res_th.json().get("files", [])
+            if th_files:
+                img_id = th_files[0]["id"]
+                img_res = requests.get(f"https://www.googleapis.com/drive/v3/files/{img_id}?alt=media", headers=headers, timeout=15)
+                if img_res.status_code == 200:
+                    return Response(content=img_res.content, media_type="image/jpeg")
+
+            # Nếu chưa có ảnh .jpg riêng, tìm file .mp4 để lấy thumbnail tích hợp sẵn của Google Drive
+            q_vid = f"name = '{clean_name}.mp4' and '{user_fid}' in parents and trashed = false"
+            res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,thumbnailLink)"}, timeout=10)
+            vid_files = res_vid.json().get("files", [])
+            if vid_files:
+                vid_id = vid_files[0]["id"]
+                thumb_link = vid_files[0].get("thumbnailLink")
+                if thumb_link:
+                    return RedirectResponse(url=thumb_link, status_code=302)
+                return RedirectResponse(url=f"https://drive.google.com/thumbnail?id={vid_id}&sz=w800", status_code=302)
+    except Exception as e:
+        print(f"[!] Lỗi tải thumbnail từ Google Drive: {e}")
 
     raise HTTPException(status_code=404, detail="Không tìm thấy video hoặc không thể tạo ảnh xem trước")
 
@@ -550,15 +660,26 @@ def get_thumbnail(user: str, filename: str):
 def download_video(user: str, filename: str):
     user = user.strip().replace("@", "").lower()
     fp = os.path.join(BASE_DIR, user, filename)
-    if not os.path.exists(fp):
-        raise HTTPException(status_code=404, detail="File video không tồn tại")
+    if os.path.exists(fp):
+        return FileResponse(path=fp, media_type="video/mp4", filename=filename)
     
-    # High-speed streaming response with accept-ranges
-    return FileResponse(
-        path=fp,
-        media_type="video/mp4",
-        filename=filename
-    )
+    # Tìm kiếm trên Google Drive và redirect trực tiếp đến link tải tốc độ cao
+    try:
+        tok = gdrive_manager.get_access_token()
+        if tok:
+            root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
+            user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
+            headers = {"Authorization": f"Bearer {tok}"}
+            q_vid = f"name = '{filename}' and '{user_fid}' in parents and trashed = false"
+            res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,webContentLink)"}, timeout=10)
+            vid_files = res_vid.json().get("files", [])
+            if vid_files:
+                file_id = vid_files[0]["id"]
+                return RedirectResponse(url=f"https://drive.google.com/uc?export=download&id={file_id}", status_code=302)
+    except Exception as e:
+        print(f"[!] Lỗi tìm video trên Google Drive: {e}")
+
+    raise HTTPException(status_code=404, detail="File video không tồn tại")
 
 @app.post("/api/gdrive/sync")
 def trigger_gdrive_sync(bg_tasks: BackgroundTasks):
