@@ -98,9 +98,10 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True):
     """
     log(f"🎬 [Luồng mới] Bắt đầu phiên ghi hình cho @{user} (Hỗ trợ tối đa {MAX_CONCURRENT_RECORDERS} streamer cùng lúc)...")
     
-    # Cập nhật trạng thái đang quay lên Google Drive
+    # Cập nhật trạng thái đang quay và tạo ngay thư mục trên Google Drive
     try:
         gdrive_manager.set_user_recording_status_drive(user, True)
+        gdrive_manager.create_streamer_folder_drive(user)
     except Exception:
         pass
 

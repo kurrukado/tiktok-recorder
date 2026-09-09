@@ -111,14 +111,17 @@ API được lập trình bằng FastAPI và đã được triển khai chạy t
 
 ---
 
-### 🔄 Cơ chế Đồng bộ Thông minh giữa Web $\leftrightarrow$ Google Drive $\leftrightarrow$ Bot GitHub:
-1. Khi bạn hoặc người dùng **Thêm / Xóa streamer** trên website qua API Render:
-   - Server Render sẽ tự động cập nhật danh sách vào file `streamers.json` nằm trong thư mục `tiktok-record/` trên Google Drive.
-2. Bot **GitHub Actions** (đang chạy ngầm 24/7 độc lập) sẽ tự động kiểm tra Google Drive sau mỗi 60 giây.
-3. Khi phát hiện streamer mới được thêm vào, bot GitHub sẽ **tự động canh sóng và ghi hình ngay lập tức** khi streamer đó phát trực tiếp.
+### 🔄 Cơ chế Đồng bộ & Quản lý Thư mục Tự động (Google Drive $\leftrightarrow$ Web $\leftrightarrow$ Bot GitHub):
+1. **Khi bạn bấm "Thêm streamer" (`POST /api/users`) trên Website:**
+   - API tự động **tạo ngay lập tức thư mục `tiktok-record/<tên_streamer>/` trên Google Drive** của bạn. Bạn mở Google Drive ra là thấy thư mục xuất hiện ngay!
+   - Cập nhật streamer mới vào file `streamers.json` trên Google Drive.
+   - Bot **GitHub Actions** (đang chạy ngầm 24/7) tự động nhận diện streamer mới này và bắt đầu ghi hình ngay nếu họ đang phát trực tiếp.
+2. **Khi bạn bấm "Xóa streamer" (`DELETE /api/users/{username}`) trên Dashboard Web:**
+   - API tự động **xóa vĩnh viễn thư mục `tiktok-record/<tên_streamer>/` trên Google Drive** (kèm toàn bộ video bên trong nếu có) để giải phóng dung lượng Google Drive cho bạn.
+   - Xóa streamer khỏi danh sách theo dõi, bot GitHub Actions sẽ ngừng quay streamer đó.
 
-> 💡 **Cấu hình trên Render Dashboard (Để bật đồng bộ Google Drive):**
-> Vào [Render Dashboard](https://dashboard.render.com/) ➔ Chọn dịch vụ `tiktok-api-as2y` ➔ Mục **Environment** ➔ Thêm 3 biến môi trường (Lấy các giá trị tương ứng từ file `config.json` trên máy tính của bạn):
+> ⚠️ **LƯU Ý QUAN TRỌNG (Để API Render có quyền truy cập Google Drive):**
+> Trong [Render Dashboard](https://dashboard.render.com/) ➔ Chọn dịch vụ `tiktok-api-as2y` ➔ Mục **Environment** ➔ Bắt buộc phải có 3 biến môi trường sau để Render có quyền tạo/xóa thư mục trên Google Drive:
 > - `GOOGLE_CLIENT_ID`: (Nhập giá trị `google_client_id` trong file config.json)
 > - `GOOGLE_CLIENT_SECRET`: (Nhập giá trị `google_client_secret` trong file config.json)
 > - `GDRIVE_REFRESH_TOKEN`: (Nhập giá trị `gdrive_refresh_token` trong file config.json)
@@ -131,8 +134,8 @@ API được lập trình bằng FastAPI và đã được triển khai chạy t
 | :--- | :--- | :--- |
 | `GET` | `/api/recordings/active` | **Xem ai đang được ghi hình thời gian thực** (Đồng bộ trực tiếp từ Cloud Bot) |
 | `GET` | `/api/users` | Lấy danh sách streamer đang theo dõi (kèm trạng thái `is_recording` chuẩn 100%) |
-| `POST` | `/api/users` | Thêm streamer mới (Tự động đồng bộ lên Google Drive & Bot GitHub) |
-| `DELETE` | `/api/users/{username}` | Xóa streamer khỏi danh sách theo dõi |
+| `POST` | `/api/users` | **Thêm streamer & Tự động tạo thư mục riêng trên Google Drive** |
+| `DELETE` | `/api/users/{username}` | **Xóa streamer & Tự động xóa vĩnh viễn thư mục trên Google Drive** |
 | `GET` | `/api/stream/{username}` | Lấy link stream CDN trực tiếp để tải/xem tốc độ cao |
 | `POST` | `/api/record/start` | Kích hoạt bắt đầu ghi hình ngay lập tức |
 | `GET` | `/api/recordings` | Lấy danh sách toàn bộ file video đã quay (kèm thời lượng, dung lượng, link thumbnail) |

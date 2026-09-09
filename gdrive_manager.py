@@ -382,6 +382,59 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
         print(f"[!] Lỗi cập nhật active_recordings lên Drive: {e}")
         return False
 
+def create_streamer_folder_drive(user: str, access_token=None):
+    """
+    Tạo thư mục tiktok-record/<user> trên Google Drive ngay khi thêm streamer.
+    Trả về (True, folder_id) hoặc (False, error_msg).
+    """
+    try:
+        if not access_token:
+            access_token = get_access_token()
+        if not access_token:
+            return False, "Chưa có Access Token Google Drive (Vui lòng kiểm tra biến môi trường GDRIVE_REFRESH_TOKEN)"
+        
+        user = user.strip().replace("@", "").lower()
+        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+        subfolder_id = find_or_create_folder(user, parent_id=root_id, access_token=access_token)
+        return True, subfolder_id
+    except Exception as e:
+        return False, str(e)
+
+def delete_streamer_folder_drive(user: str, access_token=None):
+    """
+    Xóa vĩnh viễn thư mục tiktok-record/<user> cùng toàn bộ video bên trong trên Google Drive.
+    Trả về (True, message) hoặc (False, error_msg).
+    """
+    try:
+        if not access_token:
+            access_token = get_access_token()
+        if not access_token:
+            return False, "Chưa có Access Token Google Drive (Vui lòng kiểm tra biến môi trường GDRIVE_REFRESH_TOKEN)"
+        
+        user = user.strip().replace("@", "").lower()
+        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        
+        q = f"name = '{user}' and mimeType = 'application/vnd.google-apps.folder' and '{root_id}' in parents and trashed = false"
+        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            files = res.json().get("files", [])
+            if files:
+                folder_id = files[0]["id"]
+                del_url = f"https://www.googleapis.com/drive/v3/files/{folder_id}"
+                del_res = requests.delete(del_url, headers=headers, timeout=15)
+                if del_res.status_code in [200, 204]:
+                    return True, f"Đã xóa thành công thư mục 'tiktok-record/{user}/' trên Google Drive"
+                else:
+                    return False, f"Lỗi từ Google Drive: {del_res.text}"
+            else:
+                return True, f"Thư mục 'tiktok-record/{user}/' không tồn tại trên Google Drive"
+        else:
+            return False, f"Lỗi tìm kiếm thư mục trên Google Drive: {res.text}"
+    except Exception as e:
+        return False, str(e)
+
 
 if __name__ == "__main__":
     import argparse

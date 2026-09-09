@@ -214,17 +214,37 @@ def add_user(req: AddUserRequest):
     except Exception:
         pass
 
-    if user in users:
-        return {"message": f"@{user} đã có trong danh sách theo dõi", "users": users}
-    
-    users.append(user)
-    cfg["monitored_users"] = users
-    save_config(cfg)
+    already_in = (user in users)
+    if not already_in:
+        users.append(user)
+        cfg["monitored_users"] = users
+        save_config(cfg)
+        try:
+            gdrive_manager.save_streamers_to_drive(users)
+        except Exception:
+            pass
+
+    # TỰ ĐỘNG TẠO THƯ MỤC TRÊN GOOGLE DRIVE
+    gdrive_status = "Chưa kết nối Google Drive"
+    folder_id = None
     try:
-        gdrive_manager.save_streamers_to_drive(users)
-    except Exception:
-        pass
-    return {"message": f"Đã thêm @{user} vào danh sách theo dõi", "users": users}
+        ok, res_info = gdrive_manager.create_streamer_folder_drive(user)
+        if ok:
+            folder_id = res_info
+            gdrive_status = f"Đã tạo thành công thư mục 'tiktok-record/{user}/' trên Google Drive"
+        else:
+            gdrive_status = f"Không thể tạo folder Drive: {res_info}"
+    except Exception as e:
+        gdrive_status = f"Lỗi tạo folder Drive: {e}"
+
+    msg = f"@{user} đã có trong danh sách theo dõi" if already_in else f"Đã thêm @{user} vào danh sách theo dõi"
+    return {
+        "message": msg,
+        "username": user,
+        "gdrive_status": gdrive_status,
+        "gdrive_folder_id": folder_id,
+        "users": users
+    }
 
 @app.delete("/api/users/{username}")
 def delete_user(username: str):
@@ -238,17 +258,37 @@ def delete_user(username: str):
     except Exception:
         pass
 
-    if user not in users:
-        raise HTTPException(status_code=404, detail=f"@{user} không có trong danh sách")
-    
-    users.remove(user)
-    cfg["monitored_users"] = users
-    save_config(cfg)
+    if user in users:
+        users.remove(user)
+        cfg["monitored_users"] = users
+        save_config(cfg)
+        try:
+            gdrive_manager.save_streamers_to_drive(users)
+        except Exception:
+            pass
+
+    # TỰ ĐỘNG XÓA VĨNH VIỄN THƯ MỤC TRÊN GOOGLE DRIVE
+    gdrive_status = "Chưa kết nối Google Drive"
     try:
-        gdrive_manager.save_streamers_to_drive(users)
-    except Exception:
-        pass
-    return {"message": f"Đã xóa @{user} khỏi danh sách theo dõi", "users": users}
+        ok, msg = gdrive_manager.delete_streamer_folder_drive(user)
+        gdrive_status = msg
+    except Exception as e:
+        gdrive_status = f"Lỗi xóa folder Drive: {e}"
+
+    # Xóa cả folder local nếu có
+    local_dir = os.path.join(BASE_DIR, user)
+    if os.path.exists(local_dir):
+        try:
+            shutil.rmtree(local_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+    return {
+        "message": f"Đã xóa @{user} khỏi danh sách theo dõi và dọn dẹp Google Drive",
+        "username": user,
+        "gdrive_status": gdrive_status,
+        "users": users
+    }
 
 @app.get("/api/stream/{username}")
 def get_stream_url(username: str):
