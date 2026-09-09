@@ -22,7 +22,10 @@ from recorder_core import (
     COOKIES_FILE,
     CONFIG_FILE
 )
-from download_archives import download_all_archives
+try:
+    from download_archives import download_all_archives
+except ImportError:
+    download_all_archives = None
 
 
 BANNER = r"""
@@ -253,9 +256,12 @@ def main_menu():
             set_cookie_interactive()
             input("\nNhấn Enter để quay lại menu chính...")
         elif choice == "5":
-            ans = input(f"\nBạn muốn tải bao nhiêu video gần nhất của @{target_user}? (Ví dụ: 5, 10, hoặc gõ 'all' để tải tất cả): ").strip()
-            limit = None if ans.lower() in ["all", "tat ca", "0"] else (int(ans) if ans.isdigit() else 5)
-            download_all_archives(username=target_user, limit=limit, output_dir=user_dir)
+            if download_all_archives:
+                ans = input(f"\nBạn muốn tải bao nhiêu video gần nhất của @{target_user}? (Ví dụ: 5, 10, hoặc gõ 'all' để tải tất cả): ").strip()
+                limit = None if ans.lower() in ["all", "tat ca", "0"] else (int(ans) if ans.isdigit() else 5)
+                download_all_archives(username=target_user, limit=limit, output_dir=user_dir)
+            else:
+                print("\n[!] Tính năng tải video lưu trữ yêu cầu module download_archives.")
             input("\nNhấn Enter để quay lại menu chính...")
         elif choice == "6":
             from auto_h264 import convert_all_videos_in_folder

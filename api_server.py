@@ -24,11 +24,17 @@ if sys.platform == "win32":
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+try:
+    import imageio_ffmpeg
+    IMGIO_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    IMGIO_FFMPEG = None
+
 if sys.platform == "win32":
     win_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
-    FFMPEG_PATH = win_ffmpeg if os.path.exists(win_ffmpeg) else (shutil.which("ffmpeg") or "ffmpeg")
+    FFMPEG_PATH = win_ffmpeg if os.path.exists(win_ffmpeg) else (shutil.which("ffmpeg") or IMGIO_FFMPEG or "ffmpeg")
 else:
-    FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+    FFMPEG_PATH = shutil.which("ffmpeg") or IMGIO_FFMPEG or "/usr/bin/ffmpeg"
 
 import recorder_core
 import auto_h264
@@ -507,16 +513,24 @@ def get_stream_url(username: str):
 
 def bg_record_worker(user: str, duration: Optional[int]):
     # Chỉ chạy local recorder nếu hệ thống có sẵn ffmpeg
-    if not shutil.which("ffmpeg") and not os.path.exists(FFMPEG_PATH):
+    if not shutil.which("ffmpeg") and not (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)):
         return
     try:
-        is_live, room_id = get_user_live_status_cached(user)
+        live_details = get_user_live_details_cached(user)
+        is_live = live_details.get("is_live", False)
+        room_id = live_details.get("room_id")
+        is_sub_only = live_details.get("is_sub_only", False)
         if not is_live or not room_id:
             return
         stream_url = recorder_core.get_live_stream_url(room_id, user=user)
         if stream_url:
-            output_file = recorder_core.record_stream_ffmpeg(stream_url, target_user=user, duration=duration)
-            if output_file and os.path.exists(output_file):
+            output_file = recorder_core.record_stream_ffmpeg(
+                stream_url,
+                target_user=user,
+                duration=duration,
+                is_sub_only=is_sub_only
+            )
+            if output_file and os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
                 thumb_f = extract_middle_thumbnail(output_file)
                 try:
                     import supabase_sync
@@ -534,12 +548,27 @@ def bg_record_worker(user: str, duration: Optional[int]):
                 if token:
                     root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
                     sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
-                    gdrive_manager.upload_file_to_drive(output_file, sub_id, access_token=token)
+                    ok = gdrive_manager.upload_file_to_drive(output_file, sub_id, access_token=token)
+                    if ok:
+                        try:
+                            os.remove(output_file)
+                        except Exception:
+                            pass
+                    if thumb_f and os.path.exists(thumb_f):
+                        gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
+                        try:
+                            os.remove(thumb_f)
+                        except Exception:
+                            pass
     except Exception as e:
         print(f"[!] Lỗi ghi hình worker: {e}")
     finally:
         with RECORDING_LOCK:
             ACTIVE_RECORDING_TASKS.pop(user, None)
+        try:
+            gdrive_manager.set_user_recording_status_drive(user, False)
+        except Exception:
+            pass
 
 @app.post("/api/record/start")
 @app.post("/api/record")
@@ -577,26 +606,29 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     is_sub_only = live_details.get("is_sub_only", False)
     is_preview = live_details.get("is_preview", False)
 
+    has_ffmpeg = bool(shutil.which("ffmpeg") or (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)))
+
     if is_live:
-        with RECORDING_LOCK:
-            ACTIVE_RECORDING_TASKS[user] = {"start_time": time.time()}
-        try:
-            gdrive_manager.set_user_recording_status_drive(user, True)
-        except Exception:
-            pass
-            
-        # Nếu có FFmpeg (chạy dưới máy local) thì chạy thêm luồng lưu
-        if shutil.which("ffmpeg") or os.path.exists(FFMPEG_PATH):
+        if has_ffmpeg:
+            with RECORDING_LOCK:
+                ACTIVE_RECORDING_TASKS[user] = {"start_time": time.time()}
+            try:
+                gdrive_manager.set_user_recording_status_drive(user, True)
+            except Exception:
+                pass
             bg_tasks.add_task(bg_record_worker, user, req.duration_seconds)
+            is_recording = True
+        else:
+            is_recording = False
 
         msg_prefix = f"@{user} đang phát trực tiếp"
         if is_sub_only:
             msg_prefix += " (🔒 VIP Sub-Only)"
         return {
-            "message": f"{msg_prefix}! Hệ thống Cloud 24/7 đang ghi hình phiên live.",
-            "status": "recording",
+            "message": f"{msg_prefix}! Hệ thống đang ghi hình phiên live.",
+            "status": "recording" if is_recording else "live",
             "is_live": True,
-            "is_recording": True,
+            "is_recording": is_recording,
             "username": user,
             "room_id": room_id,
             "is_sub_only": is_sub_only,

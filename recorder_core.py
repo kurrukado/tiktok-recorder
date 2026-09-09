@@ -19,11 +19,17 @@ if sys.platform == "win32":
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+try:
+    import imageio_ffmpeg
+    IMGIO_FFMPEG = imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    IMGIO_FFMPEG = None
+
 if sys.platform == "win32":
     win_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
-    FFMPEG_PATH = win_ffmpeg if os.path.exists(win_ffmpeg) else (shutil.which("ffmpeg") or "ffmpeg")
+    FFMPEG_PATH = win_ffmpeg if os.path.exists(win_ffmpeg) else (shutil.which("ffmpeg") or IMGIO_FFMPEG or "ffmpeg")
 else:
-    FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
+    FFMPEG_PATH = shutil.which("ffmpeg") or IMGIO_FFMPEG or "/usr/bin/ffmpeg"
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
