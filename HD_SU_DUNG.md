@@ -19,10 +19,12 @@ Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.26
 ## 1. TÍNH NĂNG NỔI BẬT
 
 - 🟢 **Chạy ngầm 24/7 trên Cloud:** Chạy trên máy chủ Microsoft/GitHub miễn phí, không tốn điện, bạn tắt máy tính vẫn tự động quay.
+- ⚡ **Ghi hình Đa Luồng Song Song (Tối đa 10 streamer cùng lúc):** Không bị chặn tuần tự; nếu 5-10 người cùng live một lúc, bot sẽ tạo 10 luồng riêng để quay đồng thời tất cả mọi người.
+- ✂️ **Tự động Cắt Chia Nhỏ Dưới 2 Tiếng (< 2h/phần):** Mỗi video live tối đa 1 tiếng 56 phút. Nếu live dài 6-8 tiếng, bot tự động đóng file Part 1, cắt ảnh thumbnail, up lên Google Drive, và **ngay lập tức ghi tiếp Part 2** hoàn toàn không làm gián đoạn bot.
 - 🔴 **Bỏ qua giới hạn 18+:** Sử dụng thuật toán bóc tách SIGI_STATE kết hợp cookie `sessionid_ss`, không bị lỗi chặn lứa tuổi của TikTok.
 - 🎬 **Chuẩn nén H.264 (AVC) + AAC:** Xuất file MP4 chuẩn quốc tế, mở xem được ngay trên mọi điện thoại (iPhone, Android) và máy tính mà không cần cài thêm phần mềm.
 - ☁️ **Đồng bộ tự động lên Google Drive:** Tự động tạo thư mục riêng cho từng streamer trên Google Drive của bạn (`tiktok-record/<user>/`).
-- ⚡ **REST API đầy đủ CORS:** Dễ dàng nhúng vào bất kỳ trang web nào (React, Vue, HTML/JS, PHP, WordPress) để thêm người dùng và tải video tốc độ cao.
+- ⚡ **REST API đầy đủ CORS & Giám sát Live Status:** Cung cấp API trực tuyến trên Cloud (Render) để xem ai đang được quay, thêm/xóa streamer và tải video tốc độ cao.
 
 ---
 
@@ -127,7 +129,8 @@ API được lập trình bằng FastAPI và đã được triển khai chạy t
 
 | Phương thức | Endpoint URL | Chức năng |
 | :--- | :--- | :--- |
-| `GET` | `/api/users` | Lấy danh sách streamer đang theo dõi (Phản hồi tức thì <50ms) |
+| `GET` | `/api/recordings/active` | **Xem ai đang được ghi hình thời gian thực** (Đồng bộ trực tiếp từ Cloud Bot) |
+| `GET` | `/api/users` | Lấy danh sách streamer đang theo dõi (kèm trạng thái `is_recording` chuẩn 100%) |
 | `POST` | `/api/users` | Thêm streamer mới (Tự động đồng bộ lên Google Drive & Bot GitHub) |
 | `DELETE` | `/api/users/{username}` | Xóa streamer khỏi danh sách theo dõi |
 | `GET` | `/api/stream/{username}` | Lấy link stream CDN trực tiếp để tải/xem tốc độ cao |

@@ -125,10 +125,33 @@ class RecordRequest(BaseModel):
 
 @app.get("/api/health")
 def health_check():
+    active = []
+    try:
+        active = gdrive_manager.load_active_recordings_from_drive() or []
+    except Exception:
+        pass
+    all_active = list(set(active + list(ACTIVE_RECORDING_TASKS.keys())))
     return {
         "status": "online",
         "time": datetime.now().isoformat(),
-        "active_recordings": list(ACTIVE_RECORDING_TASKS.keys())
+        "active_recordings": all_active,
+        "active_count": len(all_active)
+    }
+
+@app.get("/api/recordings/active")
+def get_active_recordings():
+    """
+    Trả về danh sách chính xác các streamer hiện đang được bot 24/7 ghi hình.
+    """
+    active = []
+    try:
+        active = gdrive_manager.load_active_recordings_from_drive() or []
+    except Exception:
+        pass
+    all_active = list(set(active + list(ACTIVE_RECORDING_TASKS.keys())))
+    return {
+        "total_active": len(all_active),
+        "active_streamers": all_active
     }
 
 @app.get("/api/users")
@@ -144,6 +167,15 @@ def get_users(check_live: bool = False):
     if not users:
         cfg = load_config()
         users = cfg.get("monitored_users", ["islizanx", "itsme_kate0110", "urielhui38"])
+
+    active_users = set()
+    try:
+        drive_act = gdrive_manager.load_active_recordings_from_drive()
+        if drive_act:
+            active_users.update(drive_act)
+    except Exception:
+        pass
+    active_users.update(ACTIVE_RECORDING_TASKS.keys())
     
     result = []
     for u in users:
@@ -153,14 +185,19 @@ def get_users(check_live: bool = False):
                 is_live, room_id = recorder_core.check_user_live(u)
             except Exception:
                 pass
-        is_recording = (u in ACTIVE_RECORDING_TASKS)
+        is_recording = (u in active_users)
         result.append({
             "username": u,
             "is_live": is_live,
             "room_id": room_id,
             "is_recording": is_recording
         })
-    return {"users": result, "streamers": users, "total": len(users)}
+    return {
+        "users": result,
+        "streamers": users,
+        "total": len(users),
+        "currently_recording": list(active_users)
+    }
 
 @app.post("/api/users")
 def add_user(req: AddUserRequest):

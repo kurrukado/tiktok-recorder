@@ -292,6 +292,83 @@ def save_streamers_to_drive(streamers_list, access_token=None):
         print(f"[!] Lỗi ghi streamers.json lên Drive: {e}")
     return False
 
+def load_active_recordings_from_drive(access_token=None):
+    """Đọc danh sách các streamer đang được ghi hình thời gian thực từ Google Drive."""
+    try:
+        if not access_token:
+            access_token = get_access_token()
+        if not access_token:
+            return []
+        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
+        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+        res = requests.get(url, headers=headers, timeout=8)
+        if res.status_code == 200:
+            files = res.json().get("files", [])
+            if files:
+                file_id = files[0]["id"]
+                down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+                d_res = requests.get(down_url, headers=headers, timeout=8)
+                if d_res.status_code == 200:
+                    data = d_res.json()
+                    return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+def set_user_recording_status_drive(user: str, is_recording: bool, access_token=None):
+    """Cập nhật trạng thái đang quay của một streamer lên Google Drive."""
+    try:
+        if not access_token:
+            access_token = get_access_token()
+        if not access_token:
+            return False
+        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        
+        q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
+        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+        res = requests.get(url, headers=headers, timeout=8)
+        file_id = None
+        current_active = []
+        if res.status_code == 200:
+            files = res.json().get("files", [])
+            if files:
+                file_id = files[0]["id"]
+                try:
+                    d_res = requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=8)
+                    if d_res.status_code == 200:
+                        current_active = d_res.json()
+                        if not isinstance(current_active, list):
+                            current_active = []
+                except Exception:
+                    pass
+
+        user = user.strip().replace("@", "").lower()
+        if is_recording:
+            if user not in current_active:
+                current_active.append(user)
+        else:
+            current_active = [u for u in current_active if u != user]
+
+        content_bytes = json.dumps(current_active, indent=2).encode("utf-8")
+        if file_id:
+            up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
+            requests.patch(up_url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=content_bytes, timeout=10)
+        else:
+            meta = {"name": "active_recordings.json", "parents": [root_id]}
+            files_data = {
+                "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
+                "file": ("active_recordings.json", content_bytes, "application/json")
+            }
+            create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+            requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files_data, timeout=10)
+        return True
+    except Exception as e:
+        print(f"[!] Lỗi cập nhật active_recordings lên Drive: {e}")
+        return False
+
 
 if __name__ == "__main__":
     import argparse

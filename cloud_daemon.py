@@ -5,6 +5,7 @@ import time
 import random
 import argparse
 import re
+import threading
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -83,15 +84,149 @@ def discover_new_streamers(current_user):
     except Exception:
         return []
 
+MAX_CONCURRENT_RECORDERS = 10  # Tối đa 10 streamer ghi hình cùng lúc
+MAX_CHUNK_SECONDS = 7000       # 1 tiếng 56 phút (< 2 tiếng), tự động cắt và ghi tiếp
+ACTIVE_RECORDERS = {}          # {user: {"thread": Thread, "start_time": float}}
+RECORDERS_LOCK = threading.Lock()
+
+def streamer_recording_worker(user, initial_room_id, auto_discover=True):
+    """
+    Luồng ghi hình độc lập cho từng streamer:
+    - Ghi từng đoạn ngắn dưới 2 tiếng (mặc định 1h56m).
+    - Hết đoạn: tự xuất file MP4 progressive +faststart, cắt thumbnail 50% thời lượng, upload Google Drive và xóa file tạm.
+    - Nếu streamer vẫn đang live: tự động nối tiếp ghi Phần tiếp theo (part 2, part 3...) mà không ngắt quãng bot.
+    - Cập nhật trạng thái đang quay lên Google Drive theo thời gian thực để API hiển thị.
+    """
+    log(f"🎬 [Luồng mới] Bắt đầu phiên ghi hình cho @{user} (Hỗ trợ tối đa {MAX_CONCURRENT_RECORDERS} streamer cùng lúc)...")
+    
+    # Cập nhật trạng thái đang quay lên Google Drive
+    try:
+        gdrive_manager.set_user_recording_status_drive(user, True)
+    except Exception:
+        pass
+
+    part_number = 1
+    current_room_id = initial_room_id
+
+    try:
+        while True:
+            # Tự động tìm kiếm đối thủ PK / Co-hosts nếu bật
+            if auto_discover:
+                try:
+                    new_found = discover_new_streamers(user)
+                    if new_found:
+                        cfg = load_config()
+                        current_list = cfg.get("monitored_users", [])
+                        added_any = False
+                        for nf in new_found:
+                            if nf not in current_list:
+                                current_list.append(nf)
+                                added_any = True
+                                log(f"✨ [Auto-Discover] Tự động phát hiện streamer mới từ phiên live: @{nf}")
+                        if added_any:
+                            cfg["monitored_users"] = current_list
+                            save_config(cfg)
+                            try:
+                                gdrive_manager.save_streamers_to_drive(current_list)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+            stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
+            if not stream_url:
+                log(f"[!] Không lấy được URL stream của @{user}, kết thúc luồng.")
+                break
+
+            now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            part_suffix = f"_part{part_number}" if part_number > 1 else ""
+            user_dir = os.path.join(BASE_DIR, user)
+            os.makedirs(user_dir, exist_ok=True)
+            output_file = os.path.join(user_dir, f"{user}_{now_str}{part_suffix}.mp4")
+
+            log(f"🔴 [@{user}] Đang ghi hình Phần {part_number} (Tối đa < 2 tiếng: {MAX_CHUNK_SECONDS}s)...")
+
+            # Ghi hình với giới hạn duration = MAX_CHUNK_SECONDS (7000s ~ 1h56m)
+            rec_result = recorder_core.record_stream_ffmpeg(
+                stream_url,
+                output_filename=output_file,
+                target_user=user,
+                duration=MAX_CHUNK_SECONDS
+            )
+
+            if rec_result and os.path.exists(rec_result) and os.path.getsize(rec_result) > 1024:
+                log(f"[✓] [@{user}] Hoàn tất Phần {part_number}: {os.path.basename(rec_result)}")
+
+                # 1. Trích xuất thumbnail từ 50% thời lượng của đoạn này
+                thumb_file = None
+                try:
+                    from api_server import extract_middle_thumbnail
+                    thumb_file = extract_middle_thumbnail(rec_result)
+                    if thumb_file and os.path.exists(thumb_file):
+                        log(f"[✓] [@{user}] Đã tạo thumbnail Phần {part_number}: {os.path.basename(thumb_file)}")
+                except Exception as th_err:
+                    log(f"[!] [@{user}] Lỗi tạo thumbnail: {th_err}")
+
+                # 2. Tải video & thumbnail lên Google Drive
+                try:
+                    log(f"[*] [@{user}] Đang tải Phần {part_number} lên Google Drive...")
+                    tok = gdrive_manager.get_access_token()
+                    if tok:
+                        r_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
+                        s_id = gdrive_manager.find_or_create_folder(user, parent_id=r_id, access_token=tok)
+                        ok = gdrive_manager.upload_file_to_drive(rec_result, s_id, access_token=tok)
+                        if ok:
+                            log(f"[✓] [@{user}] Đã lưu video Phần {part_number} lên Google Drive!")
+                            try:
+                                os.remove(rec_result)
+                                log(f"🗑️ [@{user}] Đã xóa video tạm Phần {part_number} để giải phóng ổ cứng.")
+                            except Exception:
+                                pass
+
+                        if thumb_file and os.path.exists(thumb_file):
+                            gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
+                            try:
+                                os.remove(thumb_file)
+                            except Exception:
+                                pass
+                except Exception as up_err:
+                    log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
+
+            # 3. Kiểm tra xem streamer còn live hay không để ghi tiếp Phần tiếp theo
+            log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number + 1}...")
+            time.sleep(3)
+            is_live, new_room_id = recorder_core.check_user_live(user)
+            if is_live and new_room_id:
+                part_number += 1
+                current_room_id = new_room_id
+                log(f"⏩ [@{user}] Streamer VẪN ĐANG LIVE! Tiếp tục ghi hình nối tiếp Phần {part_number} ngay lập tức...")
+                continue
+            else:
+                log(f"🏁 [@{user}] Phiên livestream đã kết thúc hoàn toàn sau {part_number} phần.")
+                break
+
+    except Exception as err:
+        log(f"[!] Lỗi trong luồng ghi hình của @{user}: {err}")
+    finally:
+        with RECORDERS_LOCK:
+            ACTIVE_RECORDERS.pop(user, None)
+        try:
+            gdrive_manager.set_user_recording_status_drive(user, False)
+        except Exception:
+            pass
+        log(f"⏹️ [@{user}] Đã đóng luồng ghi hình.")
+
 def run_daemon(max_minutes=210, interval=25, auto_discover=True):
     start_time = time.time()
     max_seconds = max_minutes * 60
     hard_limit_seconds = 320 * 60  # Giới hạn tối đa 5 tiếng 20 phút (tránh chạm mốc 6h của GitHub)
 
     log("=" * 65)
-    log("   TIKTOK 24/7 CLOUD AUTO RECORDER (GITHUB ACTIONS OPTIMIZED)")
+    log("   TIKTOK 24/7 CLOUD AUTO RECORDER (MULTI-THREADED & CHUNKING)")
     log("=" * 65)
     log(f"[*] Thời gian định kỳ phiên: {max_minutes} phút")
+    log(f"[*] Ghi hình đồng thời tối đa: {MAX_CONCURRENT_RECORDERS} streamers song song")
+    log(f"[*] Giới hạn mỗi video live: < 2 tiếng ({MAX_CHUNK_SECONDS}s/đoạn, tự động ghi tiếp)")
     log(f"[*] Chu kỳ quét thông minh: ~{interval}s (kèm độ trễ ngẫu nhiên)")
     log(f"[*] Tự động khám phá streamer (PK / Co-host): {'BẬT' if auto_discover else 'TẮT'}")
 
@@ -111,87 +246,57 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
     while True:
         elapsed = time.time() - start_time
 
+        # Dọn dẹp các luồng đã hoàn tất
+        with RECORDERS_LOCK:
+            dead_users = [u for u, info in ACTIVE_RECORDERS.items() if not info["thread"].is_alive()]
+            for u in dead_users:
+                ACTIVE_RECORDERS.pop(u, None)
+
         # Kiểm tra điều kiện luân chuyển phiên mượt mà (Graceful Rotation)
         if elapsed >= max_seconds:
-            log(f"[*] Đã đạt mốc chuyển giao ({int(elapsed // 60)} phút). Đang kiểm tra trước khi kết thúc phiên...")
-            log("[✓] Không có livestream nào đang dở. Luân chuyển sang phiên mới ngay lập tức!")
-            break
-
-        if elapsed >= hard_limit_seconds:
-            log("[!] Chạm ngưỡng an toàn 5.3 giờ của GitHub. Bắt buộc kết thúc phiên để bảo vệ video.")
-            break
+            with RECORDERS_LOCK:
+                active_count = len(ACTIVE_RECORDERS)
+            if active_count > 0:
+                log(f"[*] Đã qua {int(elapsed // 60)} phút, hiện có {active_count} streamer đang quay dở. Tiếp tục chờ hoàn tất...")
+                if elapsed >= hard_limit_seconds:
+                    log("[!] Chạm ngưỡng an toàn 5.3 giờ của GitHub. Bắt buộc kết thúc phiên để bảo vệ video.")
+                    break
+            else:
+                log(f"[*] Đã đạt mốc chuyển giao ({int(elapsed // 60)} phút). Không có livestream nào đang dở. Luân chuyển sang phiên mới ngay lập tức!")
+                break
 
         users = load_monitored_users()
         session_count += 1
+        with RECORDERS_LOCK:
+            active_now = list(ACTIVE_RECORDERS.keys())
         if session_count % 15 == 1:
-            log(f"[*] Đang theo dõi {len(users)} streamers: {users}")
+            log(f"[*] Đang theo dõi {len(users)} streamers. Đang ghi hình song song ({len(active_now)}/{MAX_CONCURRENT_RECORDERS}): {active_now}")
 
         for user in users:
+            # Nếu streamer này đang được ghi hình -> Bỏ qua
+            with RECORDERS_LOCK:
+                if user in ACTIVE_RECORDERS:
+                    continue
+                if len(ACTIVE_RECORDERS) >= MAX_CONCURRENT_RECORDERS:
+                    log(f"[!] Đã đạt giới hạn tối đa {MAX_CONCURRENT_RECORDERS} streamer cùng lúc. Chờ luồng trống...")
+                    break
+
             try:
                 is_live, room_id = recorder_core.check_user_live(user)
                 if is_live and room_id:
                     log(f"🔴 PHÁT HIỆN LIVESTREAM: @{user} đang trực tiếp (Room ID: {room_id})")
-                    notifier.send_telegram(f"🔴 <b>STREAMER ĐANG LIVE!</b>\n👤 <code>@{user}</code> bắt đầu phát livestream.\nĐang tự động ghi hình HD H.264...")
+                    notifier.send_telegram(f"🔴 <b>STREAMER ĐANG LIVE!</b>\n👤 <code>@{user}</code> bắt đầu phát livestream.\nĐang tự động ghi hình đa luồng HD H.264 (< 2 tiếng/phần)...")
 
-                    # Tự động tìm kiếm đối thủ PK / Co-hosts nếu tính năng bật
-                    if auto_discover:
-                        new_found = discover_new_streamers(user)
-                        if new_found:
-                            cfg = load_config()
-                            current_list = cfg.get("monitored_users", users)
-                            added_any = False
-                            for nf in new_found:
-                                if nf not in current_list:
-                                    current_list.append(nf)
-                                    added_any = True
-                                    log(f"✨ [Auto-Discover] Tự động phát hiện streamer mới từ phiên live: @{nf}")
-                            if added_any:
-                                cfg["monitored_users"] = current_list
-                                save_config(cfg)
-
-                    stream_url = recorder_core.get_live_stream_url(room_id, user=user)
-                    if stream_url:
-                        output_file = recorder_core.record_stream_ffmpeg(stream_url, target_user=user)
-                        if output_file and os.path.exists(output_file):
-                            log(f"[✓] Ghi hình hoàn tất: {os.path.basename(output_file)}")
-
-                            # Tự động cắt ảnh xem trước (thumbnail) từ giữa video
-                            thumb_file = None
-                            try:
-                                from api_server import extract_middle_thumbnail
-                                thumb_file = extract_middle_thumbnail(output_file)
-                                if thumb_file and os.path.exists(thumb_file):
-                                    log(f"[✓] Đã tạo ảnh xem trước (thumbnail): {os.path.basename(thumb_file)}")
-                            except Exception as th_err:
-                                log(f"[!] Không thể tạo thumbnail: {th_err}")
-
-                            # Tự động tải lên Google Drive
-                            try:
-                                log(f"[*] Đang tải video & ảnh xem trước lên Google Drive (tiktok-record/{user}/)...")
-                                tok = gdrive_manager.get_access_token()
-                                if tok:
-                                    r_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
-                                    s_id = gdrive_manager.find_or_create_folder(user, parent_id=r_id, access_token=tok)
-                                    ok = gdrive_manager.upload_file_to_drive(output_file, s_id, access_token=tok)
-                                    if ok:
-                                        log(f"[✓] Đã lưu video thành công lên Google Drive: {os.path.basename(output_file)}")
-                                        try:
-                                            os.remove(output_file)
-                                            log(f"🗑️ Đã xóa file video tạm để giải phóng ổ cứng.")
-                                        except Exception:
-                                            pass
-
-                                    # Tải tiếp thumbnail lên Google Drive
-                                    if thumb_file and os.path.exists(thumb_file):
-                                        gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
-                                        try:
-                                            os.remove(thumb_file)
-                                        except Exception:
-                                            pass
-                            except Exception as up_err:
-                                log(f"[!] Lỗi khi tải lên Google Drive: {up_err}")
-                    else:
-                        log(f"[!] Không lấy được URL stream của @{user}")
+                    # Khởi chạy luồng ghi hình riêng biệt (không chặn luồng quét)
+                    t = threading.Thread(
+                        target=streamer_recording_worker,
+                        args=(user, room_id, auto_discover),
+                        daemon=True
+                    )
+                    with RECORDERS_LOCK:
+                        ACTIVE_RECORDERS[user] = {"thread": t, "start_time": time.time()}
+                    t.start()
+                    time.sleep(1)
 
             except Exception as e:
                 log(f"[!] Lỗi kiểm tra @{user}: {e}")
