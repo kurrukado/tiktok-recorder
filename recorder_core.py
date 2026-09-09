@@ -232,6 +232,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
     cmd = [
         FFMPEG_PATH,
         "-y",
+        "-rw_timeout", "15000000",
         "-headers", (
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
             "Referer: https://www.tiktok.com/\r\n"
@@ -240,7 +241,6 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         "-c", "copy",
         "-bsf:a", "aac_adtstoasc",
         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
-
     ]
     if duration:
         cmd.extend(["-t", str(duration)])
@@ -256,16 +256,68 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
         )
         
+        last_size = 0
+        last_growth_time = time.time()
+        last_live_check_time = time.time()
+
         while proc.poll() is None:
             time.sleep(1)
-            elapsed = int(time.time() - start_time)
+            now = time.time()
+            elapsed = int(now - start_time)
             mins, secs = divmod(elapsed, 60)
             hours, mins = divmod(mins, 60)
             
-            size_mb = 0.0
+            size_bytes = 0
             if os.path.exists(output_filename):
-                size_mb = os.path.getsize(output_filename) / (1024 * 1024)
+                size_bytes = os.path.getsize(output_filename)
+            size_mb = size_bytes / (1024 * 1024)
             
+            # Theo dõi tăng trưởng dung lượng file
+            if size_bytes > last_size:
+                last_size = size_bytes
+                last_growth_time = now
+
+            stagnant_seconds = int(now - last_growth_time)
+
+            # Nếu trong 12s liên tục không có thêm dữ liệu mới -> Kiểm tra xem streamer đã tắt live chưa
+            if size_bytes > 1024 and stagnant_seconds >= 12:
+                if (now - last_live_check_time) >= 8:
+                    last_live_check_time = now
+                    if target_user:
+                        try:
+                            is_still_live, _ = check_live_status(target_user)
+                            if not is_still_live:
+                                print(f"\n\n[✓] [@{target_user}] Streamer ĐÃ XUỐNG LIVE (Không còn tín hiệu sau {stagnant_seconds}s).")
+                                print(f"[*] [@{target_user}] Đang chốt file video MP4 và lưu trữ ngay lập tức...")
+                                if proc.stdin:
+                                    try:
+                                        proc.stdin.write(b"q\n")
+                                        proc.stdin.flush()
+                                    except Exception:
+                                        pass
+                                try:
+                                    proc.wait(timeout=4)
+                                except Exception:
+                                    proc.terminate()
+                                break
+                        except Exception:
+                            pass
+
+            # Nếu 30 giây liên tiếp không nhận được bất kỳ byte nào -> Buộc kết thúc để đóng gói video
+            if size_bytes > 1024 and stagnant_seconds >= 30:
+                print(f"\n\n[!] [@{target_user}] Tín hiệu live ngắt quãng {stagnant_seconds}s. Tự động chốt video...")
+                if proc.stdin:
+                    try:
+                        proc.stdin.write(b"q\n")
+                        proc.stdin.flush()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=4)
+                except Exception:
+                    proc.terminate()
+                break
+
             sys.stdout.write(f"\r🔴 Đang ghi hình: [{hours:02d}:{mins:02d}:{secs:02d}] - Dung lượng: {size_mb:.2f} MB")
             sys.stdout.flush()
 
