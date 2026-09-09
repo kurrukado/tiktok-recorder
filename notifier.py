@@ -64,7 +64,7 @@ def sync_to_gdrive(local_path, target_user):
     falls back to rclone if available.
     """
     cfg = get_notifier_config()
-    enabled = cfg.get("gdrive_enabled", False)
+    enabled = cfg.get("gdrive_enabled", False) or bool(cfg.get("gdrive_refresh_token")) or bool(os.environ.get("GDRIVE_REFRESH_TOKEN"))
     if not enabled:
         return None
 

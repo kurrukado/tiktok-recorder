@@ -154,24 +154,47 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
                     "Content-Range": f"bytes {uploaded_bytes}-{end_byte}/{file_size}",
                     "Content-Length": str(chunk_len)
                 }
-                put_res = requests.put(upload_url, headers=headers_chunk, data=chunk, timeout=60)
-                uploaded_bytes += chunk_len
 
+                chunk_ok = False
+                put_res = None
+                for attempt in range(5):
+                    try:
+                        put_res = requests.put(upload_url, headers=headers_chunk, data=chunk, timeout=60)
+                        if put_res.status_code in (200, 201, 308):
+                            chunk_ok = True
+                            break
+                        elif put_res.status_code in (500, 502, 503, 504):
+                            time.sleep(1.5 * (attempt + 1))
+                            continue
+                        else:
+                            print(f"\n  [!] Google Drive trả về mã {put_res.status_code}: {put_res.text}")
+                            break
+                    except Exception as ex:
+                        time.sleep(1.5 * (attempt + 1))
+
+                if not chunk_ok or put_res is None:
+                    print(f"\n  [!] Không thể upload chunk {uploaded_bytes}-{end_byte} sau 5 lần thử.")
+                    return False
+
+                uploaded_bytes += chunk_len
                 curr_mb = uploaded_bytes / (1024 * 1024)
                 pct = (uploaded_bytes / file_size) * 100
                 speed = curr_mb / (time.time() - start_time + 0.001)
                 sys.stdout.write(f"\r  --> Đang tải lên Drive: {file_name} ({curr_mb:.1f}/{file_size_mb:.1f} MB - {pct:.1f}%) [{speed:.2f} MB/s]")
                 sys.stdout.flush()
 
+        if put_res is None or put_res.status_code not in (200, 201):
+            print(f"\n  [!] Upload chưa hoàn tất hợp lệ (mã: {put_res.status_code if put_res else 'None'})")
+            return False
+
         print(f"\r  [✓] Đã tải lên Drive thành công: {file_name} ({file_size_mb:.2f} MB)                 ")
-        if put_res.status_code in [200, 201]:
-            try:
-                res_data = put_res.json()
-                f_id = res_data.get("id")
-                if f_id:
-                    make_file_public(f_id, access_token=access_token)
-            except Exception:
-                pass
+        try:
+            res_data = put_res.json()
+            f_id = res_data.get("id")
+            if f_id:
+                make_file_public(f_id, access_token=access_token)
+        except Exception:
+            pass
         return True
 
     except Exception as e:

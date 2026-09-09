@@ -89,7 +89,7 @@ MAX_CHUNK_SECONDS = 7000       # 1 tiếng 56 phút (< 2 tiếng), tự động 
 ACTIVE_RECORDERS = {}          # {user: {"thread": Thread, "start_time": float}}
 RECORDERS_LOCK = threading.Lock()
 
-def streamer_recording_worker(user, initial_room_id, auto_discover=True):
+def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_event=None):
     """
     Luồng ghi hình độc lập cho từng streamer:
     - Ghi từng đoạn ngắn dưới 2 tiếng (mặc định 1h56m).
@@ -111,6 +111,10 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True):
 
     try:
         while True:
+            if stop_event and stop_event.is_set():
+                log(f"⏹️ [@{user}] Dừng luồng theo yêu cầu của hệ thống.")
+                break
+
             # Tự động tìm kiếm đối thủ PK / Co-hosts nếu bật
             if auto_discover:
                 try:
@@ -152,7 +156,9 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True):
                 stream_url,
                 output_filename=output_file,
                 target_user=user,
-                duration=MAX_CHUNK_SECONDS
+                duration=MAX_CHUNK_SECONDS,
+                stop_event=stop_event,
+                auto_sync_gdrive=False
             )
 
             if rec_result and os.path.exists(rec_result) and os.path.getsize(rec_result) > 1024:
@@ -199,6 +205,8 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True):
                                 log(f"🗑️ [@{user}] Đã xóa video tạm Phần {part_number} để giải phóng ổ cứng.")
                             except Exception:
                                 pass
+                        else:
+                            log(f"[!] [@{user}] Không thể upload video lên Drive sau các lần thử. Giữ lại file local.")
 
                         if thumb_file and os.path.exists(thumb_file):
                             gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
@@ -209,7 +217,11 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True):
                 except Exception as up_err:
                     log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
 
-            # 3. Kiểm tra xem streamer còn live hay không để ghi tiếp Phần tiếp theo
+            if stop_event and stop_event.is_set():
+                log(f"⏹️ [@{user}] Nhận lệnh dừng phiên. Không ghi tiếp phần mới.")
+                break
+
+            # 4. Kiểm tra xem streamer còn live hay không để ghi tiếp Phần tiếp theo
             log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number + 1}...")
             time.sleep(3)
             is_live, new_room_id = recorder_core.check_user_live(user)
@@ -276,7 +288,7 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
             if active_count > 0:
                 log(f"[*] Đã qua {int(elapsed // 60)} phút, hiện có {active_count} streamer đang quay dở. Tiếp tục chờ hoàn tất...")
                 if elapsed >= hard_limit_seconds:
-                    log("[!] Chạm ngưỡng an toàn 5.3 giờ của GitHub. Bắt buộc kết thúc phiên để bảo vệ video.")
+                    log("[!] Chạm ngưỡng an toàn 5.3 giờ của GitHub. Bắt đầu kết thúc an toàn phiên để chốt video và upload...")
                     break
             else:
                 log(f"[*] Đã đạt mốc chuyển giao ({int(elapsed // 60)} phút). Không có livestream nào đang dở. Luân chuyển sang phiên mới ngay lập tức!")
@@ -305,13 +317,18 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                     notifier.send_telegram(f"🔴 <b>STREAMER ĐANG LIVE!</b>\n👤 <code>@{user}</code> bắt đầu phát livestream.\nĐang tự động ghi hình đa luồng HD H.264 (< 2 tiếng/phần)...")
 
                     # Khởi chạy luồng ghi hình riêng biệt (không chặn luồng quét)
+                    stop_ev = threading.Event()
                     t = threading.Thread(
                         target=streamer_recording_worker,
-                        args=(user, room_id, auto_discover),
-                        daemon=True
+                        args=(user, room_id, auto_discover, stop_ev),
+                        daemon=False
                     )
                     with RECORDERS_LOCK:
-                        ACTIVE_RECORDERS[user] = {"thread": t, "start_time": time.time()}
+                        ACTIVE_RECORDERS[user] = {
+                            "thread": t,
+                            "start_time": time.time(),
+                            "stop_event": stop_ev
+                        }
                     t.start()
                     time.sleep(1)
 
@@ -323,6 +340,18 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
         # Smart Jitter Delay để tránh bị TikTok chặn tần suất
         jitter = random.uniform(-3.0, 4.0)
         time.sleep(max(15, interval + jitter))
+
+    # Chờ tất cả luồng ghi hình hoàn tất đóng gói và upload lên Google Drive
+    with RECORDERS_LOCK:
+        remaining_recorders = list(ACTIVE_RECORDERS.items())
+    if remaining_recorders:
+        log(f"⏳ Đang chờ {len(remaining_recorders)} luồng ghi hình hoàn tất đóng gói và upload lên Google Drive...")
+        for u, info in remaining_recorders:
+            if "stop_event" in info:
+                info["stop_event"].set()
+        for u, info in remaining_recorders:
+            info["thread"].join(timeout=180)
+            log(f"  [✓] Luồng @{u} đã hoàn tất.")
 
     log("[✓] Phiên làm việc kết thúc thành công.")
 

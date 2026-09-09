@@ -17,7 +17,11 @@ if sys.platform == "win32":
 
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe") if os.path.exists(os.path.join(BASE_DIR, "ffmpeg.exe")) else (shutil.which("ffmpeg") or "ffmpeg")
+if sys.platform == "win32":
+    win_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
+    FFMPEG_PATH = win_ffmpeg if os.path.exists(win_ffmpeg) else (shutil.which("ffmpeg") or "ffmpeg")
+else:
+    FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 COOKIES_FILE = os.path.join(BASE_DIR, "cookies.json")
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
@@ -252,12 +256,47 @@ def get_stream_urls(room_id, user, cookies=None):
 
     return candidates
 
-def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx", duration=None):
+def _safe_stop_ffmpeg(proc, timeout=8):
     """
-    Records a live stream URL to an MP4 file using ffmpeg.exe without re-encoding,
+    Dừng tiến trình ffmpeg an toàn:
+    1. Gửi 'q\n' qua stdin và đóng stdin để ffmpeg chốt moov atom chuẩn MP4.
+    2. Chờ tiến trình kết thúc trong timeout giây.
+    3. Nếu chưa kết thúc, gọi terminate() rồi kill() để không bị treo vĩnh viễn.
+    """
+    if not proc or proc.poll() is not None:
+        return
+    if proc.stdin:
+        try:
+            proc.stdin.write(b"q\n")
+            proc.stdin.flush()
+            proc.stdin.close()
+        except Exception:
+            pass
+    try:
+        proc.wait(timeout=timeout)
+        return
+    except Exception:
+        pass
+
+    try:
+        proc.terminate()
+        proc.wait(timeout=4)
+        return
+    except Exception:
+        pass
+
+    try:
+        proc.kill()
+        proc.wait(timeout=2)
+    except Exception:
+        pass
+
+def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx", duration=None, stop_event=None, auto_sync_gdrive=True):
+    """
+    Records a live stream URL to an MP4 file using ffmpeg without re-encoding,
     then automatically ensures it is in standard H.264 (AVC) format.
     """
-    if not os.path.exists(FFMPEG_PATH):
+    if not os.path.exists(FFMPEG_PATH) and not shutil.which(FFMPEG_PATH):
         raise FileNotFoundError(f"Không tìm thấy ffmpeg tại {FFMPEG_PATH}")
 
     now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -305,6 +344,11 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         last_live_check_time = time.time()
 
         while proc.poll() is None:
+            if stop_event and stop_event.is_set():
+                print(f"\n[!] Nhận tín hiệu dừng từ hệ thống. Đang đóng gói file video cho @{target_user}...")
+                _safe_stop_ffmpeg(proc, timeout=8)
+                break
+
             time.sleep(1)
             now = time.time()
             elapsed = int(now - start_time)
@@ -333,48 +377,24 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
                             if not is_still_live:
                                 print(f"\n\n[✓] [@{target_user}] Streamer ĐÃ XUỐNG LIVE (Không còn tín hiệu sau {stagnant_seconds}s).")
                                 print(f"[*] [@{target_user}] Đang chốt file video MP4 và lưu trữ ngay lập tức...")
-                                if proc.stdin:
-                                    try:
-                                        proc.stdin.write(b"q\n")
-                                        proc.stdin.flush()
-                                    except Exception:
-                                        pass
-                                try:
-                                    proc.wait(timeout=4)
-                                except Exception:
-                                    proc.terminate()
+                                _safe_stop_ffmpeg(proc, timeout=8)
                                 break
                         except Exception:
                             pass
 
             # Nếu 30 giây liên tiếp không nhận được bất kỳ byte nào -> Buộc kết thúc để đóng gói video
-            if size_bytes > 1024 and stagnant_seconds >= 30:
+            if stagnant_seconds >= 30:
                 print(f"\n\n[!] [@{target_user}] Tín hiệu live ngắt quãng {stagnant_seconds}s. Tự động chốt video...")
-                if proc.stdin:
-                    try:
-                        proc.stdin.write(b"q\n")
-                        proc.stdin.flush()
-                    except Exception:
-                        pass
-                try:
-                    proc.wait(timeout=4)
-                except Exception:
-                    proc.terminate()
+                _safe_stop_ffmpeg(proc, timeout=6)
                 break
 
             sys.stdout.write(f"\r🔴 Đang ghi hình: [{hours:02d}:{mins:02d}:{secs:02d}] - Dung lượng: {size_mb:.2f} MB")
             sys.stdout.flush()
 
-        proc.wait()
+        _safe_stop_ffmpeg(proc, timeout=6)
     except KeyboardInterrupt:
         print("\n\n[!] Nhận lệnh dừng từ người dùng. Đang đóng gói file video...")
-        try:
-            if proc.stdin:
-                proc.stdin.write(b"q\n")
-                proc.stdin.flush()
-            proc.wait(timeout=4)
-        except Exception:
-            proc.terminate()
+        _safe_stop_ffmpeg(proc, timeout=8)
 
     if os.path.exists(output_filename) and os.path.getsize(output_filename) > 1024:
         final_size = os.path.getsize(output_filename) / (1024 * 1024)
@@ -388,20 +408,21 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         except Exception as e:
             print(f"[!] Lỗi khi tự động kiểm tra định dạng H.264: {e}")
 
-        # Tự động gửi thông báo Telegram & đồng bộ Google Drive
-        try:
-            from notifier import send_telegram, sync_to_gdrive
-            final_mb = os.path.getsize(output_filename) / (1024 * 1024) if os.path.exists(output_filename) else 0
-            fname = os.path.basename(output_filename)
-            send_telegram(
-                f"✅ <b>Đã lưu thành công phiên Live!</b>\n"
-                f"👤 Streamer: <code>@{target_user}</code>\n"
-                f"📁 File: <code>{fname}</code>\n"
-                f"💾 Dung lượng: <b>{final_mb:.2f} MB</b> (Chuẩn H.264)"
-            )
-            sync_to_gdrive(output_filename, target_user)
-        except Exception as e:
-            print(f"[!] Lỗi khi gửi thông báo/đồng bộ đám mây: {e}")
+        # Tự động gửi thông báo Telegram & đồng bộ Google Drive nếu được yêu cầu
+        if auto_sync_gdrive:
+            try:
+                from notifier import send_telegram, sync_to_gdrive
+                final_mb = os.path.getsize(output_filename) / (1024 * 1024) if os.path.exists(output_filename) else 0
+                fname = os.path.basename(output_filename)
+                send_telegram(
+                    f"✅ <b>Đã lưu thành công phiên Live!</b>\n"
+                    f"👤 Streamer: <code>@{target_user}</code>\n"
+                    f"📁 File: <code>{fname}</code>\n"
+                    f"💾 Dung lượng: <b>{final_mb:.2f} MB</b> (Chuẩn H.264)"
+                )
+                sync_to_gdrive(output_filename, target_user)
+            except Exception as e:
+                print(f"[!] Lỗi khi gửi thông báo/đồng bộ đám mây: {e}")
 
         return output_filename
     else:

@@ -12,7 +12,11 @@ if sys.platform == "win32":
         pass
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe") if os.path.exists(os.path.join(BASE_DIR, "ffmpeg.exe")) else (shutil.which("ffmpeg") or "ffmpeg")
+if sys.platform == "win32":
+    win_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
+    FFMPEG_PATH = win_ffmpeg if os.path.exists(win_ffmpeg) else (shutil.which("ffmpeg") or "ffmpeg")
+else:
+    FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 
 _CACHED_ENCODER = None
 
@@ -88,7 +92,7 @@ def ensure_h264(filepath):
             temp_out
         ]
         try:
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
             if proc.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 1024:
                 os.remove(filepath)
                 os.rename(temp_out, filepath)

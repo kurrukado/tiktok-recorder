@@ -24,7 +24,11 @@ if sys.platform == "win32":
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
-FFMPEG_PATH = os.path.join(BASE_DIR, "ffmpeg.exe") if os.path.exists(os.path.join(BASE_DIR, "ffmpeg.exe")) else (shutil.which("ffmpeg") or "ffmpeg")
+if sys.platform == "win32":
+    win_ffmpeg = os.path.join(BASE_DIR, "ffmpeg.exe")
+    FFMPEG_PATH = win_ffmpeg if os.path.exists(win_ffmpeg) else (shutil.which("ffmpeg") or "ffmpeg")
+else:
+    FFMPEG_PATH = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
 
 import recorder_core
 import auto_h264
@@ -235,11 +239,13 @@ def get_users(check_live: bool = True):
     result = []
     for u in users:
         is_live, room_id = live_statuses.get(u, (False, None))
-        # Nếu streamer đang Live hoặc đang được bot quay -> báo "recording" chuẩn 100%
-        is_recording = (u in active_users) or is_live
+        is_recording = (u in active_users)
         if is_recording:
-            active_users.add(u)
-        status_str = "recording" if is_recording else "offline"
+            status_str = "recording"
+        elif is_live:
+            status_str = "live"
+        else:
+            status_str = "offline"
         result.append({
             "username": u,
             "is_live": is_live,
@@ -302,7 +308,7 @@ def add_user(req: AddUserRequest):
     }
 
 @app.delete("/api/users/{username}")
-def delete_user(username: str):
+def delete_user(username: str, delete_files: bool = False):
     user = username.strip().replace("@", "").lower()
     cfg = load_config()
     users = cfg.get("monitored_users", [])
@@ -322,24 +328,24 @@ def delete_user(username: str):
         except Exception:
             pass
 
-    # TỰ ĐỘNG XÓA VĨNH VIỄN THƯ MỤC TRÊN GOOGLE DRIVE
-    gdrive_status = "Chưa kết nối Google Drive"
-    try:
-        ok, msg = gdrive_manager.delete_streamer_folder_drive(user)
-        gdrive_status = msg
-    except Exception as e:
-        gdrive_status = f"Lỗi xóa folder Drive: {e}"
-
-    # Xóa cả folder local nếu có
-    local_dir = os.path.join(BASE_DIR, user)
-    if os.path.exists(local_dir):
+    # Chỉ xóa thư mục trên Drive khi người dùng yêu cầu rõ ràng (mặc định giữ lại video đã quay)
+    gdrive_status = "Giữ nguyên thư mục video trên Google Drive để bảo vệ dữ liệu"
+    if delete_files:
         try:
-            shutil.rmtree(local_dir, ignore_errors=True)
-        except Exception:
-            pass
+            ok, msg = gdrive_manager.delete_streamer_folder_drive(user)
+            gdrive_status = msg
+        except Exception as e:
+            gdrive_status = f"Lỗi xóa folder Drive: {e}"
+
+        local_dir = os.path.join(BASE_DIR, user)
+        if os.path.exists(local_dir):
+            try:
+                shutil.rmtree(local_dir, ignore_errors=True)
+            except Exception:
+                pass
 
     return {
-        "message": f"Đã xóa @{user} khỏi danh sách theo dõi và dọn dẹp Google Drive",
+        "message": f"Đã xóa @{user} khỏi danh sách theo dõi",
         "username": user,
         "gdrive_status": gdrive_status,
         "users": users
@@ -488,10 +494,18 @@ def stop_record(req: AddUserRequest):
         "username": user
     }
 
-def list_recordings_from_drive(access_token=None):
+_RECORDINGS_CACHE = {"timestamp": 0, "data": []}
+_RECORDINGS_CACHE_LOCK = threading.Lock()
+
+def list_recordings_from_drive(access_token=None, force_refresh=False):
     """
-    Quét danh sách toàn bộ video và thumbnail đã lưu trên Google Drive.
+    Quét danh sách toàn bộ video và thumbnail đã lưu trên Google Drive bằng ThreadPool song song.
     """
+    global _RECORDINGS_CACHE
+    now = time.time()
+    if not force_refresh and (now - _RECORDINGS_CACHE["timestamp"] < 10) and _RECORDINGS_CACHE["data"]:
+        return _RECORDINGS_CACHE["data"]
+
     recordings = []
     try:
         if not access_token:
@@ -505,15 +519,15 @@ def list_recordings_from_drive(access_token=None):
         q_folders = f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         res_f = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_folders, "fields": "files(id,name)"}, timeout=10)
         folders = res_f.json().get("files", [])
-        
-        for fold in folders:
+
+        def _fetch_folder_files(fold):
             uname = fold["name"]
             fid = fold["id"]
             q_files = f"'{fid}' in parents and trashed = false"
             res_files = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_files, "fields": "files(id,name,mimeType,size,createdTime)"}, timeout=10)
             files = res_files.json().get("files", [])
             thumbs = {f["name"]: f["id"] for f in files if f["name"].endswith(".jpg")}
-            
+            folder_recs = []
             for f in files:
                 fname = f["name"]
                 if fname.endswith(".mp4"):
@@ -521,7 +535,6 @@ def list_recordings_from_drive(access_token=None):
                     thumb_name = base_name + ".jpg"
                     thumb_id = thumbs.get(thumb_name)
                     
-                    # Parse ngày giờ trước khi bắt đầu bấm máy quay từ tên file {user}_{YYYY-MM-DD}_{HH-MM-SS}
                     recorded_at = None
                     date_match = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", fname)
                     if date_match:
@@ -532,7 +545,7 @@ def list_recordings_from_drive(access_token=None):
                         
                     sz_bytes = int(f.get("size", 0))
                     cdn_url = f"https://drive.usercontent.google.com/download?id={f['id']}&export=download&authuser=0"
-                    recordings.append({
+                    folder_recs.append({
                         "filename": fname,
                         "user": uname,
                         "size_bytes": sz_bytes,
@@ -546,6 +559,17 @@ def list_recordings_from_drive(access_token=None):
                         "drive_thumb_id": thumb_id,
                         "source": "google_drive"
                     })
+            return folder_recs
+
+        if folders:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(folders), 8)) as ex:
+                results = ex.map(_fetch_folder_files, folders)
+                for r in results:
+                    recordings.extend(r)
+
+        with _RECORDINGS_CACHE_LOCK:
+            _RECORDINGS_CACHE["timestamp"] = now
+            _RECORDINGS_CACHE["data"] = recordings
     except Exception as e:
         print(f"[!] Lỗi lấy danh sách video từ Google Drive: {e}")
     return recordings
