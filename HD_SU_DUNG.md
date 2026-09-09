@@ -78,6 +78,9 @@ Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.26
   - Mỗi video giới hạn tối đa 1 tiếng 56 phút. Khi live kéo dài nhiều tiếng, bot tự động ngắt Part 1 tải lên Drive và quay tiếp Part 2 liên tục không ngắt quãng.
 - 🔴 **Vượt Rào Cản 18+ & Không Bị Chặn:**
   - Bóc tách dữ liệu SIGI_STATE kết hợp Cookie `sessionid_ss`, không bị lỗi giới hạn độ tuổi của TikTok.
+- ⚡ **Quét Live Đa Luồng & Phân Tách Rõ Ràng LIVE / REC:**
+  - `cloud_daemon` quét trạng thái toàn bộ danh sách streamer song song qua `ThreadPoolExecutor` (chỉ 2-3s/chu kỳ thay vì quét tuần tự).
+  - Phân tách rõ ràng trạng thái: 🟢 **LIVE** (streamer đang phát sóng trên TikTok) và 🔴 **REC** (bot đang thực sự ghi hình luồng). Giao diện web hỗ trợ nút **Ghi ngay** và **Dừng ghi** chủ động.
 
 ---
 
