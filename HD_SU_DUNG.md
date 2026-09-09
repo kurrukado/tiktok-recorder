@@ -1,249 +1,303 @@
 # 📖 HƯỚNG DẪN SỬ DỤNG HỆ THỐNG TIKTOK RECORDER 24/7 & REST API
 
-Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.264 (AVC) và tự động đồng bộ lên Google Drive. Hỗ trợ chạy ngầm 24/7 trên đám mây miễn phí và cung cấp REST API để tích hợp vào website khác.
+Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.264 (AVC) và tự động đồng bộ lên Google Drive. Hệ thống hoạt động hoàn toàn miễn phí 24/7 trên đám mây (GitHub Actions & Render) và cung cấp REST API tốc độ cao để tích hợp vào bất kỳ website nào.
 
 ---
 
 ## 📑 MỤC LỤC
-1. [Tính năng nổi bật](#1-tính-năng-nổi-bật)
-2. [Cấu trúc thư mục lưu trữ](#2-cấu-trúc-thư-mục-lưu-trữ)
-3. [Cách 1: Chạy 24/7 trên Đám mây GitHub Actions (Tắt máy tính vẫn chạy)](#3-cách-1-chạy-247-trên-đám-mây-github-actions-tắt-máy-tính-vẫn-chạy)
-4. [Cách 2: Chạy trực tiếp trên máy tính của bạn](#4-cách-2-chạy-trực-tiếp-trên-máy-tính-của-bạn)
-5. [Cách 3: Tích hợp REST API vào Website khác](#5-cách-3-tích-hợp-rest-api-vào-website-khác)
-6. [Tải xuống video với tốc độ cao](#6-tải-xuống-video-với-tốc-độ-cao)
-7. [Giải thích các file trong mã nguồn](#7-giải-thích-các-file-trong-mã-nguồn)
-8. [Cách cập nhật Cookie TikTok (Khi cần)](#8-cách-cập-nhật-cookie-tiktok-khi-cần)
+1. [Kiến trúc hệ thống Cloud 100% Miễn phí](#1-kiến-trúc-hệ-thống-cloud-100-miễn-phí)
+2. [Tính năng nổi bật mới cập nhật](#2-tính-năng-nổi-bật-mới-cập-nhật)
+3. [Cấu trúc thư mục lưu trữ](#3-cấu-trúc-thư-mục-lưu-trữ)
+4. [Cách 1: Vận hành 24/7 trên Đám mây (Không cần bật máy tính)](#4-cách-1-vận-hành-247-trên-đám-mây-không-cần-bật-máy-tính)
+5. [Cách 2: Chạy trực tiếp trên máy tính cá nhân](#5-cách-2-chạy-trực-tiếp-trên-máy-tính-cá-nhân)
+6. [Cách 3: Tích hợp REST API vào Website khác](#6-cách-3-tích-hợp-rest-api-vào-website-khác)
+7. [Xem Video Trực Tuyến & Tải Tốc Độ Cao (Google Edge CDN)](#7-xem-video-trực-tuyến--tải-tốc-độ-cao-google-edge-cdn)
+8. [Giải thích các file trong mã nguồn](#8-giải-thích-các-file-trong-mã-nguồn)
+9. [Cách cập nhật Cookie TikTok (Khi cần)](#9-cách-cập-nhật-cookie-tiktok-khi-cần)
 
 ---
 
-## 1. TÍNH NĂNG NỔI BẬT
+## 1. KIẾN TRÚC HỆ THỐNG CLOUD 100% MIỄN PHÍ
 
-- 🟢 **Chạy ngầm 24/7 trên Cloud:** Chạy trên máy chủ Microsoft/GitHub miễn phí, không tốn điện, bạn tắt máy tính vẫn tự động quay.
-- ⚡ **Ghi hình Đa Luồng Song Song (Tối đa 10 streamer cùng lúc):** Không bị chặn tuần tự; nếu 5-10 người cùng live một lúc, bot sẽ tạo 10 luồng riêng để quay đồng thời tất cả mọi người.
-- ✂️ **Tự động Cắt Chia Nhỏ Dưới 2 Tiếng (< 2h/phần):** Mỗi video live tối đa 1 tiếng 56 phút. Nếu live dài 6-8 tiếng, bot tự động đóng file Part 1, cắt ảnh thumbnail, up lên Google Drive, và **ngay lập tức ghi tiếp Part 2** hoàn toàn không làm gián đoạn bot.
-- 🔴 **Bỏ qua giới hạn 18+:** Sử dụng thuật toán bóc tách SIGI_STATE kết hợp cookie `sessionid_ss`, không bị lỗi chặn lứa tuổi của TikTok.
-- 🎬 **Chuẩn nén H.264 (AVC) + AAC:** Xuất file MP4 chuẩn quốc tế, mở xem được ngay trên mọi điện thoại (iPhone, Android) và máy tính mà không cần cài thêm phần mềm.
-- ☁️ **Đồng bộ tự động lên Google Drive:** Tự động tạo thư mục riêng cho từng streamer trên Google Drive của bạn (`tiktok-record/<user>/`).
-- ⚡ **REST API đầy đủ CORS & Giám sát Live Status:** Cung cấp API trực tuyến trên Cloud (Render) để xem ai đang được quay, thêm/xóa streamer và tải video tốc độ cao.
+```text
+               ┌────────────────────────────────────────────────────────┐
+               │              GIAO DIỆN WEB CỦA BẠN                     │
+               │   (Hiển thị Streamer, Xem Video HTML5, Tải IDM CDN)    │
+               └───────────────▲────────────────────────▲───────────────┘
+                               │                        │
+                    REST API (JSON)            Google Edge CDN URL
+                               │                 (Tua video Range 206)
+                               ▼                        │
+┌──────────────────────────────────────────────────┐    │
+│              RENDER.COM (API SERVER)             │    │
+│  - Endpoint: https://tiktok-api-as2y.onrender.com│    │
+│  - Tiếp nhận thêm/xóa streamer                   │    │
+│  - Tự động tạo/xóa thư mục trên Google Drive     │    │
+│  - Cung cấp link phát CDN và ảnh Thumbnail 50%   │    │
+└──────────────────────┬───────────────────────────┘    │
+                       │ Đồng bộ danh sách              │
+                       ▼ streamers.json                 │
+┌──────────────────────────────────────────────────┐    │
+│                 GOOGLE DRIVE                     │────┘
+│  - Thư mục gốc: tiktok-record/                   │
+│  - Chứa streamers.json (danh sách theo dõi)      │
+│  - Lưu trữ video MP4 và ảnh Thumbnail JPG        │
+└──────────────────────▲───────────────────────────┘
+                       │ Upload video tự động (sau 30s)
+┌──────────────────────┴───────────────────────────┐
+│           GITHUB ACTIONS (CLOUD RUNNER)          │
+│  - Chạy ngầm 24/7 vĩnh viễn (Ubuntu + FFmpeg)    │
+│  - Kiểm tra live đa luồng mỗi 15 giây            │
+│  - Live-End Watchdog (nhận biết tắt live tức thì)│
+│  - Chuyển mã H.264 (AVC) + Đóng file MP4 sạch sẽ │
+└──────────────────────────────────────────────────┘
+```
 
 ---
 
-## 2. CẤU TRÚC THƯ MỤC LƯU TRỮ
+## 2. TÍNH NĂNG NỔI BẬT MỚI CẬP NHẬT
+
+- ⚡ **Live-End Watchdog (Tải lên Drive sau 30-45 giây):**
+  - Khắc phục triệt để lỗi streamer tắt live nhưng video không tải lên (do kết nối mạng giữ trạng thái treo).
+  - Tích hợp bộ giám sát dữ liệu đọng (Stagnant Data Watchdog): Khi file ngừng tăng dung lượng quá 12 giây, hệ thống tự động kiểm tra trạng thái phòng live. Nếu streamer đã tắt live, bot lập tức đóng luồng FFmpeg sạch sẽ (ghi đầy đủ `moov atom`), cắt thumbnail và **tải video lên Google Drive chỉ trong 30-45 giây**.
+- 🚀 **Phát hiện & Ghi hình Thần tốc (15 - 35 giây):**
+  - Khi bạn thêm streamer mới trên Website (`POST /api/users`), hệ thống đồng bộ ngay lên Google Drive. Bot đám mây quét danh sách mỗi 15 giây và sẽ bắt đầu ghi hình ngay sau 15-35 giây nếu người đó đang phát trực tiếp.
+- 🌐 **Google Edge CDN & Tua Video Tức Thì (HTTP Range 206):**
+  - Tất cả video được tự động phân quyền công khai và sinh link tải trực tiếp qua máy chủ Google Edge CDN (`drive.usercontent.google.com`).
+  - Hỗ trợ chuẩn **HTTP 206 Partial Content**: Bạn có thể nhúng trực tiếp vào thẻ `<video controls>` trên website để xem và tua đến bất kỳ đoạn nào mà không cần đợi tải toàn bộ video về.
+  - Hỗ trợ tải đa luồng qua IDM, Aria2 với băng thông tối đa của đường truyền Internet (100MB/s+).
+- 📁 **Quản lý Vòng đời Thư mục Tự động trên Google Drive:**
+  - `POST /api/users`: Tự động tạo thư mục riêng `tiktok-record/<tên_streamer>/` trên Google Drive ngay tức thì.
+  - `DELETE /api/users/{username}`: Tự động xóa vĩnh viễn thư mục của streamer trên Google Drive (kèm toàn bộ video đã lưu) để tự động giải phóng dung lượng bộ nhớ.
+- 🖼️ **Thumbnail 50% Thời Lượng & Timestamp Chuẩn:**
+  - Mỗi video được tự động cắt ảnh đại diện tại thời điểm chính giữa (50% thời lượng video) bằng FFmpeg.
+  - API `GET /api/recordings` trả về trường `recorded_at` (`YYYY-MM-DD HH:MM:SS`) và `thumbnail_url` giúp website hiển thị lịch sử ghi hình trực quan, đẹp mắt.
+- ⚡ **Ghi hình Đa Luồng Song Song (Tối đa 10 streamer):**
+  - Ghi hình đồng thời nhiều streamer mà không bị nghẽn mạng hay chặn luồng.
+- ✂️ **Tự động Cắt Chia Nhỏ Dưới 2 Tiếng (< 2h/part):**
+  - Mỗi video giới hạn tối đa 1 tiếng 56 phút. Khi live kéo dài nhiều tiếng, bot tự động ngắt Part 1 tải lên Drive và quay tiếp Part 2 liên tục không ngắt quãng.
+- 🔴 **Vượt Rào Cản 18+ & Không Bị Chặn:**
+  - Bóc tách dữ liệu SIGI_STATE kết hợp Cookie `sessionid_ss`, không bị lỗi giới hạn độ tuổi của TikTok.
+
+---
+
+## 3. CẤU TRÚC THƯ MỤC LƯU TRỮ
 
 ### Trên Google Drive của bạn:
 ```text
 Google Drive
 └── tiktok-record/
+    ├── streamers.json                  <- Danh sách streamer đang được theo dõi
     ├── islizanx/
-    │   └── islizanx_2026-09-09_00-33-27.mp4
+    │   ├── islizanx_2026-09-09_22-51-16.mp4
+    │   └── islizanx_2026-09-09_22-51-16.jpg   (Thumbnail 50%)
     ├── itsme_kate0110/
-    │   └── itsme_kate0110_live_2026-08-21_09-35-12.mp4
+    │   ├── itsme_kate0110_2026-08-21_09-35-12.mp4
+    │   └── itsme_kate0110_2026-08-21_09-35-12.jpg
     └── urielhui38/
-        └── urielhui38_2026-09-08_23-43-48.mp4
-```
-
-### Trên máy tính cá nhân:
-```text
-D:\New folder\
-├── islizanx/           <- Chứa video của @islizanx
-├── itsme_kate0110/     <- Chứa video của @itsme_kate0110
-└── urielhui38/         <- Chứa video của @urielhui38
+        ├── urielhui38_2026-09-08_23-43-48.mp4
+        └── urielhui38_2026-09-08_23-43-48.jpg
 ```
 
 ---
 
-## 3. CÁCH 1: CHẠY 24/7 TRÊN ĐÁM MÂY GITHUB ACTIONS (TẮT MÁY TÍNH VẪN CHẠY)
+## 4. CÁCH 1: VẬN HÀNH 24/7 TRÊN ĐÁM MÂY (KHÔNG CẦN BẬT MÁY TÍNH)
 
-Đây là cách tốt nhất để bạn không cần bật máy tính.
+Đây là chế độ khuyên dùng: toàn bộ quá trình canh live, ghi hình, nén file và tải lên Google Drive đều do máy chủ Microsoft/GitHub thực hiện hoàn toàn miễn phí.
 
 ### Bước 1: Cấp quyền Workflow trên GitHub
-1. Vào kho lưu trữ của bạn: https://github.com/kurrukado/tiktok-recorder
-2. Vào tab **Settings** ➔ Menu bên trái chọn **Actions** ➔ **General**.
+1. Mở repository: `https://github.com/kurrukado/tiktok-recorder`
+2. Vào **Settings** ➔ Menu bên trái chọn **Actions** ➔ **General**.
 3. Kéo xuống mục **Workflow permissions** ➔ Tích chọn: **Read and write permissions** ➔ Bấm **Save**.
 
-### Bước 2: Thêm 4 biến bí mật (Secrets)
+### Bước 2: Cài đặt 4 biến Secrets trên GitHub
 Vào **Settings** ➔ **Secrets and variables** ➔ **Actions** ➔ Bấm **New repository secret**:
-- `GOOGLE_CLIENT_ID`: Nhập Google OAuth Client ID của bạn
-- `GOOGLE_CLIENT_SECRET`: Nhập Google OAuth Client Secret của bạn
-- `GDRIVE_REFRESH_TOKEN`: Nhập Refresh Token Google Drive của bạn
-- `TIKTOK_SESSION_ID`: Nhập sessionid_ss từ cookie TikTok của bạn
+- `GOOGLE_CLIENT_ID`: Nhập Client ID từ file `config.json`
+- `GOOGLE_CLIENT_SECRET`: Nhập Client Secret từ file `config.json`
+- `GDRIVE_REFRESH_TOKEN`: Nhập Refresh Token Google Drive từ file `config.json`
+- `TIKTOK_SESSION_ID`: Nhập sessionid_ss từ file `cookies.json`
 
-### Bước 3: Bấm chạy
+### Bước 3: Kích hoạt Bot
 1. Vào tab **Actions** trên GitHub.
-2. Bấm vào quy trình **TikTok 24-7 Auto Recorder** ở cột bên trái.
+2. Chọn workflow **TikTok 24-7 Auto Recorder** ở cột bên trái.
 3. Bấm **Run workflow** ➔ **Run workflow**.
 
-> 💡 **Cơ chế:** Máy chủ Microsoft sẽ chạy liên tục, tự canh live, tự tải video vào Google Drive, và tự kích hoạt phiên tiếp theo để duy trì 24/7 vĩnh viễn.
+> 💡 **Cơ chế tự duy trì:** Bot chạy liên tục theo chu kỳ. Khi phiên runner sắp chạm giới hạn thời gian của GitHub, quy trình tự kích hoạt phiên tiếp theo để duy trì trạng thái 24/7 vĩnh viễn không ngắt quãng.
 
 ---
 
-## 4. CÁCH 2: CHẠY TRỰC TIẾP TRÊN MÁY TÍNH CỦA BẠN
+## 5. CÁCH 2: CHẠY TRỰC TIẾP TRÊN MÁY TÍNH CÁ NHÂN
 
-Nếu bạn đang bật máy tính và muốn ghi hình trực tiếp bằng card màn hình GPU:
+Nếu bạn muốn chạy trực tiếp trên máy bàn hoặc laptop cá nhân:
 
-### 1. Bật chế độ tự động canh live:
 ```powershell
+# 1. Bật tự động canh live liên tục:
 python tiktok_recorder.py
-```
-*(Chương trình sẽ kiểm tra danh sách người dùng mỗi 20 giây, ai live là tự quay ngay).*
 
-### 2. Quay ngay lập tức một người:
-```powershell
+# 2. Ghi hình ngay lập tức một streamer cụ thể:
 python tiktok_recorder.py --user islizanx --now
-```
 
-### 3. Tải toàn bộ video hiện có lên Google Drive:
-```powershell
+# 3. Quét và tải thủ công toàn bộ video lên Google Drive:
 python gdrive_manager.py --upload-all
 ```
 
 ---
 
-## 5. CÁCH 3: TÍCH HỢP REST API VÀO WEBSITE KHÁC
+## 6. CÁCH 3: TÍCH HỢP REST API VÀO WEBSITE KHÁC
 
-API được lập trình bằng FastAPI và đã được triển khai chạy trực tuyến 24/7 trên Cloud (Render.com), hỗ trợ đầy đủ CORS và chứng chỉ bảo mật HTTPS. Bạn không cần bật máy tính ở nhà mà website tích hợp vẫn hoạt động bình thường.
+Hệ thống cung cấp REST API trực tuyến chuẩn OpenAPI/Swagger được triển khai sẵn trên Cloud (Render):
+- **Base URL:** `https://tiktok-api-as2y.onrender.com`
+- **Tài liệu trực quan & Test API (Swagger UI):** [`https://tiktok-api-as2y.onrender.com/docs`](https://tiktok-api-as2y.onrender.com/docs)
+- **Hỗ trợ CORS:** `*` (Cho phép mọi frontend gọi trực tiếp qua AJAX / Fetch).
 
-### 🌐 Địa chỉ Server API Trực Tuyến:
-- **API Base URL:** `https://tiktok-api-as2y.onrender.com`
-- **Giao diện thử nghiệm trực quan (Swagger UI):** [`https://tiktok-api-as2y.onrender.com/docs`](https://tiktok-api-as2y.onrender.com/docs)
+### Bảng chi tiết các API:
 
-*(Nếu bạn muốn chạy server trực tiếp dưới máy tính cá nhân, chỉ cần chạy lệnh: `python api_server.py`, server sẽ lắng nghe tại `http://localhost:8000`).*
-
----
-
-### 🔄 Cơ chế Đồng bộ & Quản lý Thư mục Tự động (Google Drive $\leftrightarrow$ Web $\leftrightarrow$ Bot GitHub):
-1. **Khi bạn bấm "Thêm streamer" (`POST /api/users`) trên Website:**
-   - API tự động **tạo ngay lập tức thư mục `tiktok-record/<tên_streamer>/` trên Google Drive** của bạn. Bạn mở Google Drive ra là thấy thư mục xuất hiện ngay!
-   - Cập nhật streamer mới vào file `streamers.json` trên Google Drive.
-   - Bot **GitHub Actions** (đang chạy ngầm 24/7) tự động nhận diện streamer mới này và bắt đầu ghi hình ngay nếu họ đang phát trực tiếp.
-2. **Khi bạn bấm "Xóa streamer" (`DELETE /api/users/{username}`) trên Dashboard Web:**
-   - API tự động **xóa vĩnh viễn thư mục `tiktok-record/<tên_streamer>/` trên Google Drive** (kèm toàn bộ video bên trong nếu có) để giải phóng dung lượng Google Drive cho bạn.
-   - Xóa streamer khỏi danh sách theo dõi, bot GitHub Actions sẽ ngừng quay streamer đó.
-
-> ⚠️ **LƯU Ý QUAN TRỌNG (Để API Render có quyền truy cập Google Drive):**
-> Trong [Render Dashboard](https://dashboard.render.com/) ➔ Chọn dịch vụ `tiktok-api-as2y` ➔ Mục **Environment** ➔ Bắt buộc phải có 3 biến môi trường sau để Render có quyền tạo/xóa thư mục trên Google Drive:
-> - `GOOGLE_CLIENT_ID`: (Nhập giá trị `google_client_id` trong file config.json)
-> - `GOOGLE_CLIENT_SECRET`: (Nhập giá trị `google_client_secret` trong file config.json)
-> - `GDRIVE_REFRESH_TOKEN`: (Nhập giá trị `gdrive_refresh_token` trong file config.json)
-
----
-
-### Bảng chi tiết các API chính:
-
-| Phương thức | Endpoint URL | Chức năng |
+| Phương thức | Endpoint URL | Mô tả chức năng |
 | :--- | :--- | :--- |
-| `GET` | `/api/recordings/active` | **Xem ai đang được ghi hình thời gian thực** (Đồng bộ trực tiếp từ Cloud Bot) |
-| `GET` | `/api/users` | Lấy danh sách streamer đang theo dõi (kèm trạng thái `is_recording` chuẩn 100%) |
-| `POST` | `/api/users` | **Thêm streamer & Tự động tạo thư mục riêng trên Google Drive** |
+| `GET` | `/api/users` | Lấy danh sách streamer, kèm trạng thái live và `status: "recording"` |
+| `POST` | `/api/users` | **Thêm streamer mới & Tự động tạo thư mục riêng trên Google Drive** |
 | `DELETE` | `/api/users/{username}` | **Xóa streamer & Tự động xóa vĩnh viễn thư mục trên Google Drive** |
-| `GET` | `/api/stream/{username}` | Lấy link stream CDN trực tiếp để tải/xem tốc độ cao |
-| `POST` | `/api/record/start` | Kích hoạt bắt đầu ghi hình ngay lập tức |
-| `GET` | `/api/recordings` | Lấy danh sách toàn bộ video đã quay (kèm `recorded_at`, link ảnh 50%, link CDN) |
-| `GET` | `/api/thumbnail/{user}/{filename}` | **Lấy ảnh xem trước (Thumbnail)** tự động cắt từ chính giữa video (50% thời lượng) |
-| `GET` | `/api/download/{user}/{filename}` | Tải video tốc độ cao (Tự động chuyển hướng đến Google Edge CDN) |
-| `GET` | `/api/cdn/{user}/{filename}` | **Lấy link Google Edge CDN trực tiếp** (Hỗ trợ IDM đa luồng, tua video Range 206) |
+| `GET` | `/api/recordings/active` | **Xem ai đang được bot quay thời gian thực** (Kèm phòng live và file tạm) |
+| `GET` | `/api/recordings` | Lấy danh sách video đã quay (kèm `recorded_at`, link ảnh 50%, link CDN) |
+| `GET` | `/api/cdn/{user}/{filename}` | **Lấy link Google Edge CDN trực tiếp** (Phục vụ stream Range 206 / IDM) |
+| `GET` | `/api/download/{user}/{filename}` | Tải video (Redirect 302 trực tiếp sang Google Edge CDN) |
+| `GET` | `/api/thumbnail/{user}/{filename}` | Lấy ảnh đại diện cắt tại mốc 50% video |
+| `GET` | `/api/stream/{username}` | Lấy link stream gốc của TikTok để phát trực tiếp |
 
 ---
 
-### Code mẫu JavaScript để nhúng vào Website của bạn:
+### Cấu trúc dữ liệu mẫu (JSON Response):
 
-```javascript
-// Đường dẫn API trực tuyến trên Render (Hoạt động 24/7)
-const API_BASE = "https://tiktok-api-as2y.onrender.com";
-
-// 1. Lấy danh sách streamer đang theo dõi
-async function getStreamers() {
-  try {
-    const res = await fetch(`${API_BASE}/api/users`);
-    const data = await res.json();
-    console.log("Danh sách streamer:", data.streamers);
-    return data.streamers; // Ví dụ: ['islizanx', 'itsme_kate0110', 'urielhui38']
-  } catch (err) {
-    console.error("Lỗi khi tải danh sách:", err);
-  }
+#### 1. Lấy danh sách streamer (`GET /api/users`):
+```json
+{
+  "streamers": ["islizanx", "urielhui38"],
+  "details": [
+    {
+      "username": "islizanx",
+      "is_live": true,
+      "is_recording": true,
+      "status": "recording",
+      "room_id": "7683563035756694279"
+    },
+    {
+      "username": "urielhui38",
+      "is_live": false,
+      "is_recording": false,
+      "status": "offline",
+      "room_id": null
+    }
+  ]
 }
+```
 
-// 2. Thêm một streamer mới
-async function addStreamer(username) {
-  const cleanUser = username.trim().replace('@', '').toLowerCase();
-  try {
-    const res = await fetch(`${API_BASE}/api/users`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username: cleanUser })
-    });
-    const data = await res.json();
-    alert(data.message);
-  } catch (err) {
-    alert("Không thể kết nối tới server API!");
-  }
-}
-
-// 3. Xóa một streamer khỏi danh sách
-async function deleteStreamer(username) {
-  const cleanUser = username.trim().replace('@', '').toLowerCase();
-  try {
-    const res = await fetch(`${API_BASE}/api/users/${cleanUser}`, {
-      method: "DELETE"
-    });
-    const data = await res.json();
-    alert(data.message);
-  } catch (err) {
-    alert("Không thể kết nối tới server API!");
-  }
-}
-
-// 4. Lấy link CDN tải tốc độ tối đa đường truyền
-async function getHighSpeedDownload(username) {
-  const cleanUser = username.trim().replace('@', '').toLowerCase();
-  const res = await fetch(`${API_BASE}/api/stream/${cleanUser}`);
-  const data = await res.json();
-  if (data.is_live) {
-    window.open(data.stream_url);
-  } else {
-    alert('Streamer hiện không online');
-  }
+#### 2. Lấy danh sách video đã lưu (`GET /api/recordings`):
+```json
+{
+  "count": 1,
+  "recordings": [
+    {
+      "user": "islizanx",
+      "filename": "islizanx_2026-09-09_22-51-16.mp4",
+      "size": 154201840,
+      "size_human": "147.06 MB",
+      "recorded_at": "2026-09-09 22:51:16",
+      "url": "https://drive.google.com/uc?id=1AbCdEfGh...",
+      "cdn_download_url": "https://drive.usercontent.google.com/download?id=1AbCdEfGh...&export=download&authuser=0",
+      "thumbnail_url": "https://tiktok-api-as2y.onrender.com/api/thumbnail/islizanx/islizanx_2026-09-09_22-51-16.jpg"
+    }
+  ]
 }
 ```
 
 ---
 
-## 6. TẢI XUỐNG VIDEO VỚI TỐC ĐỘ CAO
+### Code JavaScript mẫu tích hợp Frontend:
 
-Hệ thống cung cấp 2 giải pháp tải tốc độ cao:
+```javascript
+const API_BASE = "https://tiktok-api-as2y.onrender.com";
 
-1. **Tải trực tiếp từ máy chủ CDN TikTok (Tối đa đường truyền):**
-   - Sử dụng API `GET /api/stream/{username}` để lấy link CDN gốc (`pull-flv-...tiktokcdn.com`).
-   - Mở link này bằng trình duyệt hoặc phần mềm IDM để tải với tốc độ tối đa của mạng Internet (hàng chục MB/giây) mà không tiêu tốn băng thông của máy chủ bạn.
+// 1. Thêm một streamer mới (Tự tạo thư mục trên Drive & Bot tự ghi sau 15-35s)
+async function addStreamer(username) {
+  const cleanUser = username.trim().replace('@', '').toLowerCase();
+  const res = await fetch(`${API_BASE}/api/users`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: cleanUser })
+  });
+  const data = await res.json();
+  console.log(data.message);
+}
 
-2. **Tải từ Google Drive:**
-   - Tất cả video được tự động đẩy lên thư mục `tiktok-record/` trên Google Drive của bạn.
-   - Bạn có thể bật tính năng chia sẻ link của Google Drive để bất kỳ ai cũng có thể tải về với tốc độ cao không giới hạn từ hạ tầng máy chủ của Google.
+// 2. Xóa một streamer (Tự dọn dẹp & giải phóng dung lượng Drive)
+async function deleteStreamer(username) {
+  const cleanUser = username.trim().replace('@', '').toLowerCase();
+  const res = await fetch(`${API_BASE}/api/users/${cleanUser}`, {
+    method: "DELETE"
+  });
+  const data = await res.json();
+  console.log(data.message);
+}
+
+// 3. Tải danh sách video và hiển thị lên giao diện
+async function loadRecordedVideos() {
+  const res = await fetch(`${API_BASE}/api/recordings`);
+  const data = await res.json();
+  
+  data.recordings.forEach(video => {
+    console.log(`Video: ${video.filename}`);
+    console.log(`Thời gian ghi: ${video.recorded_at}`);
+    console.log(`Ảnh đại diện: ${video.thumbnail_url}`);
+    console.log(`Link phát tốc độ cao: ${video.cdn_download_url}`);
+  });
+}
+```
 
 ---
 
-## 7. GIẢI THÍCH CÁC FILE TRONG MÃ NGUỒN
+## 7. XEM VIDEO TRỰC TUYẾN & TẢI TỐC ĐỘ CAO (GOOGLE EDGE CDN)
 
-| Tên file | Chức năng |
+Hệ thống sử dụng cơ chế liên kết trực tiếp Google Edge CDN:
+`https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0`
+
+### 1. Nhúng phát trực tiếp trên Website bằng thẻ `<video>` HTML5:
+Nhờ hỗ trợ chuẩn **HTTP 206 Partial Content**, người dùng xem web có thể phát ngay và tua tiến/lùi mượt mà mà không phải tải toàn bộ video về máy:
+
+```html
+<video width="640" height="360" controls poster="https://tiktok-api-as2y.onrender.com/api/thumbnail/islizanx/islizanx_2026-09-09_22-51-16.jpg">
+  <source src="https://drive.usercontent.google.com/download?id=MÃ_FILE_ID&export=download&authuser=0" type="video/mp4">
+  Trình duyệt của bạn không hỗ trợ thẻ video.
+</video>
+```
+
+### 2. Tải bằng Internet Download Manager (IDM) hoặc Trình duyệt:
+- Tự động bỏ qua màn hình cảnh báo virus của Google Drive đối với file lớn trên 100MB.
+- Cho phép chia nhỏ luồng tải (multithreading), đạt tốc độ tối đa của gói cước Internet.
+
+---
+
+## 8. GIẢI THÍCH CÁC FILE TRONG MÃ NGUỒN
+
+| Tên file | Chức năng chính |
 | :--- | :--- |
-| `cloud_daemon.py` | Kịch bản chạy ngầm 24/7 trên đám mây GitHub Actions |
-| `api_server.py` | Máy chủ REST API (FastAPI) để kết nối vào website bên ngoài |
-| `recorder_core.py` | Lõi bóc tách livestream TikTok, giải mã 18+ và thu sóng FFmpeg |
-| `auto_h264.py` | Tự động kiểm tra và chuyển mã sang chuẩn H.264 (AVC) + AAC |
-| `gdrive_manager.py`| Tự động tạo thư mục và tải video lên Google Drive qua OAuth |
-| `gdrive_auth.py` | Trình xác thực và lấy Refresh Token của Google Drive |
-| `config.json` | Cấu hình danh sách người dùng và mã xác thực Google Drive |
-| `cookies.json` | Chứa cookie phiên làm việc TikTok (sessionid_ss) |
-| `.github/workflows/recorder.yml` | File cấu hình chạy tự động 24/7 của GitHub Actions |
+| `cloud_daemon.py` | Tiến trình điều phối chạy ngầm 24/7 trên GitHub Actions, kiểm tra live đa luồng mỗi 15s |
+| `recorder_core.py` | Lõi thu sóng TikTok, giải mã 18+, tích hợp Live-End Watchdog tự ngắt khi hết live |
+| `api_server.py` | Máy chủ REST API FastAPI trên Render, quản lý streamer, thư mục Drive và link CDN |
+| `gdrive_manager.py`| Điều khiển Google Drive API: tạo/xóa thư mục streamer, upload file, sinh link CDN công khai |
+| `gdrive_auth.py` | Tiện ích hỗ trợ cấp phép xác thực OAuth 2.0 cho Google Drive |
+| `auto_h264.py` | Hỗ trợ kiểm tra và chuyển mã H.264 (AVC) + AAC nếu cần thiết |
+| `config.json` | Chứa danh sách cấu hình và thông tin định danh Google Drive |
+| `cookies.json` | Chứa cookie phiên đăng nhập TikTok (`sessionid_ss`) |
+| `.github/workflows/recorder.yml` | Kịch bản tự động hóa điều phối vòng lặp 24/7 của GitHub Actions |
 
 ---
 
-## 8. CÁCH CẬP NHẬT COOKIE TIKTOK (KHI CẦN)
+## 9. CÁCH CẬP NHẬT COOKIE TIKTOK (KHI CẦN)
 
-Nếu sau vài tháng cookie bị hết hạn hoặc bạn đổi mật khẩu TikTok:
-1. Đăng nhập TikTok trên trình duyệt máy tính.
+Nếu sau thời gian dài cookie TikTok bị hết hạn hoặc bạn đổi mật khẩu:
+1. Đăng nhập tài khoản TikTok trên trình duyệt máy tính.
 2. Bấm phím **F12** ➔ Chọn tab **Application** (hoặc **Bộ nhớ**) ➔ Chọn mục **Cookies** (`https://www.tiktok.com`).
-3. Tìm dòng có tên **`sessionid_ss`** và copy giá trị chuỗi ký tự đó.
+3. Tìm dòng có tên **`sessionid_ss`** và sao chép chuỗi ký tự giá trị.
 4. Cập nhật lại vào:
-   - File `cookies.json` trên máy tính.
-   - Biến `TIKTOK_SESSION_ID` trong mục **GitHub Secrets** của bạn.
+   - File `cookies.json` trên máy tính: `{"sessionid_ss": "CHUỖI_MỚI"}`
+   - Biến `TIKTOK_SESSION_ID` trong **GitHub Secrets** của repository.
