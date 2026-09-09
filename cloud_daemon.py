@@ -167,7 +167,23 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True):
                 except Exception as th_err:
                     log(f"[!] [@{user}] Lỗi tạo thumbnail: {th_err}")
 
-                # 2. Tải video & thumbnail lên Google Drive
+                # 2. Tự động đồng bộ ngay vào Supabase Storage (ảnh thumbnail) & Database
+                rec_file_name = os.path.basename(rec_result)
+                rec_file_size = os.path.getsize(rec_result) if os.path.exists(rec_result) else 0
+                try:
+                    import supabase_sync
+                    log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
+                    supabase_sync.sync_recording_to_supabase(
+                        user=user,
+                        filename=rec_file_name,
+                        size_bytes=rec_file_size,
+                        thumb_source=thumb_file,
+                        source="cloud_daemon"
+                    )
+                except Exception as sb_err:
+                    log(f"[!] [@{user}] Lỗi đồng bộ Supabase: {sb_err}")
+
+                # 3. Tải video & thumbnail lên Google Drive
                 try:
                     log(f"[*] [@{user}] Đang tải Phần {part_number} lên Google Drive...")
                     tok = gdrive_manager.get_access_token()

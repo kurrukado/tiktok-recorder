@@ -383,7 +383,19 @@ def bg_record_worker(user: str, duration: Optional[int]):
         if stream_url:
             output_file = recorder_core.record_stream_ffmpeg(stream_url, target_user=user, duration=duration)
             if output_file and os.path.exists(output_file):
-                extract_middle_thumbnail(output_file)
+                thumb_f = extract_middle_thumbnail(output_file)
+                try:
+                    import supabase_sync
+                    sz = os.path.getsize(output_file)
+                    supabase_sync.sync_recording_to_supabase(
+                        user=user,
+                        filename=os.path.basename(output_file),
+                        size_bytes=sz,
+                        thumb_source=thumb_f,
+                        source="api_server"
+                    )
+                except Exception as sb_err:
+                    print(f"[!] Lỗi đồng bộ Supabase từ bg_record_worker: {sb_err}")
                 token = gdrive_manager.get_access_token()
                 if token:
                     root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
@@ -602,6 +614,37 @@ def list_recordings():
     files_list = list(merged_files.values())
     files_list.sort(key=lambda x: x.get("recorded_at") or x.get("created_at") or "", reverse=True)
     return {"total_files": len(files_list), "recordings": files_list}
+
+@app.post("/api/recordings/sync-supabase")
+def sync_supabase_endpoint(bg_tasks: BackgroundTasks):
+    """
+    Kích hoạt đồng bộ ngầm toàn bộ video và ảnh thumbnail lên Supabase Storage và Database.
+    """
+    def worker():
+        try:
+            import supabase_sync
+            recs = list_recordings_from_drive()
+            for r in recs:
+                u = r["user"]
+                fn = r["filename"]
+                th_url = f"https://tiktok-api-as2y.onrender.com/api/thumbnail/{u}/{fn}"
+                supabase_sync.sync_recording_to_supabase(
+                    user=u,
+                    filename=fn,
+                    size_bytes=r.get("size_bytes", 0),
+                    recorded_at=r.get("recorded_at"),
+                    created_at=r.get("created_at"),
+                    thumb_source=th_url,
+                    drive_file_id=r.get("drive_file_id"),
+                    drive_thumb_id=r.get("drive_thumb_id"),
+                    cdn_download_url=r.get("cdn_download_url"),
+                    source="google_drive"
+                )
+        except Exception as e:
+            print(f"[!] Lỗi sync supabase endpoint worker: {e}")
+
+    bg_tasks.add_task(worker)
+    return {"status": "started", "message": "Đang đồng bộ toàn bộ video và thumbnail lên Supabase trong nền"}
 
 @app.get("/api/thumbnail/{user}/{filename}")
 def get_thumbnail(user: str, filename: str):
