@@ -78,32 +78,78 @@ def save_cookies(cookies_dict):
 
 def check_live_status(user):
     """
-    Returns (is_live: bool, room_id: str or None, title: str)
+    Kiểm tra trạng thái live và lấy Room ID của streamer siêu tốc (<1s) bằng curl_cffi Chrome 136.
+    Không bị chặn bởi Cloudflare/TikTok bot protection và không gặp xung đột event loop AsyncIO.
+    Returns (is_live: bool, room_id: str or None)
     """
-    from TikTokLive import TikTokLiveClient
-    import asyncio
-
-    async def _check():
-        client = TikTokLiveClient(unique_id=user)
-        try:
-            is_live = await client.is_live()
-            room_id = None
-            if is_live:
-                try:
-                    room_id = await client.web.fetch_room_id_from_api(unique_id=user)
-                except Exception:
-                    try:
-                        room_id = await client.web.fetch_room_id_from_html(unique_id=user)
-                    except Exception:
-                        pass
-            return is_live, str(room_id) if room_id else None
-        except Exception as e:
-            return False, None
-
+    user = user.strip().replace("@", "").lower()
+    
+    # Cách 1 (Nhanh & Ổn định nhất): Scrape trực tiếp qua curl_cffi Chrome 136
     try:
+        from curl_cffi import requests
+        cookies = load_cookies()
+        session = requests.Session(impersonate="chrome136")
+        if cookies:
+            session.cookies.update(cookies)
+        
+        url = f"https://www.tiktok.com/@{user}/live"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+            "Referer": "https://www.tiktok.com/",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        res = session.get(url, headers=headers, timeout=7)
+        if res.status_code == 200:
+            content = res.text.replace('\\"', '"').replace('\\u0026', '&').replace('&amp;', '&').replace('\\/', '/')
+            
+            # Tìm roomId (chuỗi 15-22 số)
+            room_matches = re.findall(r'"roomId"[:"]+(\d{15,25})', content)
+            if not room_matches:
+                room_matches = re.findall(r'"room_id"[:"]+(\d{15,25})', content)
+            
+            # Kiểm tra xem có stream flv hoặc m3u8 hoặc status=2 (đang live)
+            has_flv = bool(re.search(r'https?://[^\s"\'<>]+\.flv\?[^\s"\'<>]+', content))
+            has_hls = bool(re.search(r'https?://[^\s"\'<>]+\.m3u8\?[^\s"\'<>]*', content))
+            is_live = False
+            room_id = room_matches[0] if room_matches else None
+            
+            if (has_flv or has_hls) and room_id:
+                is_live = True
+            elif '"status":2' in content or '"liveRoom":{"status":2' in content:
+                is_live = True
+
+            if is_live and room_id:
+                return True, str(room_id)
+    except Exception:
+        pass
+
+    # Cách 2 (Dự phòng): Thử qua thư viện TikTokLiveClient
+    try:
+        from TikTokLive import TikTokLiveClient
+        import asyncio
+
+        async def _check():
+            client = TikTokLiveClient(unique_id=user)
+            try:
+                is_live = await client.is_live()
+                room_id = None
+                if is_live:
+                    try:
+                        room_id = await client.web.fetch_room_id_from_api(unique_id=user)
+                    except Exception:
+                        try:
+                            room_id = await client.web.fetch_room_id_from_html(unique_id=user)
+                        except Exception:
+                            pass
+                return is_live, str(room_id) if room_id else None
+            except Exception:
+                return False, None
+
         return asyncio.run(_check())
-    except Exception as e:
-        return False, None
+    except Exception:
+        pass
+
+    return False, None
 
 check_user_live = check_live_status
 

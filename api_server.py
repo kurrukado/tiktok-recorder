@@ -197,22 +197,6 @@ def get_active_recordings():
         "status": "recording" if all_active else "idle"
     }
 
-@app.get("/api/debug/{username}")
-def debug_user(username: str):
-    import traceback
-    info = {"user": username}
-    try:
-        import TikTokLive
-        info["tiktoklive_version"] = getattr(TikTokLive, "__version__", "unknown")
-    except Exception as e:
-        info["tiktoklive_import_error"] = str(e)
-    try:
-        is_live, room_id = recorder_core.check_user_live(username)
-        info["check_user_live"] = {"is_live": is_live, "room_id": room_id}
-    except Exception as e:
-        info["check_user_live_error"] = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
-    return info
-
 @app.get("/api/users")
 def get_users(check_live: bool = True):
     users = None
