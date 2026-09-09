@@ -190,17 +190,18 @@ def health_check():
 @app.get("/api/recordings/active")
 def get_active_recordings():
     """
-    Trả về danh sách chính xác các streamer hiện đang được bot 24/7 ghi hình (hoặc đang phát trực tiếp).
+    Trả về danh sách chính xác các streamer hiện đang được bot ghi hình thực sự.
     """
-    active = set()
+    recording = set()
     try:
         drive_act = gdrive_manager.load_active_recordings_from_drive() or []
-        active.update(drive_act)
+        recording.update(drive_act)
     except Exception:
         pass
-    active.update(ACTIVE_RECORDING_TASKS.keys())
+    recording.update(ACTIVE_RECORDING_TASKS.keys())
 
-    # Đồng bộ thêm các user đang live
+    # Danh sách các user đang phát live trên TikTok
+    live_streamers = []
     cfg = load_config()
     users = cfg.get("monitored_users", [])
     try:
@@ -213,13 +214,15 @@ def get_active_recordings():
     for u in users:
         is_live, _ = get_user_live_status_cached(u)
         if is_live:
-            active.add(u)
+            live_streamers.append(u)
 
-    all_active = list(active)
+    all_recording = list(recording)
     return {
-        "total_active": len(all_active),
-        "active_streamers": all_active,
-        "status": "recording" if all_active else "idle"
+        "total_active": len(all_recording),
+        "active_streamers": all_recording,
+        "live_streamers": live_streamers,
+        "total_live": len(live_streamers),
+        "status": "recording" if all_recording else "idle"
     }
 
 @app.get("/api/users")

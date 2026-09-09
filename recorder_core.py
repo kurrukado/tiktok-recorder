@@ -115,8 +115,13 @@ def check_live_status(user):
                 room_id = room_info.get("roomId") or user_info.get("roomId")
                 
                 # status == 2 nghĩa là ĐANG LIVE, status == 4 nghĩa là ĐÃ XUỐNG LIVE
-                if status == 2 and room_id:
-                    return True, str(room_id)
+                if status == 2:
+                    if not room_id:
+                        r_match = re.search(r'"roomId"[:"]+(\d{15,25})', res.text)
+                        if r_match:
+                            room_id = r_match.group(1)
+                    if room_id:
+                        return True, str(room_id)
                 elif status == 4:
                     return False, None
 
@@ -158,7 +163,9 @@ check_user_live = check_live_status
 def get_live_stream_url(room_id, user=None, cookies=None):
     try:
         urls = get_stream_urls(room_id, user, cookies=cookies)
-        return urls[0] if urls else None
+        if isinstance(urls, list) and urls:
+            return urls[0]
+        return None
     except Exception:
         return None
 

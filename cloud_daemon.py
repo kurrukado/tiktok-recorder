@@ -49,9 +49,12 @@ def load_monitored_users():
         try:
             drive_users = gdrive_manager.load_streamers_from_drive()
             if drive_users is not None and isinstance(drive_users, list):
-                _CACHED_DRIVE_USERS = [u.strip().replace("@", "") for u in drive_users if u.strip()]
-        except Exception:
-            pass
+                cleaned = [u.strip().replace("@", "") for u in drive_users if u.strip()]
+                if _CACHED_DRIVE_USERS != cleaned:
+                    log(f"[*] Cập nhật danh sách từ Google Drive ({len(cleaned)} streamers): {cleaned}")
+                _CACHED_DRIVE_USERS = cleaned
+        except Exception as e:
+            log(f"[!] Lỗi đọc danh sách streamer từ Drive: {e}")
 
     if _CACHED_DRIVE_USERS is not None:
         return _CACHED_DRIVE_USERS
@@ -120,8 +123,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 try:
                     new_found = discover_new_streamers(user)
                     if new_found:
-                        cfg = load_config()
-                        current_list = cfg.get("monitored_users", [])
+                        current_list = list(load_monitored_users())
                         added_any = False
                         for nf in new_found:
                             if nf not in current_list:
@@ -129,6 +131,8 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                                 added_any = True
                                 log(f"✨ [Auto-Discover] Tự động phát hiện streamer mới từ phiên live: @{nf}")
                         if added_any:
+                            _CACHED_DRIVE_USERS = current_list
+                            cfg = load_config()
                             cfg["monitored_users"] = current_list
                             save_config(cfg)
                             try:
@@ -301,17 +305,29 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
         if session_count % 15 == 1:
             log(f"[*] Đang theo dõi {len(users)} streamers. Đang ghi hình song song ({len(active_now)}/{MAX_CONCURRENT_RECORDERS}): {active_now}")
 
-        for user in users:
-            # Nếu streamer này đang được ghi hình -> Bỏ qua
-            with RECORDERS_LOCK:
-                if user in ACTIVE_RECORDERS:
-                    continue
-                if len(ACTIVE_RECORDERS) >= MAX_CONCURRENT_RECORDERS:
-                    log(f"[!] Đã đạt giới hạn tối đa {MAX_CONCURRENT_RECORDERS} streamer cùng lúc. Chờ luồng trống...")
-                    break
+        with RECORDERS_LOCK:
+            active_set = set(ACTIVE_RECORDERS.keys())
+            slots_available = MAX_CONCURRENT_RECORDERS - len(active_set)
 
-            try:
-                is_live, room_id = recorder_core.check_user_live(user)
+        users_to_check = [u for u in users if u not in active_set]
+
+        if users_to_check and slots_available > 0:
+            import concurrent.futures
+
+            def _check(u):
+                try:
+                    return u, recorder_core.check_user_live(u)
+                except Exception:
+                    return u, (False, None)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_check), 6)) as executor:
+                check_results = list(executor.map(_check, users_to_check))
+
+            for user, (is_live, room_id) in check_results:
+                with RECORDERS_LOCK:
+                    if user in ACTIVE_RECORDERS or len(ACTIVE_RECORDERS) >= MAX_CONCURRENT_RECORDERS:
+                        continue
+
                 if is_live and room_id:
                     log(f"🔴 PHÁT HIỆN LIVESTREAM: @{user} đang trực tiếp (Room ID: {room_id})")
                     notifier.send_telegram(f"🔴 <b>STREAMER ĐANG LIVE!</b>\n👤 <code>@{user}</code> bắt đầu phát livestream.\nĐang tự động ghi hình đa luồng HD H.264 (< 2 tiếng/phần)...")
@@ -330,16 +346,11 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                             "stop_event": stop_ev
                         }
                     t.start()
-                    time.sleep(1)
-
-            except Exception as e:
-                log(f"[!] Lỗi kiểm tra @{user}: {e}")
-
-            time.sleep(2)
+                    time.sleep(0.5)
 
         # Smart Jitter Delay để tránh bị TikTok chặn tần suất
-        jitter = random.uniform(-3.0, 4.0)
-        time.sleep(max(15, interval + jitter))
+        jitter = random.uniform(-2.0, 3.0)
+        time.sleep(max(10, interval + jitter))
 
     # Chờ tất cả luồng ghi hình hoàn tất đóng gói và upload lên Google Drive
     with RECORDERS_LOCK:
