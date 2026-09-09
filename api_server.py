@@ -185,7 +185,10 @@ def get_users(check_live: bool = False):
                 is_live, room_id = recorder_core.check_user_live(u)
             except Exception:
                 pass
-        is_recording = (u in active_users)
+        # Nếu streamer đang live thì luôn được tính là đang ghi hình tự động
+        is_recording = (u in active_users) or is_live
+        if is_live:
+            active_users.add(u)
         result.append({
             "username": u,
             "is_live": is_live,
