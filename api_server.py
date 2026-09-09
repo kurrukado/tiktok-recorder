@@ -55,7 +55,7 @@ def load_config():
         except Exception:
             pass
     return {
-        "monitored_users": [],
+        "monitored_users": ["islizanx", "itsme_kate0110", "urielhui38", "fmmaidcoffee"],
         "check_interval_seconds": 20
     }
 
