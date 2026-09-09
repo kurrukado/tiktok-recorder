@@ -17,6 +17,7 @@ Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.26
 - ⚡ **Ghi Hình Đa Luồng Song Song:** Ghi hình đồng thời lên tới 10 streamer cùng một thời điểm.
 - ✂️ **Tự Động Cắt File Dưới 2 Tiếng:** Tự động ngắt file Part 1 tải lên Drive và tiếp tục ghi Part 2 nếu streamer phát trực tiếp xuyên đêm dài nhiều tiếng.
 - 🔴 **Vượt Rào Cản 18+:** Sử dụng thuật toán bóc tách dữ liệu kết hợp cookie `sessionid_ss`, không bị chặn lứa tuổi.
+- 🔒 **Hỗ trợ VIP Sub-Only & Thread-Safe Drive:** Nhận diện livestream Sub-Only/Preview và sinh guest session fingerprint lấy luồng preview; khóa luồng thread-safe đồng bộ danh sách quay thời gian thực lên Google Drive kèm TTL tự dọn dẹp.
 
 ---
 

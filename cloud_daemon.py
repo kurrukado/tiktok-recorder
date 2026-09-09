@@ -111,6 +111,14 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
 
     part_number = 1
     current_room_id = initial_room_id
+    max_vip_attempts = 5
+    guest_session = None
+
+    # Kiểm tra xem buổi live có phải VIP Sub-only không qua check_live_details
+    live_details = recorder_core.check_live_details(user)
+    is_sub_only = live_details.get("is_sub_only", False)
+    if is_sub_only:
+        log(f"🔒 [@{user}] Phát hiện phòng live VIP Sub-Only / Paid Event! Kích hoạt chế độ VIP Sub-Only Quick Watchdog & Session Rotation.")
 
     try:
         while True:
@@ -142,7 +150,14 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 except Exception:
                     pass
 
-            stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
+            if is_sub_only:
+                # Xoay Guest Session vô danh mới cho mỗi phần preview Sub-Only
+                log(f"🔄 [@{user}] Tạo phiên khách vô danh mới (Guest Session) để lấy link preview Sub-Only Phần {part_number}...")
+                guest_session = recorder_core.generate_guest_session()
+                stream_url = recorder_core.get_live_stream_url(current_room_id, user=user, session=guest_session)
+            else:
+                stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
+
             if not stream_url:
                 log(f"[!] Không lấy được URL stream của @{user}, kết thúc luồng.")
                 break
@@ -153,16 +168,18 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             os.makedirs(user_dir, exist_ok=True)
             output_file = os.path.join(user_dir, f"{user}_{now_str}{part_suffix}.mp4")
 
-            log(f"🔴 [@{user}] Đang ghi hình Phần {part_number} (Tối đa < 2 tiếng: {MAX_CHUNK_SECONDS}s)...")
+            log(f"🔴 [@{user}] Đang ghi hình Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Tối đa < 2 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
 
-            # Ghi hình với giới hạn duration = MAX_CHUNK_SECONDS (7000s ~ 1h56m)
+            # Ghi hình với giới hạn duration và cờ is_sub_only
+            chunk_duration = 300 if is_sub_only else MAX_CHUNK_SECONDS
             rec_result = recorder_core.record_stream_ffmpeg(
                 stream_url,
                 output_filename=output_file,
                 target_user=user,
-                duration=MAX_CHUNK_SECONDS,
+                duration=chunk_duration,
                 stop_event=stop_event,
-                auto_sync_gdrive=False
+                auto_sync_gdrive=False,
+                is_sub_only=is_sub_only
             )
 
             if rec_result and os.path.exists(rec_result) and os.path.getsize(rec_result) > 1024:
@@ -226,17 +243,40 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 break
 
             # 4. Kiểm tra xem streamer còn live hay không để ghi tiếp Phần tiếp theo
-            log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number + 1}...")
-            time.sleep(3)
-            is_live, new_room_id = recorder_core.check_user_live(user)
-            if is_live and new_room_id:
-                part_number += 1
-                current_room_id = new_room_id
-                log(f"⏩ [@{user}] Streamer VẪN ĐANG LIVE! Tiếp tục ghi hình nối tiếp Phần {part_number} ngay lập tức...")
-                continue
+            if is_sub_only:
+                if part_number >= max_vip_attempts:
+                    log(f"🛑 [@{user}] Đã đạt giới hạn tối đa {max_vip_attempts} lần xoay Guest Session preview Sub-Only. Kết thúc luồng.")
+                    break
+
+                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live VIP Sub-Only để xoay Guest Session cho Phần {part_number + 1}...")
+                time.sleep(2)
+                curr_det = recorder_core.check_live_details(user)
+                if curr_det.get("is_live"):
+                    part_number += 1
+                    if curr_det.get("room_id"):
+                        current_room_id = curr_det.get("room_id")
+                    log(f"⏩ [@{user}] Streamer VẪN ĐANG LIVE VIP Sub-Only! Tiếp tục xoay Guest Session ghi tiếp Phần {part_number}...")
+                    continue
+                else:
+                    log(f"🏁 [@{user}] Streamer đã xuống live sau {part_number} phần preview.")
+                    break
             else:
-                log(f"🏁 [@{user}] Phiên livestream đã kết thúc hoàn toàn sau {part_number} phần.")
-                break
+                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number + 1}...")
+                time.sleep(3)
+                curr_det = recorder_core.check_live_details(user)
+                is_live = curr_det.get("is_live", False)
+                new_room_id = curr_det.get("room_id")
+                if is_live and new_room_id:
+                    part_number += 1
+                    current_room_id = new_room_id
+                    if curr_det.get("is_sub_only"):
+                        is_sub_only = True
+                        log(f"🔒 [@{user}] Streamer đã chuyển sang chế độ VIP Sub-Only! Kích hoạt Quick Watchdog và Guest Rotation...")
+                    log(f"⏩ [@{user}] Streamer VẪN ĐANG LIVE! Tiếp tục ghi hình nối tiếp Phần {part_number} ngay lập tức...")
+                    continue
+                else:
+                    log(f"🏁 [@{user}] Phiên livestream đã kết thúc hoàn toàn sau {part_number} phần.")
+                    break
 
     except Exception as err:
         log(f"[!] Lỗi trong luồng ghi hình của @{user}: {err}")

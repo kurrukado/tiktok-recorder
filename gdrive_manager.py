@@ -22,6 +22,7 @@ _CACHED_ACCESS_TOKEN = {"token": None, "expires_at": 0}
 _TOKEN_LOCK = threading.Lock()
 _FOLDER_CACHE = {}
 _FOLDER_CACHE_LOCK = threading.Lock()
+_DRIVE_STATUS_LOCK = threading.Lock()
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -311,153 +312,206 @@ def sync_all_to_gdrive():
     print("=" * 65 + "\n")
 
 def load_streamers_from_drive(access_token=None):
-    """Đọc danh sách streamer từ file streamers.json trong thư mục tiktok-record trên Google Drive."""
-    try:
-        if not access_token:
-            access_token = get_access_token()
-        if not access_token:
-            return None
-        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
-        headers = {"Authorization": f"Bearer {access_token}"}
-        q = f"name = 'streamers.json' and '{root_id}' in parents and trashed = false"
-        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-        res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            files = res.json().get("files", [])
-            if files:
-                file_id = files[0]["id"]
-                down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-                d_res = requests.get(down_url, headers=headers, timeout=10)
-                if d_res.status_code == 200:
-                    data = d_res.json()
-                    if isinstance(data, list):
-                        return data
-                    if isinstance(data, dict) and "streamers" in data:
-                        return data["streamers"]
-    except Exception as e:
-        print(f"[!] Lỗi đọc streamers.json từ Drive: {e}")
-    return None
+    """Đọc danh sách streamer từ file streamers.json trong thư mục tiktok-record trên Google Drive (Thread-Safe)."""
+    with _DRIVE_STATUS_LOCK:
+        try:
+            if not access_token:
+                access_token = get_access_token()
+            if not access_token:
+                return None
+            root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+            headers = {"Authorization": f"Bearer {access_token}"}
+            q = f"name = 'streamers.json' and '{root_id}' in parents and trashed = false"
+            url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+            res = requests.get(url, headers=headers, timeout=10)
+            if res.status_code == 200:
+                files = res.json().get("files", [])
+                if files:
+                    file_id = files[0]["id"]
+                    down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+                    d_res = requests.get(down_url, headers=headers, timeout=10)
+                    if d_res.status_code == 200:
+                        data = d_res.json()
+                        if isinstance(data, list):
+                            return data
+                        if isinstance(data, dict) and "streamers" in data:
+                            return data["streamers"]
+        except Exception as e:
+            print(f"[!] Lỗi đọc streamers.json từ Drive: {e}")
+        return None
 
 def save_streamers_to_drive(streamers_list, access_token=None):
-    """Lưu danh sách streamer vào file streamers.json trong thư mục tiktok-record trên Google Drive."""
-    try:
-        if not access_token:
-            access_token = get_access_token()
-        if not access_token:
-            return False
-        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
-        headers = {"Authorization": f"Bearer {access_token}"}
-        q = f"name = 'streamers.json' and '{root_id}' in parents and trashed = false"
-        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-        res = requests.get(url, headers=headers, timeout=10)
-        file_id = None
-        if res.status_code == 200:
-            files = res.json().get("files", [])
-            if files:
-                file_id = files[0]["id"]
+    """Lưu danh sách streamer vào file streamers.json trong thư mục tiktok-record trên Google Drive (Thread-Safe)."""
+    with _DRIVE_STATUS_LOCK:
+        try:
+            if not access_token:
+                access_token = get_access_token()
+            if not access_token:
+                return False
+            root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+            headers = {"Authorization": f"Bearer {access_token}"}
+            q = f"name = 'streamers.json' and '{root_id}' in parents and trashed = false"
+            url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+            res = requests.get(url, headers=headers, timeout=10)
+            file_id = None
+            if res.status_code == 200:
+                files = res.json().get("files", [])
+                if files:
+                    file_id = files[0]["id"]
 
-        content_bytes = json.dumps(streamers_list, indent=2, ensure_ascii=False).encode("utf-8")
-        if file_id:
-            up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
-            up_res = requests.patch(
-                up_url,
-                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                data=content_bytes,
-                timeout=15
-            )
-            return up_res.status_code == 200
-        else:
-            meta = {
-                "name": "streamers.json",
-                "parents": [root_id]
-            }
-            files = {
-                "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
-                "file": ("streamers.json", content_bytes, "application/json")
-            }
-            create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-            c_res = requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files, timeout=15)
-            return c_res.status_code in [200, 201]
-    except Exception as e:
-        print(f"[!] Lỗi ghi streamers.json lên Drive: {e}")
-    return False
+            content_bytes = json.dumps(streamers_list, indent=2, ensure_ascii=False).encode("utf-8")
+            if file_id:
+                up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
+                up_res = requests.patch(
+                    up_url,
+                    headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                    data=content_bytes,
+                    timeout=15
+                )
+                return up_res.status_code == 200
+            else:
+                meta = {
+                    "name": "streamers.json",
+                    "parents": [root_id]
+                }
+                files = {
+                    "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
+                    "file": ("streamers.json", content_bytes, "application/json")
+                }
+                create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+                c_res = requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files, timeout=15)
+                return c_res.status_code in [200, 201]
+        except Exception as e:
+            print(f"[!] Lỗi ghi streamers.json lên Drive: {e}")
+        return False
 
-def load_active_recordings_from_drive(access_token=None):
-    """Đọc danh sách các streamer đang được ghi hình thời gian thực từ Google Drive."""
-    try:
-        if not access_token:
-            access_token = get_access_token()
-        if not access_token:
-            return []
-        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
-        headers = {"Authorization": f"Bearer {access_token}"}
-        q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
-        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-        res = requests.get(url, headers=headers, timeout=8)
-        if res.status_code == 200:
-            files = res.json().get("files", [])
-            if files:
-                file_id = files[0]["id"]
-                down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-                d_res = requests.get(down_url, headers=headers, timeout=8)
-                if d_res.status_code == 200:
-                    data = d_res.json()
-                    return data if isinstance(data, list) else []
-    except Exception:
-        pass
-    return []
+def load_active_recordings_from_drive(access_token=None, as_details=False):
+    """
+    Đọc danh sách các streamer đang được ghi hình thời gian thực từ Google Drive (Thread-Safe).
+    Bao gồm trường updated_at để theo dõi TTL.
+    Nếu as_details=False: trả về danh sách username [str] để tương thích ngược 100%.
+    Nếu as_details=True: trả về danh sách chi tiết [{'username': str, 'updated_at': int}].
+    """
+    with _DRIVE_STATUS_LOCK:
+        try:
+            if not access_token:
+                access_token = get_access_token()
+            if not access_token:
+                return []
+            root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+            headers = {"Authorization": f"Bearer {access_token}"}
+            q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
+            url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+            res = requests.get(url, headers=headers, timeout=8)
+            if res.status_code == 200:
+                files = res.json().get("files", [])
+                if files:
+                    file_id = files[0]["id"]
+                    down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+                    d_res = requests.get(down_url, headers=headers, timeout=8)
+                    if d_res.status_code == 200:
+                        raw_data = d_res.json()
+                        if not isinstance(raw_data, list):
+                            return []
+
+                        details = []
+                        now_ts = int(time.time())
+                        for item in raw_data:
+                            if isinstance(item, dict) and "username" in item:
+                                details.append({
+                                    "username": str(item["username"]).strip().replace("@", "").lower(),
+                                    "updated_at": item.get("updated_at", now_ts)
+                                })
+                            elif isinstance(item, str) and item.strip():
+                                details.append({
+                                    "username": item.strip().replace("@", "").lower(),
+                                    "updated_at": now_ts
+                                })
+
+                        if as_details:
+                            return details
+                        return [d["username"] for d in details]
+        except Exception as e:
+            print(f"[!] Lỗi đọc active_recordings.json từ Drive: {e}")
+        return []
 
 def set_user_recording_status_drive(user: str, is_recording: bool, access_token=None):
-    """Cập nhật trạng thái đang quay của một streamer lên Google Drive."""
-    try:
-        if not access_token:
-            access_token = get_access_token()
-        if not access_token:
+    """
+    Cập nhật trạng thái đang quay của một streamer lên Google Drive (Thread-Safe).
+    Tự động lưu kèm trường updated_at (epoch timestamp) để theo dõi TTL.
+    """
+    with _DRIVE_STATUS_LOCK:
+        try:
+            if not access_token:
+                access_token = get_access_token()
+            if not access_token:
+                return False
+            root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+            headers = {"Authorization": f"Bearer {access_token}"}
+            
+            q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
+            url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+            res = requests.get(url, headers=headers, timeout=8)
+            file_id = None
+            current_raw = []
+            if res.status_code == 200:
+                files = res.json().get("files", [])
+                if files:
+                    file_id = files[0]["id"]
+                    try:
+                        d_res = requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=8)
+                        if d_res.status_code == 200:
+                            current_raw = d_res.json()
+                            if not isinstance(current_raw, list):
+                                current_raw = []
+                    except Exception:
+                        pass
+
+            user = user.strip().replace("@", "").lower()
+            now_ts = int(time.time())
+
+            # Chuẩn hóa dữ liệu sang danh sách dict với username và updated_at
+            normalized_active = []
+            for it in current_raw:
+                if isinstance(it, dict) and "username" in it:
+                    normalized_active.append({
+                        "username": str(it["username"]).strip().replace("@", "").lower(),
+                        "updated_at": it.get("updated_at", now_ts)
+                    })
+                elif isinstance(it, str) and it.strip():
+                    normalized_active.append({
+                        "username": it.strip().replace("@", "").lower(),
+                        "updated_at": now_ts
+                    })
+
+            if is_recording:
+                found = False
+                for entry in normalized_active:
+                    if entry["username"] == user:
+                        entry["updated_at"] = now_ts
+                        found = True
+                        break
+                if not found:
+                    normalized_active.append({"username": user, "updated_at": now_ts})
+            else:
+                normalized_active = [it for it in normalized_active if it["username"] != user]
+
+            content_bytes = json.dumps(normalized_active, indent=2, ensure_ascii=False).encode("utf-8")
+            if file_id:
+                up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
+                requests.patch(up_url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=content_bytes, timeout=10)
+            else:
+                meta = {"name": "active_recordings.json", "parents": [root_id]}
+                files_data = {
+                    "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
+                    "file": ("active_recordings.json", content_bytes, "application/json")
+                }
+                create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+                requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files_data, timeout=10)
+            return True
+        except Exception as e:
+            print(f"[!] Lỗi cập nhật active_recordings lên Drive: {e}")
             return False
-        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
-        headers = {"Authorization": f"Bearer {access_token}"}
-        
-        q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
-        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-        res = requests.get(url, headers=headers, timeout=8)
-        file_id = None
-        current_active = []
-        if res.status_code == 200:
-            files = res.json().get("files", [])
-            if files:
-                file_id = files[0]["id"]
-                try:
-                    d_res = requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=8)
-                    if d_res.status_code == 200:
-                        current_active = d_res.json()
-                        if not isinstance(current_active, list):
-                            current_active = []
-                except Exception:
-                    pass
-
-        user = user.strip().replace("@", "").lower()
-        if is_recording:
-            if user not in current_active:
-                current_active.append(user)
-        else:
-            current_active = [u for u in current_active if u != user]
-
-        content_bytes = json.dumps(current_active, indent=2).encode("utf-8")
-        if file_id:
-            up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
-            requests.patch(up_url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=content_bytes, timeout=10)
-        else:
-            meta = {"name": "active_recordings.json", "parents": [root_id]}
-            files_data = {
-                "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
-                "file": ("active_recordings.json", content_bytes, "application/json")
-            }
-            create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-            requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files_data, timeout=10)
-        return True
-    except Exception as e:
-        print(f"[!] Lỗi cập nhật active_recordings lên Drive: {e}")
-        return False
 
 def create_streamer_folder_drive(user: str, access_token=None):
     """

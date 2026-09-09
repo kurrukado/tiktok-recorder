@@ -5,7 +5,9 @@ import time
 import re
 import shutil
 import subprocess
+import random
 from datetime import datetime
+from typing import Optional, Tuple, Dict, Any
 from curl_cffi import requests
 
 if sys.platform == "win32":
@@ -80,23 +82,61 @@ def save_cookies(cookies_dict):
             pass
 
 
-def check_live_status(user):
+def generate_guest_session() -> requests.Session:
     """
-    Kiểm tra trạng thái live và lấy Room ID của streamer chuẩn xác 100% bằng curl_cffi Chrome 136.
-    Trích xuất từ thẻ script SIGI_STATE của chính streamer:
-    - status == 2: Streamer ĐANG LIVE.
-    - status == 4: Streamer ĐÃ XUỐNG LIVE (Offline). Tránh nhận nhầm các phòng live gợi ý khác!
-    Returns (is_live: bool, room_id: str or None)
+    Tạo phiên khách vô danh mới với browser fingerprint ngẫu nhiên để lấy cookie khách sạch sẽ,
+    vượt qua cơ chế giới hạn IP/phiên của TikTok khi xem luồng preview Sub-Only.
+    """
+    impersonates = ["chrome136", "chrome131", "chrome124", "safari17_0", "edge101"]
+    chosen_browser = random.choice(impersonates)
+    session = requests.Session(impersonate=chosen_browser)
+
+    chrome_vers = ["126.0.6478.127", "128.0.6613.85", "131.0.6778.86", "133.0.6943.53", "136.0.7024.12"]
+    ver = random.choice(chrome_vers)
+
+    tt_chain_token = "".join(random.choices("0123456789abcdef", k=32))
+    session.cookies.set("tt_chain_token", tt_chain_token, domain=".tiktok.com")
+    session.cookies.set("odin_tt", "".join(random.choices("0123456789abcdef", k=64)), domain=".tiktok.com")
+    session.cookies.set("msToken", "".join(random.choices("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_", k=128)), domain=".tiktok.com")
+
+    session.headers.update({
+        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+        "Accept-Language": random.choice(["vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7", "en-US,en;q=0.9", "ja-JP,ja;q=0.8"]),
+        "Referer": "https://www.tiktok.com/",
+        "Accept": "*/*",
+        "Sec-Ch-Ua-Mobile": "?0",
+        "Sec-Ch-Ua-Platform": '"Windows"',
+    })
+    return session
+
+def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
+    """
+    Trích xuất thông tin chi tiết phiên live:
+    - is_live: bool
+    - room_id: Optional[str]
+    - is_sub_only: bool (Phòng live dành riêng cho hội viên VIP có trả phí)
+    - is_preview: bool (Đang xem luồng thử nghiệm preview)
+    - paid_type: Optional[int]
+    - preview_duration: Optional[int]
+    Trích xuất từ SIGI_STATE (liveSubOnly, paidEvent) và Webcast API (sub_only, live_sub_only, paid_event).
     """
     user = user.strip().replace("@", "").lower()
-    
-    # Cách 1 (Chuẩn xác 100%): Phân tích thẻ script SIGI_STATE qua curl_cffi Chrome 136
+    details = {
+        "is_live": False,
+        "room_id": None,
+        "is_sub_only": False,
+        "is_preview": False,
+        "paid_type": None,
+        "preview_duration": None
+    }
+
     try:
-        cookies = load_cookies()
+        if cookies is None:
+            cookies = load_cookies()
         session = requests.Session(impersonate="chrome136")
         if cookies:
             session.cookies.update(cookies)
-        
+
         url = f"https://www.tiktok.com/@{user}/live"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
@@ -105,81 +145,169 @@ def check_live_status(user):
         }
         res = session.get(url, headers=headers, timeout=7)
         if res.status_code == 200:
+            # 1. Phân tích thẻ SIGI_STATE
             m = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', res.text, re.DOTALL)
             if m:
-                data = json.loads(m.group(1))
-                live_user_info = data.get("LiveRoom", {}).get("liveRoomUserInfo", {})
-                room_info = live_user_info.get("liveRoom", {})
-                user_info = live_user_info.get("user", {})
-                status = room_info.get("status")
-                room_id = room_info.get("roomId") or user_info.get("roomId")
-                
-                # status == 2 nghĩa là ĐANG LIVE, status == 4 nghĩa là ĐÃ XUỐNG LIVE
-                if status == 2:
-                    if not room_id:
-                        r_match = re.search(r'"roomId"[:"]+(\d{15,25})', res.text)
-                        if r_match:
-                            room_id = r_match.group(1)
-                    if room_id:
-                        return True, str(room_id)
-                elif status == 4:
-                    return False, None
+                try:
+                    data = json.loads(m.group(1))
+                    live_user_info = data.get("LiveRoom", {}).get("liveRoomUserInfo", {})
+                    room_info = live_user_info.get("liveRoom", {})
+                    user_info = live_user_info.get("user", {})
+                    status = room_info.get("status")
+                    room_id = room_info.get("roomId") or user_info.get("roomId")
+
+                    # Kiểm tra các cờ VIP Sub-Only / Paid Event
+                    live_sub_only = room_info.get("liveSubOnly", False)
+                    sub_only = room_info.get("subOnly", False)
+                    paid_evt = room_info.get("paidEvent") or {}
+                    p_type = paid_evt.get("paidType") if isinstance(paid_evt, dict) else None
+                    p_dur = room_info.get("previewDuration") or room_info.get("preview_duration")
+
+                    if live_sub_only or sub_only or (isinstance(paid_evt, dict) and paid_evt.get("paidType", 0) > 0) or (paid_evt is True):
+                        details["is_sub_only"] = True
+                        details["is_preview"] = True
+                    if p_type is not None:
+                        details["paid_type"] = p_type
+                    if p_dur is not None:
+                        details["preview_duration"] = int(p_dur)
+
+                    # status == 2 nghĩa là ĐANG LIVE, status == 4 nghĩa là ĐÃ XUỐNG LIVE
+                    if status == 2:
+                        if not room_id:
+                            r_match = re.search(r'"roomId"[:"]+(\d{15,25})', res.text)
+                            if r_match:
+                                room_id = r_match.group(1)
+                        if room_id:
+                            details["is_live"] = True
+                            details["room_id"] = str(room_id)
+                    elif status == 4:
+                        details["is_live"] = False
+                        details["room_id"] = None
+                        return details
+                except Exception:
+                    pass
+
+            # Regex kiểm tra nhanh toàn bộ HTML
+            if re.search(r'"liveSubOnly"\s*:\s*(true|1)', res.text, re.IGNORECASE) or \
+               re.search(r'"subOnly"\s*:\s*(true|1)', res.text, re.IGNORECASE) or \
+               re.search(r'"is_sub_only"\s*:\s*(true|1)', res.text, re.IGNORECASE):
+                details["is_sub_only"] = True
+                details["is_preview"] = True
+
+            p_match = re.search(r'"paidEvent"\s*:\s*\{[^}]*"paidType"\s*:\s*([1-9]\d*)', res.text)
+            if p_match:
+                details["is_sub_only"] = True
+                details["is_preview"] = True
+                try:
+                    details["paid_type"] = int(p_match.group(1))
+                except Exception:
+                    pass
 
             # Kiểm tra text đặc trưng nếu streamer đã tắt live
             m_stat = re.search(r'"uniqueId":"' + re.escape(user) + r'"[^\}]*?"status":\s*(\d+)', res.text)
             if m_stat and int(m_stat.group(1)) == 4:
-                return False, None
-    except Exception:
-        pass
+                details["is_live"] = False
+                details["room_id"] = None
+                return details
 
-    # Cách 2 (Dự phòng): Thử qua thư viện TikTokLiveClient
-    try:
-        from TikTokLive import TikTokLiveClient
-        import asyncio
+            if not details["is_live"]:
+                r_match = re.search(r'"roomId"[:"]+(\d{15,25})', res.text)
+                if r_match and ('"status":2' in res.text or 'liveRoomUserInfo' in res.text):
+                    details["is_live"] = True
+                    details["room_id"] = r_match.group(1)
 
-        async def _check():
-            client = TikTokLiveClient(unique_id=user)
+        # 2. Bổ sung trích xuất qua Webcast API nếu đã phát hiện live
+        if details["is_live"] and details["room_id"]:
             try:
-                is_live = await client.is_live()
-                if not is_live:
-                    return False, None
-                room_id = None
-                try:
-                    room_id = await client.web.fetch_room_id_from_api(unique_id=user)
-                except Exception:
-                    pass
-                return is_live, str(room_id) if room_id else None
-            except Exception:
-                return False, None
+                w_url = f"https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id={details['room_id']}"
+                w_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                    "Referer": "https://www.tiktok.com/",
+                    "Accept": "*/*",
+                    "Origin": "https://www.tiktok.com",
+                }
+                w_res = session.get(w_url, headers=w_headers, timeout=4)
+                if w_res.status_code == 200:
+                    w_json = w_res.json()
+                    r_data = w_json.get("data") or {}
+                    sub_flag = r_data.get("sub_only") or r_data.get("live_sub_only")
+                    paid_data = r_data.get("paid_event") or {}
+                    p_type = paid_data.get("paid_type") if isinstance(paid_data, dict) else None
 
-        return asyncio.run(_check())
+                    if sub_flag or (isinstance(paid_data, dict) and paid_data.get("paid_type", 0) > 0):
+                        details["is_sub_only"] = True
+                        details["is_preview"] = True
+                    if p_type is not None:
+                        details["paid_type"] = p_type
+            except Exception:
+                pass
+
     except Exception:
         pass
 
-    return False, None
+    # 3. Dự phòng qua TikTokLiveClient
+    if not details["is_live"]:
+        try:
+            from TikTokLive import TikTokLiveClient
+            import asyncio
+
+            async def _check():
+                client = TikTokLiveClient(unique_id=user)
+                try:
+                    is_live = await client.is_live()
+                    if not is_live:
+                        return False, None
+                    room_id = None
+                    try:
+                        room_id = await client.web.fetch_room_id_from_api(unique_id=user)
+                    except Exception:
+                        pass
+                    return is_live, str(room_id) if room_id else None
+                except Exception:
+                    return False, None
+
+            is_live, room_id = asyncio.run(_check())
+            if is_live:
+                details["is_live"] = True
+                details["room_id"] = room_id
+        except Exception:
+            pass
+
+    return details
+
+def check_live_status(user: str) -> Tuple[bool, Optional[str]]:
+    """
+    Kiểm tra trạng thái live và lấy Room ID của streamer chuẩn xác 100% bằng curl_cffi Chrome 136.
+    Trích xuất từ thẻ script SIGI_STATE của chính streamer:
+    - status == 2: Streamer ĐANG LIVE.
+    - status == 4: Streamer ĐÃ XUỐNG LIVE (Offline). Tránh nhận nhầm các phòng live gợi ý khác!
+    Returns (is_live: bool, room_id: str or None)
+    """
+    det = check_live_details(user)
+    return det["is_live"], det["room_id"]
 
 check_user_live = check_live_status
 
-def get_live_stream_url(room_id, user=None, cookies=None):
+def get_live_stream_url(room_id, user=None, cookies=None, session=None):
     try:
-        urls = get_stream_urls(room_id, user, cookies=cookies)
+        urls = get_stream_urls(room_id, user, cookies=cookies, session=session)
         if isinstance(urls, list) and urls:
             return urls[0]
         return None
     except Exception:
         return None
 
-def get_stream_urls(room_id, user, cookies=None):
+def get_stream_urls(room_id, user, cookies=None, session=None):
     """
     Extract candidate stream URLs (FLV or HLS / m3u8).
-    Supports 18+ restricted streams using authenticated sessionid cookies.
+    Supports 18+ restricted streams using authenticated sessionid cookies or custom guest session.
     """
-    if cookies is None:
-        cookies = load_cookies()
-
-    session = requests.Session(impersonate="chrome136")
-    if cookies:
-        session.cookies.update(cookies)
+    if session is None:
+        if cookies is None:
+            cookies = load_cookies()
+        session = requests.Session(impersonate="chrome136")
+        if cookies:
+            session.cookies.update(cookies)
 
     # First attempt: Direct scrape of live page HTML with session cookies (bypasses 18+ restriction)
     if user:
@@ -298,7 +426,7 @@ def _safe_stop_ffmpeg(proc, timeout=8):
     except Exception:
         pass
 
-def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx", duration=None, stop_event=None, auto_sync_gdrive=True):
+def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx", duration=None, stop_event=None, auto_sync_gdrive=True, is_sub_only: bool = False):
     """
     Records a live stream URL to an MP4 file using ffmpeg without re-encoding,
     then automatically ensures it is in standard H.264 (AVC) format.
@@ -373,6 +501,12 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
                 last_growth_time = now
 
             stagnant_seconds = int(now - last_growth_time)
+
+            # Quick Watchdog cho VIP Sub-Only: khi dung lượng không tăng trong >= 6 giây, lập tức chốt file preview nhanh chóng
+            if is_sub_only and size_bytes > 1024 and stagnant_seconds >= 6:
+                print(f"\n\n[⚡ VIP Preview] [@{target_user}] Luồng preview Sub-Only dừng truyền tải sau {stagnant_seconds}s ({size_mb:.2f} MB). Đang chốt file preview nhanh chóng...")
+                _safe_stop_ffmpeg(proc, timeout=4)
+                break
 
             # Nếu trong 12s liên tục không có thêm dữ liệu mới -> Kiểm tra xem streamer đã tắt live chưa
             if size_bytes > 1024 and stagnant_seconds >= 12:

@@ -144,24 +144,108 @@ def extract_middle_thumbnail(video_path, output_thumb=None):
     return None
 
 # ---------------- LIVE STATUS CACHE ----------------
-LIVE_CACHE = {}  # {username: {"is_live": bool, "room_id": str, "timestamp": float}}
+LIVE_CACHE = {}  # {username: {"is_live": bool, "room_id": str, "is_sub_only": bool, "is_preview": bool, "timestamp": float}}
 LIVE_CACHE_TTL = 15.0  # Cache 15 giây để phản hồi API siêu nhanh, không gây nghẽn
 
-def get_user_live_status_cached(user: str):
+def get_user_live_details_cached(user: str) -> dict:
     user = user.strip().replace("@", "").lower()
     now = time.time()
     cached = LIVE_CACHE.get(user)
-    if cached and (now - cached["timestamp"] < LIVE_CACHE_TTL):
-        return cached["is_live"], cached["room_id"]
-    
-    is_live, room_id = False, None
+    if cached and (now - cached.get("timestamp", 0) < LIVE_CACHE_TTL) and "is_sub_only" in cached:
+        return cached
+
+    details = {
+        "is_live": False,
+        "room_id": None,
+        "is_sub_only": False,
+        "is_preview": False,
+        "timestamp": now
+    }
     try:
-        is_live, room_id = recorder_core.check_user_live(user)
+        raw = recorder_core.check_live_details(user)
+        details["is_live"] = raw.get("is_live", False)
+        details["room_id"] = raw.get("room_id")
+        details["is_sub_only"] = raw.get("is_sub_only", False)
+        details["is_preview"] = raw.get("is_preview", False)
     except Exception:
-        is_live, room_id = False, None
-        
-    LIVE_CACHE[user] = {"is_live": is_live, "room_id": room_id, "timestamp": now}
-    return is_live, room_id
+        try:
+            is_live, room_id = recorder_core.check_user_live(user)
+            details["is_live"] = is_live
+            details["room_id"] = room_id
+        except Exception:
+            pass
+
+    LIVE_CACHE[user] = details
+    return details
+
+def get_user_live_status_cached(user: str):
+    d = get_user_live_details_cached(user)
+    return d["is_live"], d["room_id"]
+
+def is_local_recorder_running_for_user(user: str) -> bool:
+    """
+    Kiểm tra xem có tiến trình ghi hình cục bộ nào (in-memory task hoặc subprocess ffmpeg/python)
+    đang thực sự chạy cho streamer này không.
+    """
+    user_clean = user.strip().replace("@", "").lower()
+    with RECORDING_LOCK:
+        if user_clean in ACTIVE_RECORDING_TASKS:
+            return True
+
+    try:
+        import psutil
+        for proc in psutil.process_iter(['name', 'cmdline']):
+            try:
+                p_name = (proc.info.get('name') or '').lower()
+                cmdline = proc.info.get('cmdline') or []
+                cmd_str = " ".join(cmdline).lower()
+                if user_clean in cmd_str:
+                    if "ffmpeg" in p_name or "python" in p_name:
+                        return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+    except Exception:
+        pass
+    return False
+
+def clean_zombie_recordings(live_statuses=None):
+    """
+    Tự động quét và dọn dẹp các user bị kẹt trạng thái ma (Zombie Recording) trong active_recordings.json
+    nếu họ offline trên TikTok và không có PID recorder cục bộ nào đang chạy.
+    """
+    try:
+        drive_details = gdrive_manager.load_active_recordings_from_drive(as_details=True) or []
+        if not drive_details:
+            return []
+
+        zombies_cleaned = []
+        for item in drive_details:
+            u = item.get("username") if isinstance(item, dict) else str(item)
+            u = u.strip().replace("@", "").lower()
+            if not u:
+                continue
+
+            # Nếu đang có PID cục bộ chạy thì không phải zombie
+            if is_local_recorder_running_for_user(u):
+                continue
+
+            # Kiểm tra trạng thái trực tiếp trên TikTok
+            is_live = False
+            if live_statuses and u in live_statuses:
+                val = live_statuses[u]
+                is_live = val.get("is_live", False) if isinstance(val, dict) else val[0]
+            else:
+                is_live, _ = get_user_live_status_cached(u)
+
+            if not is_live:
+                print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (Offline & không có PID). Đang dọn dẹp...")
+                gdrive_manager.set_user_recording_status_drive(u, False)
+                zombies_cleaned.append(u)
+
+        return zombies_cleaned
+    except Exception as e:
+        print(f"[!] Lỗi dọn dẹp Zombie Recording: {e}")
+        return []
 
 class AddUserRequest(BaseModel):
     username: str
@@ -191,7 +275,13 @@ def health_check():
 def get_active_recordings():
     """
     Trả về danh sách chính xác các streamer hiện đang được bot ghi hình thực sự.
+    Tự động dọn dẹp các streamer kẹt trạng thái ma (Zombie Recording).
     """
+    try:
+        clean_zombie_recordings()
+    except Exception:
+        pass
+
     recording = set()
     try:
         drive_act = gdrive_manager.load_active_recordings_from_drive() or []
@@ -252,17 +342,29 @@ def get_users(check_live: bool = True):
     live_statuses = {}
     if check_live and users:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users), 8)) as executor:
-            future_to_user = {executor.submit(get_user_live_status_cached, u): u for u in users}
+            future_to_user = {executor.submit(get_user_live_details_cached, u): u for u in users}
             for fut in concurrent.futures.as_completed(future_to_user):
                 u = future_to_user[fut]
                 try:
                     live_statuses[u] = fut.result()
                 except Exception:
-                    live_statuses[u] = (False, None)
+                    live_statuses[u] = {"is_live": False, "room_id": None, "is_sub_only": False, "is_preview": False}
+
+    # Tự động quét dọn dẹp Zombie Recording
+    try:
+        zombies_cleaned = clean_zombie_recordings(live_statuses=live_statuses)
+        for z in zombies_cleaned:
+            active_users.discard(z)
+    except Exception:
+        pass
 
     result = []
     for u in users:
-        is_live, room_id = live_statuses.get(u, (False, None))
+        det = live_statuses.get(u, {})
+        is_live = det.get("is_live", False)
+        room_id = det.get("room_id")
+        is_sub_only = det.get("is_sub_only", False)
+        is_preview = det.get("is_preview", False)
         is_recording = (u in active_users)
         if is_recording:
             status_str = "recording"
@@ -275,7 +377,9 @@ def get_users(check_live: bool = True):
             "is_live": is_live,
             "room_id": room_id,
             "is_recording": is_recording,
-            "status": status_str
+            "status": status_str,
+            "is_sub_only": is_sub_only,
+            "is_preview": is_preview
         })
     return {
         "users": result,
@@ -438,6 +542,7 @@ def bg_record_worker(user: str, duration: Optional[int]):
             ACTIVE_RECORDING_TASKS.pop(user, None)
 
 @app.post("/api/record/start")
+@app.post("/api/record")
 def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     user = req.username.strip().replace("@", "").lower()
     
@@ -465,8 +570,13 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     except Exception:
         pass
 
-    # Kiểm tra xem streamer có đang phát trực tiếp không
-    is_live, room_id = get_user_live_status_cached(user)
+    # Kiểm tra xem streamer có đang phát trực tiếp không (kèm chi tiết VIP Sub-Only)
+    live_details = get_user_live_details_cached(user)
+    is_live = live_details.get("is_live", False)
+    room_id = live_details.get("room_id")
+    is_sub_only = live_details.get("is_sub_only", False)
+    is_preview = live_details.get("is_preview", False)
+
     if is_live:
         with RECORDING_LOCK:
             ACTIVE_RECORDING_TASKS[user] = {"start_time": time.time()}
@@ -479,13 +589,18 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
         if shutil.which("ffmpeg") or os.path.exists(FFMPEG_PATH):
             bg_tasks.add_task(bg_record_worker, user, req.duration_seconds)
 
+        msg_prefix = f"@{user} đang phát trực tiếp"
+        if is_sub_only:
+            msg_prefix += " (🔒 VIP Sub-Only)"
         return {
-            "message": f"@{user} đang phát trực tiếp! Hệ thống Cloud 24/7 đang ghi hình phiên live.",
+            "message": f"{msg_prefix}! Hệ thống Cloud 24/7 đang ghi hình phiên live.",
             "status": "recording",
             "is_live": True,
             "is_recording": True,
             "username": user,
-            "room_id": room_id
+            "room_id": room_id,
+            "is_sub_only": is_sub_only,
+            "is_preview": is_preview
         }
     else:
         with RECORDING_LOCK:

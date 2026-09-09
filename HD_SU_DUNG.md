@@ -81,6 +81,9 @@ Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.26
 - ⚡ **Quét Live Đa Luồng & Phân Tách Rõ Ràng LIVE / REC:**
   - `cloud_daemon` quét trạng thái toàn bộ danh sách streamer song song qua `ThreadPoolExecutor` (chỉ 2-3s/chu kỳ thay vì quét tuần tự).
   - Phân tách rõ ràng trạng thái: 🟢 **LIVE** (streamer đang phát sóng trên TikTok) và 🔴 **REC** (bot đang thực sự ghi hình luồng). Giao diện web hỗ trợ nút **Ghi ngay** và **Dừng ghi** chủ động.
+- 🔒 **Hỗ trợ VIP Sub-Only & Thread-Safe Drive:**
+  - Nhận diện phòng live giới hạn Hội viên Sub-Only và tự sinh guest session fingerprint để trích xuất link xem trước.
+  - Khóa luồng `_DRIVE_STATUS_LOCK` đồng bộ danh sách `active_recordings.json` trên Google Drive an toàn đa luồng, kèm cơ chế TTL tự dọn dẹp trạng thái quá 30 phút.
 
 ---
 
