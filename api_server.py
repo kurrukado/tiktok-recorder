@@ -132,7 +132,7 @@ def health_check():
     }
 
 @app.get("/api/users")
-def get_users():
+def get_users(check_live: bool = False):
     users = None
     try:
         drive_users = gdrive_manager.load_streamers_from_drive()
@@ -147,7 +147,12 @@ def get_users():
     
     result = []
     for u in users:
-        is_live, room_id = recorder_core.check_user_live(u)
+        is_live, room_id = False, None
+        if check_live:
+            try:
+                is_live, room_id = recorder_core.check_user_live(u)
+            except Exception:
+                pass
         is_recording = (u in ACTIVE_RECORDING_TASKS)
         result.append({
             "username": u,
@@ -155,7 +160,7 @@ def get_users():
             "room_id": room_id,
             "is_recording": is_recording
         })
-    return {"users": result}
+    return {"users": result, "streamers": users, "total": len(users)}
 
 @app.post("/api/users")
 def add_user(req: AddUserRequest):
