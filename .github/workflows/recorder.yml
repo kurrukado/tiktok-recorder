@@ -57,7 +57,7 @@ jobs:
               cfg['gdrive_refresh_token'] = os.environ['GDRIVE_REFRESH_TOKEN']
               cfg['gdrive_enabled'] = True
           if 'monitored_users' not in cfg:
-              cfg['monitored_users'] = ['islizanx', 'itsme_kate0110', 'urielhui38']
+              cfg['monitored_users'] = []
           with open('config.json', 'w', encoding='utf-8') as f:
               json.dump(cfg, f, indent=4)
 

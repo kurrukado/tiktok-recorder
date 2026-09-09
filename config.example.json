@@ -1,6 +1,6 @@
-﻿{
+{
     "target_user": "islizanx",
-    "monitored_users": ["islizanx", "itsme_kate0110", "urielhui38"],
+    "monitored_users": [],
     "check_interval_seconds": 20,
     "quality": "best",
     "output_dir": ".",

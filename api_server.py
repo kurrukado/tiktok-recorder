@@ -55,7 +55,7 @@ def load_config():
         except Exception:
             pass
     return {
-        "monitored_users": ["islizanx", "itsme_kate0110", "urielhui38"],
+        "monitored_users": [],
         "check_interval_seconds": 20
     }
 
@@ -159,14 +159,14 @@ def get_users(check_live: bool = False):
     users = None
     try:
         drive_users = gdrive_manager.load_streamers_from_drive()
-        if drive_users and isinstance(drive_users, list):
+        if drive_users is not None and isinstance(drive_users, list):
             users = drive_users
     except Exception:
         pass
 
-    if not users:
+    if users is None:
         cfg = load_config()
-        users = cfg.get("monitored_users", ["islizanx", "itsme_kate0110", "urielhui38"])
+        users = cfg.get("monitored_users", [])
 
     active_users = set()
     try:
@@ -209,7 +209,7 @@ def add_user(req: AddUserRequest):
     users = cfg.get("monitored_users", [])
     try:
         drive_users = gdrive_manager.load_streamers_from_drive()
-        if drive_users and isinstance(drive_users, list):
+        if drive_users is not None and isinstance(drive_users, list):
             users = drive_users
     except Exception:
         pass
@@ -233,7 +233,7 @@ def delete_user(username: str):
     users = cfg.get("monitored_users", [])
     try:
         drive_users = gdrive_manager.load_streamers_from_drive()
-        if drive_users and isinstance(drive_users, list):
+        if drive_users is not None and isinstance(drive_users, list):
             users = drive_users
     except Exception:
         pass
@@ -321,11 +321,20 @@ def stop_record(req: AddUserRequest):
 
 @app.get("/api/recordings")
 def list_recordings():
-    users = ["islizanx", "itsme_kate0110", "urielhui38"]
+    users_set = set()
+    try:
+        drive_users = gdrive_manager.load_streamers_from_drive()
+        if drive_users and isinstance(drive_users, list):
+            users_set.update(drive_users)
+    except Exception:
+        pass
     cfg = load_config()
-    for u in cfg.get("monitored_users", []):
-        if u not in users:
-            users.append(u)
+    users_set.update(cfg.get("monitored_users", []))
+    for item in os.listdir(BASE_DIR):
+        item_path = os.path.join(BASE_DIR, item)
+        if os.path.isdir(item_path) and not item.startswith((".", "_")):
+            users_set.add(item)
+    users = list(users_set)
 
     files_list = []
     for u in users:

@@ -190,7 +190,20 @@ def sync_all_to_gdrive():
     root_id = find_or_create_folder("tiktok-record", access_token=token)
     print(f"  [✓] ID thư mục gốc: {root_id}")
 
-    users = ["islizanx", "itsme_kate0110", "urielhui38"]
+    users_set = set()
+    try:
+        drive_u = load_streamers_from_drive(access_token=token)
+        if drive_u and isinstance(drive_u, list):
+            users_set.update(drive_u)
+    except Exception:
+        pass
+    cfg = load_config()
+    users_set.update(cfg.get("monitored_users", []))
+    for item in os.listdir(BASE_DIR):
+        item_path = os.path.join(BASE_DIR, item)
+        if os.path.isdir(item_path) and not item.startswith((".", "_")):
+            users_set.add(item)
+    users = list(users_set)
     total_uploaded = 0
     total_files = 0
 
