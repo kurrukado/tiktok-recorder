@@ -519,6 +519,7 @@ def list_recordings_from_drive(access_token=None):
                         recorded_at = f.get("createdTime", "")
                         
                     sz_bytes = int(f.get("size", 0))
+                    cdn_url = f"https://drive.usercontent.google.com/download?id={f['id']}&export=download&authuser=0"
                     recordings.append({
                         "filename": fname,
                         "user": uname,
@@ -528,6 +529,7 @@ def list_recordings_from_drive(access_token=None):
                         "created_at": f.get("createdTime"),
                         "thumbnail_url": f"/api/thumbnail/{uname}/{fname}",
                         "download_url": f"/api/download/{uname}/{fname}",
+                        "cdn_download_url": cdn_url,
                         "drive_file_id": f["id"],
                         "drive_thumb_id": thumb_id,
                         "source": "google_drive"
@@ -658,12 +660,15 @@ def get_thumbnail(user: str, filename: str):
 
 @app.get("/api/download/{user}/{filename}")
 def download_video(user: str, filename: str):
+    """
+    Tải video về máy qua CDN tốc độ cao của Google Edge (Hỗ trợ IDM đa luồng, tua video Range 206).
+    """
     user = user.strip().replace("@", "").lower()
     fp = os.path.join(BASE_DIR, user, filename)
     if os.path.exists(fp):
         return FileResponse(path=fp, media_type="video/mp4", filename=filename)
     
-    # Tìm kiếm trên Google Drive và redirect trực tiếp đến link tải tốc độ cao
+    # Tìm kiếm trên Google Drive và chuyển hướng trực tiếp đến CDN tải tốc độ cao
     try:
         tok = gdrive_manager.get_access_token()
         if tok:
@@ -671,15 +676,60 @@ def download_video(user: str, filename: str):
             user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
             headers = {"Authorization": f"Bearer {tok}"}
             q_vid = f"name = '{filename}' and '{user_fid}' in parents and trashed = false"
-            res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,webContentLink)"}, timeout=10)
+            res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id)"}, timeout=10)
             vid_files = res_vid.json().get("files", [])
             if vid_files:
                 file_id = vid_files[0]["id"]
-                return RedirectResponse(url=f"https://drive.google.com/uc?export=download&id={file_id}", status_code=302)
+                # Cấp quyền đọc công khai để CDN tải mượt mà không cần xác thực
+                gdrive_manager.make_file_public(file_id, access_token=tok)
+                cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
+                return RedirectResponse(url=cdn_url, status_code=302)
     except Exception as e:
         print(f"[!] Lỗi tìm video trên Google Drive: {e}")
 
     raise HTTPException(status_code=404, detail="File video không tồn tại")
+
+@app.get("/api/cdn/{user}/{filename}")
+def get_cdn_url(user: str, filename: str, redirect: bool = False):
+    """
+    Cung cấp link CDN tải trực tiếp tốc độ cao tối đa (Gigabit Google Edge CDN).
+    - Mặc định trả về JSON chứa link CDN và thông số kỹ thuật.
+    - Nếu thêm ?redirect=true: Tự động chuyển hướng tải ngay lập tức.
+    """
+    user = user.strip().replace("@", "").lower()
+    try:
+        tok = gdrive_manager.get_access_token()
+        if tok:
+            root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
+            user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
+            headers = {"Authorization": f"Bearer {tok}"}
+            q_vid = f"name = '{filename}' and '{user_fid}' in parents and trashed = false"
+            res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,size,createdTime)"}, timeout=10)
+            vid_files = res_vid.json().get("files", [])
+            if vid_files:
+                file_id = vid_files[0]["id"]
+                sz_bytes = int(vid_files[0].get("size", 0))
+                gdrive_manager.make_file_public(file_id, access_token=tok)
+                cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
+                
+                if redirect:
+                    return RedirectResponse(url=cdn_url, status_code=302)
+                    
+                return {
+                    "filename": filename,
+                    "user": user,
+                    "cdn_download_url": cdn_url,
+                    "size_mb": round(sz_bytes / (1024 * 1024), 2),
+                    "size_bytes": sz_bytes,
+                    "cdn_provider": "Google Cloud Global Edge CDN",
+                    "supports_idm_multithread": True,
+                    "supports_range_seeking": True,
+                    "note": "Link CDN trực tiếp, không giới hạn băng thông, hỗ trợ tải đa luồng và tua video tức thì."
+                }
+    except Exception as e:
+        print(f"[!] Lỗi CDN trên Google Drive: {e}")
+
+    raise HTTPException(status_code=404, detail="File video không tồn tại trên CDN")
 
 @app.post("/api/gdrive/sync")
 def trigger_gdrive_sync(bg_tasks: BackgroundTasks):

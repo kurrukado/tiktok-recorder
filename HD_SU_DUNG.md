@@ -138,9 +138,10 @@ API được lập trình bằng FastAPI và đã được triển khai chạy t
 | `DELETE` | `/api/users/{username}` | **Xóa streamer & Tự động xóa vĩnh viễn thư mục trên Google Drive** |
 | `GET` | `/api/stream/{username}` | Lấy link stream CDN trực tiếp để tải/xem tốc độ cao |
 | `POST` | `/api/record/start` | Kích hoạt bắt đầu ghi hình ngay lập tức |
-| `GET` | `/api/recordings` | Lấy danh sách toàn bộ file video đã quay (kèm thời lượng, dung lượng, link thumbnail) |
+| `GET` | `/api/recordings` | Lấy danh sách toàn bộ video đã quay (kèm `recorded_at`, link ảnh 50%, link CDN) |
 | `GET` | `/api/thumbnail/{user}/{filename}` | **Lấy ảnh xem trước (Thumbnail)** tự động cắt từ chính giữa video (50% thời lượng) |
-| `GET` | `/api/download/{user}/{filename}` | Tải file video về máy (Hỗ trợ IDM, đa luồng) |
+| `GET` | `/api/download/{user}/{filename}` | Tải video tốc độ cao (Tự động chuyển hướng đến Google Edge CDN) |
+| `GET` | `/api/cdn/{user}/{filename}` | **Lấy link Google Edge CDN trực tiếp** (Hỗ trợ IDM đa luồng, tua video Range 206) |
 
 ---
 

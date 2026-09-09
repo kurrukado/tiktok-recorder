@@ -164,11 +164,37 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
                 sys.stdout.flush()
 
         print(f"\r  [✓] Đã tải lên Drive thành công: {file_name} ({file_size_mb:.2f} MB)                 ")
+        if put_res.status_code in [200, 201]:
+            try:
+                res_data = put_res.json()
+                f_id = res_data.get("id")
+                if f_id:
+                    make_file_public(f_id, access_token=access_token)
+            except Exception:
+                pass
         return True
 
     except Exception as e:
         print(f"\n  [!] Lỗi khi tải file {file_name}: {e}")
         return False
+
+def make_file_public(file_id, access_token=None):
+    """Cấp quyền đọc công khai (anyoneWithLink) để tải qua CDN tốc độ cao không cần đăng nhập."""
+    try:
+        if not access_token:
+            access_token = get_access_token()
+        if not access_token:
+            return False
+        headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+        url = f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions"
+        requests.post(url, headers=headers, json={"role": "reader", "type": "anyone"}, timeout=10)
+        return True
+    except Exception:
+        return False
+
+def get_cdn_download_url(file_id):
+    """Tạo link CDN tải trực tiếp tốc độ cao tối đa từ máy chủ Edge của Google."""
+    return f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
 
 def sync_all_to_gdrive():
     cfg = load_config()
