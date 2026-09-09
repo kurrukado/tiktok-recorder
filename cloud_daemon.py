@@ -43,7 +43,8 @@ def load_monitored_users():
     global _LAST_DRIVE_CHECK, _CACHED_DRIVE_USERS
 
     now = time.time()
-    if now - _LAST_DRIVE_CHECK > 60:
+    # Kiểm tra danh sách streamer mới từ Google Drive sau mỗi 15 giây
+    if now - _LAST_DRIVE_CHECK > 15:
         _LAST_DRIVE_CHECK = now
         try:
             drive_users = gdrive_manager.load_streamers_from_drive()
