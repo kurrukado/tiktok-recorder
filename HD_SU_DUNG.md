@@ -99,24 +99,37 @@ python gdrive_manager.py --upload-all
 
 ## 5. CÁCH 3: TÍCH HỢP REST API VÀO WEBSITE KHÁC
 
-API được lập trình bằng FastAPI, cho phép website khác giao tiếp hoàn toàn qua giao thức HTTP/JSON.
+API được lập trình bằng FastAPI và đã được triển khai chạy trực tuyến 24/7 trên Cloud (Render.com), hỗ trợ đầy đủ CORS và chứng chỉ bảo mật HTTPS. Bạn không cần bật máy tính ở nhà mà website tích hợp vẫn hoạt động bình thường.
 
-### Khởi động Server API:
-```powershell
-python api_server.py
-```
-- Máy chủ sẽ chạy tại: `http://localhost:8000`
-- Giao diện tài liệu trực quan (Swagger UI): **`http://localhost:8000/docs`**
+### 🌐 Địa chỉ Server API Trực Tuyến:
+- **API Base URL:** `https://tiktok-api-as2y.onrender.com`
+- **Giao diện thử nghiệm trực quan (Swagger UI):** [`https://tiktok-api-as2y.onrender.com/docs`](https://tiktok-api-as2y.onrender.com/docs)
+
+*(Nếu bạn muốn chạy server trực tiếp dưới máy tính cá nhân, chỉ cần chạy lệnh: `python api_server.py`, server sẽ lắng nghe tại `http://localhost:8000`).*
 
 ---
 
-### Bảng chi tiết các API:
+### 🔄 Cơ chế Đồng bộ Thông minh giữa Web $\leftrightarrow$ Google Drive $\leftrightarrow$ Bot GitHub:
+1. Khi bạn hoặc người dùng **Thêm / Xóa streamer** trên website qua API Render:
+   - Server Render sẽ tự động cập nhật danh sách vào file `streamers.json` nằm trong thư mục `tiktok-record/` trên Google Drive.
+2. Bot **GitHub Actions** (đang chạy ngầm 24/7 độc lập) sẽ tự động kiểm tra Google Drive sau mỗi 60 giây.
+3. Khi phát hiện streamer mới được thêm vào, bot GitHub sẽ **tự động canh sóng và ghi hình ngay lập tức** khi streamer đó phát trực tiếp.
+
+> 💡 **Cấu hình trên Render Dashboard (Để bật đồng bộ Google Drive):**
+> Vào [Render Dashboard](https://dashboard.render.com/) ➔ Chọn dịch vụ `tiktok-api-as2y` ➔ Mục **Environment** ➔ Thêm 3 biến môi trường (Lấy các giá trị tương ứng từ file `config.json` trên máy tính của bạn):
+> - `GOOGLE_CLIENT_ID`: (Nhập giá trị `google_client_id` trong file config.json)
+> - `GOOGLE_CLIENT_SECRET`: (Nhập giá trị `google_client_secret` trong file config.json)
+> - `GDRIVE_REFRESH_TOKEN`: (Nhập giá trị `gdrive_refresh_token` trong file config.json)
+
+---
+
+### Bảng chi tiết các API chính:
 
 | Phương thức | Endpoint URL | Chức năng |
 | :--- | :--- | :--- |
-| `POST` | `/api/users` | Thêm streamer mới cần theo dõi |
-| `GET` | `/api/users` | Lấy danh sách streamer & kiểm tra trạng thái Live |
-| `DELETE` | `/api/users/{username}` | Xóa streamer khỏi danh sách |
+| `GET` | `/api/users` | Lấy danh sách streamer đang theo dõi (Phản hồi tức thì <50ms) |
+| `POST` | `/api/users` | Thêm streamer mới (Tự động đồng bộ lên Google Drive & Bot GitHub) |
+| `DELETE` | `/api/users/{username}` | Xóa streamer khỏi danh sách theo dõi |
 | `GET` | `/api/stream/{username}` | Lấy link stream CDN trực tiếp để tải/xem tốc độ cao |
 | `POST` | `/api/record/start` | Kích hoạt bắt đầu ghi hình ngay lập tức |
 | `GET` | `/api/recordings` | Lấy danh sách toàn bộ file video đã quay (kèm thời lượng, dung lượng, link thumbnail) |
@@ -127,46 +140,58 @@ python api_server.py
 
 ### Code mẫu JavaScript để nhúng vào Website của bạn:
 
-#### 1. Hiển thị danh sách video kèm ảnh xem trước (Thumbnail):
 ```javascript
-async function loadVideoCards() {
-  const res = await fetch('http://localhost:8000/api/recordings');
-  const data = await res.json();
-  
-  const container = document.getElementById('video-list');
-  data.recordings.forEach(vid => {
-    container.innerHTML += `
-      <div class="video-card">
-        <!-- Ảnh xem trước tự động cắt từ giữa video -->
-        <img src="http://localhost:8000${vid.thumbnail_url}" style="width: 250px; border-radius: 8px;" />
-        <p><b>${vid.user}</b> - Thời lượng: ${vid.duration_formatted} (${vid.size_mb} MB)</p>
-        <a href="http://localhost:8000${vid.download_url}" download>Tải xuống</a>
-      </div>
-    `;
-  });
-}
-```
+// Đường dẫn API trực tuyến trên Render (Hoạt động 24/7)
+const API_BASE = "https://tiktok-api-as2y.onrender.com";
 
-#### 2. Thêm streamer mới:
-```javascript
+// 1. Lấy danh sách streamer đang theo dõi
+async function getStreamers() {
+  try {
+    const res = await fetch(`${API_BASE}/api/users`);
+    const data = await res.json();
+    console.log("Danh sách streamer:", data.streamers);
+    return data.streamers; // Ví dụ: ['islizanx', 'itsme_kate0110', 'urielhui38']
+  } catch (err) {
+    console.error("Lỗi khi tải danh sách:", err);
+  }
+}
+
+// 2. Thêm một streamer mới
 async function addStreamer(username) {
-  const res = await fetch('http://localhost:8000/api/users', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username: username })
-  });
-  const data = await res.json();
-  console.log('Kết quả:', data);
+  const cleanUser = username.trim().replace('@', '').toLowerCase();
+  try {
+    const res = await fetch(`${API_BASE}/api/users`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: cleanUser })
+    });
+    const data = await res.json();
+    alert(data.message);
+  } catch (err) {
+    alert("Không thể kết nối tới server API!");
+  }
 }
-```
 
-#### 3. Lấy link CDN tải tốc độ cao:
-```javascript
+// 3. Xóa một streamer khỏi danh sách
+async function deleteStreamer(username) {
+  const cleanUser = username.trim().replace('@', '').toLowerCase();
+  try {
+    const res = await fetch(`${API_BASE}/api/users/${cleanUser}`, {
+      method: "DELETE"
+    });
+    const data = await res.json();
+    alert(data.message);
+  } catch (err) {
+    alert("Không thể kết nối tới server API!");
+  }
+}
+
+// 4. Lấy link CDN tải tốc độ tối đa đường truyền
 async function getHighSpeedDownload(username) {
-  const res = await fetch(`http://localhost:8000/api/stream/${username}`);
+  const cleanUser = username.trim().replace('@', '').toLowerCase();
+  const res = await fetch(`${API_BASE}/api/stream/${cleanUser}`);
   const data = await res.json();
   if (data.is_live) {
-    // Mở link trực tiếp từ CDN TikTok để tải tốc độ tối đa đường truyền
     window.open(data.stream_url);
   } else {
     alert('Streamer hiện không online');
