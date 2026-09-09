@@ -105,6 +105,15 @@ def check_live_status(user):
     except Exception as e:
         return False, None
 
+check_user_live = check_live_status
+
+def get_live_stream_url(room_id, user=None, cookies=None):
+    try:
+        urls = get_stream_urls(room_id, user, cookies=cookies)
+        return urls[0] if urls else None
+    except Exception:
+        return None
+
 def get_stream_urls(room_id, user, cookies=None):
     """
     Extract candidate stream URLs (FLV or HLS / m3u8).

@@ -35,8 +35,26 @@ def save_config(cfg):
     except Exception as e:
         log(f"[!] Không thể ghi config.json: {e}")
 
+_LAST_DRIVE_CHECK = 0
+_CACHED_DRIVE_USERS = None
+
 def load_monitored_users():
+    global _LAST_DRIVE_CHECK, _CACHED_DRIVE_USERS
     default_users = ["islizanx", "itsme_kate0110", "urielhui38"]
+
+    now = time.time()
+    if now - _LAST_DRIVE_CHECK > 60:
+        _LAST_DRIVE_CHECK = now
+        try:
+            drive_users = gdrive_manager.load_streamers_from_drive()
+            if drive_users and isinstance(drive_users, list):
+                _CACHED_DRIVE_USERS = [u.strip().replace("@", "") for u in drive_users if u.strip()]
+        except Exception:
+            pass
+
+    if _CACHED_DRIVE_USERS:
+        return _CACHED_DRIVE_USERS
+
     cfg = load_config()
     users = cfg.get("monitored_users")
     if users and isinstance(users, list):

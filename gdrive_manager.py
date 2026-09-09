@@ -220,6 +220,79 @@ def sync_all_to_gdrive():
     print(f"    - Tổng số video      : {total_uploaded}/{total_files} file đã sẵn sàng")
     print("=" * 65 + "\n")
 
+def load_streamers_from_drive(access_token=None):
+    """Đọc danh sách streamer từ file streamers.json trong thư mục tiktok-record trên Google Drive."""
+    try:
+        if not access_token:
+            access_token = get_access_token()
+        if not access_token:
+            return None
+        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        q = f"name = 'streamers.json' and '{root_id}' in parents and trashed = false"
+        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            files = res.json().get("files", [])
+            if files:
+                file_id = files[0]["id"]
+                down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+                d_res = requests.get(down_url, headers=headers, timeout=10)
+                if d_res.status_code == 200:
+                    data = d_res.json()
+                    if isinstance(data, list):
+                        return data
+                    if isinstance(data, dict) and "streamers" in data:
+                        return data["streamers"]
+    except Exception as e:
+        print(f"[!] Lỗi đọc streamers.json từ Drive: {e}")
+    return None
+
+def save_streamers_to_drive(streamers_list, access_token=None):
+    """Lưu danh sách streamer vào file streamers.json trong thư mục tiktok-record trên Google Drive."""
+    try:
+        if not access_token:
+            access_token = get_access_token()
+        if not access_token:
+            return False
+        root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+        headers = {"Authorization": f"Bearer {access_token}"}
+        q = f"name = 'streamers.json' and '{root_id}' in parents and trashed = false"
+        url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
+        res = requests.get(url, headers=headers, timeout=10)
+        file_id = None
+        if res.status_code == 200:
+            files = res.json().get("files", [])
+            if files:
+                file_id = files[0]["id"]
+
+        content_bytes = json.dumps(streamers_list, indent=2, ensure_ascii=False).encode("utf-8")
+        if file_id:
+            up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
+            up_res = requests.patch(
+                up_url,
+                headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+                data=content_bytes,
+                timeout=15
+            )
+            return up_res.status_code == 200
+        else:
+            meta = {
+                "name": "streamers.json",
+                "parents": [root_id]
+            }
+            files = {
+                "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
+                "file": ("streamers.json", content_bytes, "application/json")
+            }
+            create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+            c_res = requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files, timeout=15)
+            return c_res.status_code in [200, 201]
+    except Exception as e:
+        print(f"[!] Lỗi ghi streamers.json lên Drive: {e}")
+    return False
+
+
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Google Drive Sync Manager")

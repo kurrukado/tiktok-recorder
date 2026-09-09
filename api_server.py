@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import json
 import time
@@ -133,8 +133,17 @@ def health_check():
 
 @app.get("/api/users")
 def get_users():
-    cfg = load_config()
-    users = cfg.get("monitored_users", ["islizanx", "itsme_kate0110", "urielhui38"])
+    users = None
+    try:
+        drive_users = gdrive_manager.load_streamers_from_drive()
+        if drive_users and isinstance(drive_users, list):
+            users = drive_users
+    except Exception:
+        pass
+
+    if not users:
+        cfg = load_config()
+        users = cfg.get("monitored_users", ["islizanx", "itsme_kate0110", "urielhui38"])
     
     result = []
     for u in users:
@@ -156,12 +165,23 @@ def add_user(req: AddUserRequest):
     
     cfg = load_config()
     users = cfg.get("monitored_users", [])
+    try:
+        drive_users = gdrive_manager.load_streamers_from_drive()
+        if drive_users and isinstance(drive_users, list):
+            users = drive_users
+    except Exception:
+        pass
+
     if user in users:
         return {"message": f"@{user} đã có trong danh sách theo dõi", "users": users}
     
     users.append(user)
     cfg["monitored_users"] = users
     save_config(cfg)
+    try:
+        gdrive_manager.save_streamers_to_drive(users)
+    except Exception:
+        pass
     return {"message": f"Đã thêm @{user} vào danh sách theo dõi", "users": users}
 
 @app.delete("/api/users/{username}")
@@ -169,12 +189,23 @@ def delete_user(username: str):
     user = username.strip().replace("@", "").lower()
     cfg = load_config()
     users = cfg.get("monitored_users", [])
+    try:
+        drive_users = gdrive_manager.load_streamers_from_drive()
+        if drive_users and isinstance(drive_users, list):
+            users = drive_users
+    except Exception:
+        pass
+
     if user not in users:
         raise HTTPException(status_code=404, detail=f"@{user} không có trong danh sách")
     
     users.remove(user)
     cfg["monitored_users"] = users
     save_config(cfg)
+    try:
+        gdrive_manager.save_streamers_to_drive(users)
+    except Exception:
+        pass
     return {"message": f"Đã xóa @{user} khỏi danh sách theo dõi", "users": users}
 
 @app.get("/api/stream/{username}")
