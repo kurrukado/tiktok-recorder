@@ -6,6 +6,7 @@ import shutil
 import threading
 import subprocess
 import re
+import concurrent.futures
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel
@@ -116,6 +117,26 @@ def extract_middle_thumbnail(video_path, output_thumb=None):
 
     return None
 
+# ---------------- LIVE STATUS CACHE ----------------
+LIVE_CACHE = {}  # {username: {"is_live": bool, "room_id": str, "timestamp": float}}
+LIVE_CACHE_TTL = 15.0  # Cache 15 giây để phản hồi API siêu nhanh, không gây nghẽn
+
+def get_user_live_status_cached(user: str):
+    user = user.strip().replace("@", "").lower()
+    now = time.time()
+    cached = LIVE_CACHE.get(user)
+    if cached and (now - cached["timestamp"] < LIVE_CACHE_TTL):
+        return cached["is_live"], cached["room_id"]
+    
+    is_live, room_id = False, None
+    try:
+        is_live, room_id = recorder_core.check_user_live(user)
+    except Exception:
+        is_live, room_id = False, None
+        
+    LIVE_CACHE[user] = {"is_live": is_live, "room_id": room_id, "timestamp": now}
+    return is_live, room_id
+
 class AddUserRequest(BaseModel):
     username: str
 
@@ -125,12 +146,14 @@ class RecordRequest(BaseModel):
 
 @app.get("/api/health")
 def health_check():
-    active = []
+    active = set()
     try:
-        active = gdrive_manager.load_active_recordings_from_drive() or []
+        drive_act = gdrive_manager.load_active_recordings_from_drive() or []
+        active.update(drive_act)
     except Exception:
         pass
-    all_active = list(set(active + list(ACTIVE_RECORDING_TASKS.keys())))
+    active.update(ACTIVE_RECORDING_TASKS.keys())
+    all_active = list(active)
     return {
         "status": "online",
         "time": datetime.now().isoformat(),
@@ -141,21 +164,40 @@ def health_check():
 @app.get("/api/recordings/active")
 def get_active_recordings():
     """
-    Trả về danh sách chính xác các streamer hiện đang được bot 24/7 ghi hình.
+    Trả về danh sách chính xác các streamer hiện đang được bot 24/7 ghi hình (hoặc đang phát trực tiếp).
     """
-    active = []
+    active = set()
     try:
-        active = gdrive_manager.load_active_recordings_from_drive() or []
+        drive_act = gdrive_manager.load_active_recordings_from_drive() or []
+        active.update(drive_act)
     except Exception:
         pass
-    all_active = list(set(active + list(ACTIVE_RECORDING_TASKS.keys())))
+    active.update(ACTIVE_RECORDING_TASKS.keys())
+
+    # Đồng bộ thêm các user đang live
+    cfg = load_config()
+    users = cfg.get("monitored_users", [])
+    try:
+        drive_users = gdrive_manager.load_streamers_from_drive()
+        if drive_users is not None and isinstance(drive_users, list):
+            users = drive_users
+    except Exception:
+        pass
+
+    for u in users:
+        is_live, _ = get_user_live_status_cached(u)
+        if is_live:
+            active.add(u)
+
+    all_active = list(active)
     return {
         "total_active": len(all_active),
-        "active_streamers": all_active
+        "active_streamers": all_active,
+        "status": "recording" if all_active else "idle"
     }
 
 @app.get("/api/users")
-def get_users(check_live: bool = False):
+def get_users(check_live: bool = True):
     users = None
     try:
         drive_users = gdrive_manager.load_streamers_from_drive()
@@ -177,23 +219,32 @@ def get_users(check_live: bool = False):
         pass
     active_users.update(ACTIVE_RECORDING_TASKS.keys())
     
+    # Kiểm tra live đa luồng song song (ThreadPoolExecutor) để tốc độ siêu nhanh
+    live_statuses = {}
+    if check_live and users:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users), 8)) as executor:
+            future_to_user = {executor.submit(get_user_live_status_cached, u): u for u in users}
+            for fut in concurrent.futures.as_completed(future_to_user):
+                u = future_to_user[fut]
+                try:
+                    live_statuses[u] = fut.result()
+                except Exception:
+                    live_statuses[u] = (False, None)
+
     result = []
     for u in users:
-        is_live, room_id = False, None
-        if check_live:
-            try:
-                is_live, room_id = recorder_core.check_user_live(u)
-            except Exception:
-                pass
-        # Nếu streamer đang live thì luôn được tính là đang ghi hình tự động
+        is_live, room_id = live_statuses.get(u, (False, None))
+        # Nếu streamer đang Live hoặc đang được bot quay -> báo "recording" chuẩn 100%
         is_recording = (u in active_users) or is_live
-        if is_live:
+        if is_recording:
             active_users.add(u)
+        status_str = "recording" if is_recording else "offline"
         result.append({
             "username": u,
             "is_live": is_live,
             "room_id": room_id,
-            "is_recording": is_recording
+            "is_recording": is_recording,
+            "status": status_str
         })
     return {
         "users": result,
@@ -296,11 +347,12 @@ def delete_user(username: str):
 @app.get("/api/stream/{username}")
 def get_stream_url(username: str):
     user = username.strip().replace("@", "").lower()
-    is_live, room_id = recorder_core.check_user_live(user)
+    is_live, room_id = get_user_live_status_cached(user)
     if not is_live or not room_id:
         return {
             "username": user,
             "is_live": False,
+            "status": "offline",
             "message": "Streamer hiện tại đang ngoại tuyến (Offline)"
         }
     
@@ -311,6 +363,7 @@ def get_stream_url(username: str):
     return {
         "username": user,
         "is_live": True,
+        "status": "recording",
         "room_id": room_id,
         "stream_url": stream_url,
         "format": "flv" if ".flv" in stream_url else "hls_m3u8",
@@ -318,22 +371,25 @@ def get_stream_url(username: str):
     }
 
 def bg_record_worker(user: str, duration: Optional[int]):
+    # Chỉ chạy local recorder nếu hệ thống có sẵn ffmpeg
+    if not shutil.which("ffmpeg") and not os.path.exists(FFMPEG_PATH):
+        return
     try:
-        is_live, room_id = recorder_core.check_user_live(user)
+        is_live, room_id = get_user_live_status_cached(user)
         if not is_live or not room_id:
             return
         stream_url = recorder_core.get_live_stream_url(room_id, user=user)
         if stream_url:
             output_file = recorder_core.record_stream_ffmpeg(stream_url, target_user=user, duration=duration)
             if output_file and os.path.exists(output_file):
-                # Tự động cắt thumbnail
                 extract_middle_thumbnail(output_file)
-                # Auto sync Google Drive
                 token = gdrive_manager.get_access_token()
                 if token:
                     root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
                     sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
                     gdrive_manager.upload_file_to_drive(output_file, sub_id, access_token=token)
+    except Exception as e:
+        print(f"[!] Lỗi ghi hình worker: {e}")
     finally:
         with RECORDING_LOCK:
             ACTIVE_RECORDING_TASKS.pop(user, None)
@@ -341,26 +397,83 @@ def bg_record_worker(user: str, duration: Optional[int]):
 @app.post("/api/record/start")
 def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     user = req.username.strip().replace("@", "").lower()
-    with RECORDING_LOCK:
-        if user in ACTIVE_RECORDING_TASKS:
-            return {"message": f"@{user} đang được ghi hình rồi", "status": "already_recording"}
-        ACTIVE_RECORDING_TASKS[user] = {"start_time": time.time()}
+    
+    # Đảm bảo streamer có trong danh sách theo dõi
+    cfg = load_config()
+    users = cfg.get("monitored_users", [])
+    try:
+        drive_users = gdrive_manager.load_streamers_from_drive()
+        if drive_users is not None and isinstance(drive_users, list):
+            users = drive_users
+    except Exception:
+        pass
+    if user not in users:
+        users.append(user)
+        cfg["monitored_users"] = users
+        save_config(cfg)
+        try:
+            gdrive_manager.save_streamers_to_drive(users)
+        except Exception:
+            pass
 
-    bg_tasks.add_task(bg_record_worker, user, req.duration_seconds)
-    return {
-        "message": f"Đã bắt đầu tiến trình ghi hình @{user}",
-        "status": "recording_started",
-        "username": user
-    }
+    # Tạo folder trên Google Drive
+    try:
+        gdrive_manager.create_streamer_folder_drive(user)
+    except Exception:
+        pass
+
+    # Kiểm tra xem streamer có đang phát trực tiếp không
+    is_live, room_id = get_user_live_status_cached(user)
+    if is_live:
+        with RECORDING_LOCK:
+            ACTIVE_RECORDING_TASKS[user] = {"start_time": time.time()}
+        try:
+            gdrive_manager.set_user_recording_status_drive(user, True)
+        except Exception:
+            pass
+            
+        # Nếu có FFmpeg (chạy dưới máy local) thì chạy thêm luồng lưu
+        if shutil.which("ffmpeg") or os.path.exists(FFMPEG_PATH):
+            bg_tasks.add_task(bg_record_worker, user, req.duration_seconds)
+
+        return {
+            "message": f"@{user} đang phát trực tiếp! Hệ thống Cloud 24/7 đang ghi hình phiên live.",
+            "status": "recording",
+            "is_live": True,
+            "is_recording": True,
+            "username": user,
+            "room_id": room_id
+        }
+    else:
+        with RECORDING_LOCK:
+            ACTIVE_RECORDING_TASKS.pop(user, None)
+        try:
+            gdrive_manager.set_user_recording_status_drive(user, False)
+        except Exception:
+            pass
+        return {
+            "message": f"@{user} hiện đang ngoại tuyến (Offline). Bot 24/7 đã lưu vào danh sách và sẽ tự động ghi hình ngay khi họ live!",
+            "status": "offline",
+            "is_live": False,
+            "is_recording": False,
+            "username": user
+        }
 
 @app.post("/api/record/stop")
 def stop_record(req: AddUserRequest):
     user = req.username.strip().replace("@", "").lower()
     with RECORDING_LOCK:
-        if user in ACTIVE_RECORDING_TASKS:
-            ACTIVE_RECORDING_TASKS.pop(user, None)
-            return {"message": f"Đã dừng theo dõi/ghi hình @{user}", "status": "stopped"}
-        return {"message": f"@{user} không có tiến trình ghi hình nào đang hoạt động", "status": "not_recording"}
+        ACTIVE_RECORDING_TASKS.pop(user, None)
+    try:
+        gdrive_manager.set_user_recording_status_drive(user, False)
+    except Exception:
+        pass
+    return {
+        "message": f"Đã dừng ghi hình @{user}",
+        "status": "offline",
+        "is_recording": False,
+        "username": user
+    }
 
 @app.get("/api/recordings")
 def list_recordings():

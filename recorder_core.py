@@ -136,17 +136,19 @@ def get_stream_urls(room_id, user, cookies=None):
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             }
             page_res = session.get(live_page_url, headers=page_headers, timeout=15)
-            content = page_res.text.replace('\\"', '"').replace('\\u0026', '&').replace('\\/', '/')
+            content = page_res.text.replace('\\"', '"').replace('\\u0026', '&').replace('&amp;', '&').replace('\\/', '/')
             
             flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv\?[^\s"\'<>]+', content)
             if flv_matches:
-                hd_matches = [u for u in flv_matches if "_hd" in u or "_or4" in u]
-                return hd_matches if hd_matches else flv_matches
+                clean_flv = [u.replace('&amp;', '&') for u in flv_matches]
+                hd_matches = [u for u in clean_flv if "_hd" in u or "_or4" in u]
+                return hd_matches if hd_matches else clean_flv
 
             hls_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8\?[^\s"\'<>]*', content)
             if hls_matches:
-                hd_matches = [u for u in hls_matches if "_hd" in u or "_or4" in u]
-                return hd_matches if hd_matches else hls_matches
+                clean_hls = [u.replace('&amp;', '&') for u in hls_matches]
+                hd_matches = [u for u in clean_hls if "_hd" in u or "_or4" in u]
+                return hd_matches if hd_matches else clean_hls
         except Exception:
             pass
 
