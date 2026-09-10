@@ -62,7 +62,7 @@ def get_access_token(force_refresh=False):
                 token = res_data.get("access_token")
                 expires_in = res_data.get("expires_in", 3600)
                 _CACHED_ACCESS_TOKEN["token"] = token
-                _CACHED_ACCESS_TOKEN["expires_at"] = now + max(expires_in - 120, 60)
+                _CACHED_ACCESS_TOKEN["expires_at"] = now + max(expires_in - 300, 60)
                 return token
             else:
                 print(f"[!] Lỗi khi lấy Access Token từ Google: {res.text}")
@@ -165,6 +165,13 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
 
     try:
         init_res = requests.post(init_url, headers=init_headers, json=meta, timeout=30)
+        if init_res.status_code == 401:
+            # Token hết hạn lúc chuyển giao giữa các part -> Tự động làm mới token và thử lại ngay lập tức
+            new_tok = get_access_token(force_refresh=True)
+            if new_tok:
+                init_headers["Authorization"] = f"Bearer {new_tok}"
+                init_res = requests.post(init_url, headers=init_headers, json=meta, timeout=30)
+
         if init_res.status_code != 200:
             print(f"  [!] Lỗi khởi tạo upload session: {init_res.text}")
             return False

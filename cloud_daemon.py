@@ -152,16 +152,28 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 except Exception:
                     pass
 
-            if is_sub_only:
-                # Xoay Guest Session vô danh mới cho mỗi phần preview Sub-Only
-                log(f"🔄 [@{user}] Tạo phiên khách vô danh mới (Guest Session) để lấy link preview Sub-Only Phần {part_number}...")
-                guest_session = recorder_core.generate_guest_session()
-                stream_url = recorder_core.get_live_stream_url(current_room_id, user=user, session=guest_session)
-            else:
-                stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
+            stream_url = None
+            for s_attempt in range(3):
+                if is_sub_only:
+                    log(f"🔄 [@{user}] Tạo phiên khách vô danh mới (Guest Session) để lấy link preview Sub-Only Phần {part_number} (lần {s_attempt+1})...")
+                    guest_session = recorder_core.generate_guest_session()
+                    stream_url = recorder_core.get_live_stream_url(current_room_id, user=user, session=guest_session)
+                else:
+                    stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
+                
+                if stream_url:
+                    break
+                time.sleep(2.5)
 
             if not stream_url:
-                log(f"[!] Không lấy được URL stream của @{user}, kết thúc luồng.")
+                # Thử refresh lại room_id từ live status một lần nữa trước khi kết thúc
+                st_live, new_rid = recorder_core.check_live_status(user)
+                if st_live and new_rid:
+                    current_room_id = new_rid
+                    stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
+
+            if not stream_url:
+                log(f"[!] Không lấy được URL stream của @{user} sau các lần thử, kết thúc luồng.")
                 break
 
             now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")

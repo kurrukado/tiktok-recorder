@@ -538,9 +538,15 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 print(f"[🏁] [@{user}] Streamer hiện không live. Dừng ghi hình.")
                 break
 
-            stream_url = recorder_core.get_live_stream_url(room_id, user=user)
+            stream_url = None
+            for s_att in range(3):
+                stream_url = recorder_core.get_live_stream_url(room_id, user=user)
+                if stream_url:
+                    break
+                time.sleep(2.5)
+
             if not stream_url:
-                print(f"[!] [@{user}] Không lấy được link stream. Kết thúc.")
+                print(f"[!] [@{user}] Không lấy được link stream sau các lần thử. Kết thúc.")
                 break
 
             now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
