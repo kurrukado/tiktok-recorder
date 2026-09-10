@@ -475,6 +475,9 @@ def delete_user(username: str, delete_files: bool = True):
     except Exception:
         pass
 
+    # Đợi 3s để FFmpeg và thread worker kịp thời đóng luồng và giải phóng file lock
+    time.sleep(3)
+
     # Xóa thư mục trên Drive cùng toàn bộ dữ liệu bên trong (mặc định luôn xóa sạch)
     gdrive_status = "Đã xóa toàn bộ thư mục và file trên Drive"
     if delete_files:
@@ -652,6 +655,8 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
 
                 if not stream_url:
                     print(f"[!] [@{user}] Không lấy được link stream sau các lần thử. Kết thúc tích lũy Phần {part_number}.")
+                    consecutive_failures += 1
+                    time.sleep(5)
                     break
 
                 seg_name = os.path.join(user_dir, f"{user}_{now_str}_p{part_number}_seg{len(part_segments)+1}.mp4")
@@ -711,7 +716,19 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             if not part_segments:
                 if consecutive_failures >= max_consecutive_failures:
                     break
+                time.sleep(5)
                 continue
+
+            # Nếu nhận tín hiệu dừng / xóa streamer, hủy bỏ toàn bộ phân đoạn tạm và kết thúc ngay
+            if stop_event and stop_event.is_set():
+                print(f"[⏹️] [@{user}] Phát hiện yêu cầu dừng/xóa streamer. Hủy toàn bộ phân đoạn tạm dở.")
+                for seg in part_segments:
+                    if seg and os.path.exists(seg):
+                        try:
+                            os.remove(seg)
+                        except Exception:
+                            pass
+                break
 
             # Ghép tất cả các đoạn thành 1 file MP4 duy nhất
             final_rec_file = output_file
@@ -729,6 +746,14 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             else:
                 print(f"[🧩] [@{user}] Đang ghép nối {len(part_segments)} phân đoạn thành 1 file MP4 duy nhất cho Phần {part_number} ({accumulated_seconds:.1f}s)...")
                 final_rec_file = concat_mp4_segments(part_segments, output_file)
+
+            if stop_event and stop_event.is_set():
+                if os.path.exists(final_rec_file):
+                    try:
+                        os.remove(final_rec_file)
+                    except Exception:
+                        pass
+                break
 
             is_valid, reason, final_dur = validate_playable_video(final_rec_file, min_duration=5.0, min_size_bytes=250000)
             if not is_valid:
@@ -1067,10 +1092,11 @@ def sync_supabase_endpoint(bg_tasks: BackgroundTasks):
         try:
             import supabase_sync
             recs = list_recordings_from_drive()
+            host_base = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_API_URL", "https://tiktok-api-as2y.onrender.com")
             for r in recs:
                 u = r["user"]
                 fn = r["filename"]
-                th_url = f"https://tiktok-api-as2y.onrender.com/api/thumbnail/{u}/{fn}"
+                th_url = f"{host_base.rstrip('/')}/api/thumbnail/{u}/{fn}"
                 supabase_sync.sync_recording_to_supabase(
                     user=u,
                     filename=fn,

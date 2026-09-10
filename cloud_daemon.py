@@ -252,6 +252,8 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
 
                 if not stream_url:
                     log(f"[!] Không lấy được URL stream của @{user}. Dừng tích lũy Phần {part_number}.")
+                    consecutive_failures += 1
+                    time.sleep(5)
                     break
 
                 seg_name = os.path.join(user_dir, f"{user}_{now_str}_p{part_number}_seg{len(part_segments)+1}.mp4")
@@ -317,7 +319,18 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             if not part_segments:
                 if consecutive_failures >= max_consecutive_failures:
                     break
+                time.sleep(5)
                 continue
+
+            if stop_event and stop_event.is_set():
+                log(f"⏹️ [@{user}] Phát hiện yêu cầu dừng tiến trình. Hủy phần đang dở.")
+                for seg in part_segments:
+                    if seg and os.path.exists(seg):
+                        try:
+                            os.remove(seg)
+                        except Exception:
+                            pass
+                break
 
             # Ghép tất cả các đoạn của Phần này lại thành 1 file MP4 duy nhất
             final_rec_file = output_file

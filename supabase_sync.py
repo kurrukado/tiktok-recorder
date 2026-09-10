@@ -101,8 +101,8 @@ def sync_recording_to_supabase(
         if not fname.endswith(".mp4"):
             fname = f"{fname}.mp4"
 
-        # Từ chối lưu các video rác lỗi 0:00s (< 250 KB)
-        if size_bytes and int(size_bytes) < 250 * 1024:
+        # Từ chối lưu các video rác lỗi 0:00s hoặc 0-byte (< 250 KB)
+        if not size_bytes or int(size_bytes) < 250 * 1024:
             print(f"[SUPABASE-SYNC] [!] Từ chối đồng bộ video lỗi dung lượng nhỏ ({size_bytes} bytes): {fname}")
             return False
 

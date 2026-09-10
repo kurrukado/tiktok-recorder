@@ -588,6 +588,14 @@ def delete_streamer_folder_drive(user: str, access_token=None):
         except Exception:
             pass
 
+        # Xóa cache thư mục để tránh trả về folder_id cũ đã bị xóa
+        try:
+            with _FOLDER_CACHE_LOCK:
+                _FOLDER_CACHE.pop((user, root_id), None)
+                _FOLDER_CACHE.pop((user, None), None)
+        except Exception:
+            pass
+
         if deleted_folders > 0 or deleted_files > 0:
             return True, f"Đã xóa vĩnh viễn {deleted_folders} thư mục và {deleted_files} file của @{user} trên Google Drive"
         else:
