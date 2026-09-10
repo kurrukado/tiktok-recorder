@@ -511,7 +511,7 @@ def get_stream_url(username: str):
         "note": "Link trực tiếp từ máy chủ CDN của TikTok, có thể phát trực tiếp trên web hoặc tải tốc độ cao tối đa băng thông."
     }
 
-MAX_CHUNK_SECONDS = 7200  # Đúng 2 tiếng (2h = 7200s), tự động tách video và up lên Cloud
+MAX_CHUNK_SECONDS = 3600  # Đúng 1 tiếng (1h = 3600s), tự động tách video và up lên Cloud
 
 def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Optional[threading.Event] = None):
     # Chỉ chạy local recorder nếu hệ thống có sẵn ffmpeg
@@ -549,7 +549,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             os.makedirs(user_dir, exist_ok=True)
             output_file = os.path.join(user_dir, f"{user}_{now_str}{part_suffix}.mp4")
 
-            # Xác định thời lượng cho phân đoạn này (tối đa 2 tiếng = 7200s)
+            # Xác định thời lượng cho phân đoạn này (tối đa 1 tiếng = 3600s)
             if is_sub_only:
                 chunk_duration = 300
             elif remaining_duration:

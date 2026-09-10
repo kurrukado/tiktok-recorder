@@ -88,15 +88,15 @@ def discover_new_streamers(current_user):
         return []
 
 MAX_CONCURRENT_RECORDERS = 10  # Tối đa 10 streamer ghi hình cùng lúc
-MAX_CHUNK_SECONDS = 7200       # Đúng 2 tiếng (2h = 7200s), tự động tách video và up lên Cloud
+MAX_CHUNK_SECONDS = 3600       # Đúng 1 tiếng (1h = 3600s), tự động tách video và up lên Cloud
 ACTIVE_RECORDERS = {}          # {user: {"thread": Thread, "start_time": float}}
 RECORDERS_LOCK = threading.Lock()
 
 def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_event=None):
     """
     Luồng ghi hình độc lập cho từng streamer:
-    - Ghi từng đoạn tối đa 2 tiếng (7200s).
-    - Hết đoạn 2 tiếng: tự xuất file MP4 H.264 +faststart, cắt thumbnail 50% thời lượng, upload Google Drive và Supabase, xóa file tạm.
+    - Ghi từng đoạn tối đa 1 tiếng (3600s).
+    - Hết đoạn 1 tiếng: tự xuất file MP4 H.264 +faststart, cắt thumbnail 50% thời lượng, upload Google Drive và Supabase, xóa file tạm.
     - Nếu streamer vẫn đang live: tự động nối tiếp ghi Phần tiếp theo (part 2, part 3...) mà không ngắt quãng bot.
     - Cập nhật trạng thái đang quay lên Google Drive theo thời gian thực để API hiển thị.
     """
@@ -170,7 +170,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             os.makedirs(user_dir, exist_ok=True)
             output_file = os.path.join(user_dir, f"{user}_{now_str}{part_suffix}.mp4")
 
-            log(f"🔴 [@{user}] Đang ghi hình Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Tối đa 2 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
+            log(f"🔴 [@{user}] Đang ghi hình Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Tối đa 1 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
 
             # Ghi hình với giới hạn duration và cờ is_sub_only
             chunk_duration = 300 if is_sub_only else MAX_CHUNK_SECONDS
@@ -325,7 +325,7 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
     log("=" * 65)
     log(f"[*] Thời gian định kỳ phiên: {max_minutes} phút")
     log(f"[*] Ghi hình đồng thời tối đa: {MAX_CONCURRENT_RECORDERS} streamers song song")
-    log(f"[*] Giới hạn mỗi video live: < 2 tiếng ({MAX_CHUNK_SECONDS}s/đoạn, tự động ghi tiếp)")
+    log(f"[*] Giới hạn mỗi video live: < 1 tiếng ({MAX_CHUNK_SECONDS}s/đoạn, tự động ghi tiếp)")
     log(f"[*] Chu kỳ quét thông minh: ~{interval}s (kèm độ trễ ngẫu nhiên)")
     log(f"[*] Tự động khám phá streamer (PK / Co-host): {'BẬT' if auto_discover else 'TẮT'}")
 

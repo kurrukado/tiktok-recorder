@@ -156,7 +156,7 @@ def ensure_h264(filepath):
     if codec == "h264":
         cmd = [
             FFMPEG_PATH, "-y",
-            "-fflags", "+genpts",
+            "-fflags", "+genpts+discardcorrupt",
             "-i", filepath,
             "-map", "0:v:0",
             "-map", "0:a:0?",
@@ -200,7 +200,7 @@ def ensure_h264(filepath):
     def build_transcode_cmd(selected_encoder):
         c = [
             FFMPEG_PATH, "-y",
-            "-fflags", "+genpts",
+            "-fflags", "+genpts+discardcorrupt",
             "-i", filepath,
             "-map", "0:v:0",
             "-map", "0:a:0?",
@@ -208,9 +208,9 @@ def ensure_h264(filepath):
         if selected_encoder == "h264_nvenc":
             c.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22", "-pix_fmt", "yuv420p"])
         elif selected_encoder == "libx264":
-            c.extend(["-c:v", "libx264", "-preset", "fast", "-crf", "22", "-pix_fmt", "yuv420p"])
+            c.extend(["-c:v", "libx264", "-preset", "veryfast", "-crf", "22", "-pix_fmt", "yuv420p"])
         else:
-            c.extend(["-c:v", selected_encoder, "-b:v", "2500k", "-pix_fmt", "yuv420p"])
+            c.extend(["-c:v", selected_encoder, "-b:v", "3000k", "-pix_fmt", "yuv420p"])
 
         if audio_codec == "aac":
             c.extend(["-c:a", "copy"])
@@ -228,7 +228,7 @@ def ensure_h264(filepath):
     cmd = build_transcode_cmd(encoder)
     start_t = time.time()
     try:
-        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=300)
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
         # Fallback to libx264 if hardware encoder fails
         if (proc.returncode != 0 or not os.path.exists(temp_out) or os.path.getsize(temp_out) <= 1024) and encoder != "libx264":
             print(f"  [!] {encoder} gặp lỗi, tự động chuyển sang CPU libx264 dự phòng...")
@@ -238,7 +238,7 @@ def ensure_h264(filepath):
                 except Exception:
                     pass
             cmd = build_transcode_cmd("libx264")
-            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=400)
+            proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=900)
 
         if proc.returncode == 0 and os.path.exists(temp_out) and os.path.getsize(temp_out) > 1024:
             if os.path.exists(target_path) and target_path != filepath:

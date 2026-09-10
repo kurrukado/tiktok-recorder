@@ -330,14 +330,19 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
             flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv\?[^\s"\'<>]+', content)
             if flv_matches:
                 clean_flv = [u.replace('&amp;', '&') for u in flv_matches]
-                hd_matches = [u for u in clean_flv if "_hd" in u or "_or4" in u]
-                return hd_matches if hd_matches else clean_flv
+                # Ưu tiên độ phân giải 1080p (_or4, _uhd) trước, sau đó đến 720p (_hd), rồi các luồng khác
+                p1080 = [u for u in clean_flv if "_or4" in u or "_uhd" in u]
+                p720 = [u for u in clean_flv if "_hd" in u]
+                sorted_flv = p1080 + p720 + [u for u in clean_flv if u not in p1080 and u not in p720]
+                return sorted_flv
 
             hls_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8\?[^\s"\'<>]*', content)
             if hls_matches:
                 clean_hls = [u.replace('&amp;', '&') for u in hls_matches]
-                hd_matches = [u for u in clean_hls if "_hd" in u or "_or4" in u]
-                return hd_matches if hd_matches else clean_hls
+                p1080 = [u for u in clean_hls if "_or4" in u or "_uhd" in u]
+                p720 = [u for u in clean_hls if "_hd" in u]
+                sorted_hls = p1080 + p720 + [u for u in clean_hls if u not in p1080 and u not in p720]
+                return sorted_hls
         except Exception:
             pass
 
@@ -372,18 +377,36 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
     if sdk_data_str:
         try:
             sdk_json = json.loads(sdk_data_str).get("data", {})
-            for key, entry in sdk_json.items():
+            # Phân cấp độ phân giải: origin/uhd (1080p) -> hd (720p) -> sd -> ld
+            quality_keys = ["origin", "uhd", "hd", "sd", "ld"]
+            ordered_keys = [k for k in quality_keys if k in sdk_json] + [k for k in sdk_json.keys() if k not in quality_keys and k != "ao"]
+            
+            # Ưu tiên luồng H.264 của từng độ phân giải để copy nguyên bản 0% CPU, mượt mà không giật
+            h264_candidates = []
+            other_candidates = []
+            for key in ordered_keys:
+                entry = sdk_json.get(key, {})
                 stream_main = entry.get("main", {})
                 flv = stream_main.get("flv")
                 hls = stream_main.get("hls") or stream_main.get("m3u8")
-                if flv and flv not in candidates:
-                    candidates.append(flv)
-                if hls and hls not in candidates:
-                    candidates.append(hls)
+                
+                sdk_p = stream_main.get("sdk_params", "")
+                is_h264 = False
+                if isinstance(sdk_p, str) and '"VCodec":"h264"' in sdk_p:
+                    is_h264 = True
+                
+                target_list = h264_candidates if is_h264 else other_candidates
+                if flv and flv not in target_list and flv not in candidates:
+                    target_list.append(flv)
+                if hls and hls not in target_list and hls not in candidates:
+                    target_list.append(hls)
+
+            candidates.extend(h264_candidates)
+            candidates.extend(other_candidates)
         except Exception:
             pass
 
-    # Fallback to direct URLs
+    # Fallback to direct URLs: FULL_HD1 (1080p) first, then HD1 (720p)
     flv_pull = stream_url_obj.get("flv_pull_url") or {}
     if isinstance(flv_pull, dict):
         for k in ("FULL_HD1", "HD1", "SD2", "SD1"):
@@ -457,6 +480,13 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         FFMPEG_PATH,
         "-y",
         "-rw_timeout", "15000000",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_on_network_error", "1",
+        "-reconnect_delay_max", "5",
+        "-fflags", "+genpts+discardcorrupt",
+        "-analyzeduration", "10000000",
+        "-probesize", "10000000",
         "-headers", (
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
             "Referer: https://www.tiktok.com/\r\n"

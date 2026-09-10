@@ -74,12 +74,12 @@ Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.26
   - API `GET /api/recordings` trả về trường `recorded_at` (`YYYY-MM-DD HH:MM:SS`) và `thumbnail_url` giúp website hiển thị lịch sử ghi hình trực quan, đẹp mắt.
 - 🤖 **Vận Hành Tự Động 100% 24/7 (Không Cần Thao Tác Thủ Công):**
   - Loại bỏ hoàn toàn nút "Ghi ngay" và "Dừng ghi" thủ công. Bot đám mây (GitHub Actions) tự động quét và ghi hình ngay khi streamer phát sóng, tự đóng luồng và dọn dẹp khi tắt live.
-- ✂️ **Tự Động Cắt Tách Video Tối Đa 2 Tiếng (2-Hour Chunking):**
-  - Mỗi video giới hạn tối đa 2 giờ (`MAX_CHUNK_SECONDS = 7200`). Nếu live kéo dài > 2h, bot tự chốt file, chuyển mã H.264, upload Drive/Supabase và nối tiếp ghi Part 2, Part 3... liền mạch không gián đoạn.
+- ✂️ **Tối Ưu 1080p Full HD & Tách Video 1 Tiếng (1-Hour Chunking):**
+  - Giới hạn mỗi video tối đa 1 giờ (`MAX_CHUNK_SECONDS = 3600`). Khi live kéo dài > 1h, bot tự chốt part, upload Drive/Supabase, giải phóng ngay ổ đĩa đệm và nối tiếp ghi Part 2, Part 3... liền mạch không gián đoạn.
 - 🎬 **Trình Phát Video Kép Trực Tiếp Trên Web (Dual Player):**
   - Tích hợp xem trực tiếp trên Web gồm Google Cloud Player (1080p iframe) và HTML5 Direct Player hỗ trợ HTTP Range 206 tua mượt mà, không cần mở Google Drive thủ công.
-- 🛡️ **Chuẩn Hóa H.264 MP4 Không Phụ Đề & Chống Lỗi 0:00s:**
-  - Tự động chuyển mã H.264 (8-bit YUV420p) không dính phụ đề (`-sn -dn`), tương thích mọi thiết bị; bộ thẩm định `validate_playable_video` ngăn chặn 100% video rác 0:00s.
+- 🛡️ **Chuẩn Hóa 1080p H.264 Chống Giật Lag & Không Phụ Đề:**
+  - Tự động ưu tiên luồng 1080p Full HD gốc (`_or4`, `_uhd`, `FULL_HD1`) chuẩn H.264 (0% CPU); tích hợp bộ cờ chống rớt mạng, chống lệch âm thanh (`-reconnect -discardcorrupt -bsf:a aac_adtstoasc`); bộ thẩm định `validate_playable_video` ngăn chặn 100% video rác 0:00s.
 - 🔴 **Vượt Rào Cản 18+ & Không Bị Chặn:**
   - Bóc tách dữ liệu SIGI_STATE kết hợp Cookie `sessionid_ss`, không bị lỗi giới hạn độ tuổi của TikTok.
 - 🔒 **Hỗ Trợ VIP Sub-Only & Thread-Safe Drive:**
