@@ -462,7 +462,12 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
             "Referer: https://www.tiktok.com/\r\n"
         ),
         "-i", stream_url,
-        "-c", "copy",
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-c:v", "copy",
+        "-c:a", "copy",
+        "-sn",
+        "-dn",
         "-bsf:a", "aac_adtstoasc",
         "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
     ]
@@ -551,7 +556,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         # Tự động kiểm tra và chuyển sang H.264 nếu cần thiết
         try:
             from auto_h264 import ensure_h264
-            ensure_h264(output_filename)
+            output_filename = ensure_h264(output_filename)
         except Exception as e:
             print(f"[!] Lỗi khi tự động kiểm tra định dạng H.264: {e}")
 
