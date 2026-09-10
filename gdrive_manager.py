@@ -545,7 +545,7 @@ def create_streamer_folder_drive(user: str, access_token=None):
 
 def delete_streamer_folder_drive(user: str, access_token=None):
     """
-    Xóa vĩnh viễn thư mục tiktok-record/<user> cùng toàn bộ video bên trong trên Google Drive.
+    Xóa vĩnh viễn toàn bộ thư mục tiktok-record/<user> cùng toàn bộ video bên trong trên Google Drive.
     Trả về (True, message) hoặc (False, error_msg).
     """
     try:
@@ -558,23 +558,40 @@ def delete_streamer_folder_drive(user: str, access_token=None):
         root_id = find_or_create_folder("tiktok-record", access_token=access_token)
         headers = {"Authorization": f"Bearer {access_token}"}
         
+        deleted_folders = 0
+        deleted_files = 0
+        
+        # 1. Tìm và xóa vĩnh viễn tất cả thư mục mang tên user bên trong tiktok-record
         q = f"name = '{user}' and mimeType = 'application/vnd.google-apps.folder' and '{root_id}' in parents and trashed = false"
         url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
-            files = res.json().get("files", [])
-            if files:
-                folder_id = files[0]["id"]
+            folders = res.json().get("files", [])
+            for folder in folders:
+                folder_id = folder["id"]
                 del_url = f"https://www.googleapis.com/drive/v3/files/{folder_id}"
                 del_res = requests.delete(del_url, headers=headers, timeout=15)
                 if del_res.status_code in [200, 204]:
-                    return True, f"Đã xóa thành công thư mục 'tiktok-record/{user}/' trên Google Drive"
-                else:
-                    return False, f"Lỗi từ Google Drive: {del_res.text}"
-            else:
-                return True, f"Thư mục 'tiktok-record/{user}/' không tồn tại trên Google Drive"
+                    deleted_folders += 1
+
+        # 2. Xóa các file video/thumbnail độc lập thuộc về user còn sót lại trực tiếp dưới root tiktok-record
+        try:
+            q_files = f"'{root_id}' in parents and (name contains '{user}_' or name contains '{user}.') and trashed = false"
+            url_files = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q_files)}&fields=files(id,name)"
+            res_files = requests.get(url_files, headers=headers, timeout=10)
+            if res_files.status_code == 200:
+                stray_files = res_files.json().get("files", [])
+                for f in stray_files:
+                    f_del = requests.delete(f"https://www.googleapis.com/drive/v3/files/{f['id']}", headers=headers, timeout=10)
+                    if f_del.status_code in [200, 204]:
+                        deleted_files += 1
+        except Exception:
+            pass
+
+        if deleted_folders > 0 or deleted_files > 0:
+            return True, f"Đã xóa vĩnh viễn {deleted_folders} thư mục và {deleted_files} file của @{user} trên Google Drive"
         else:
-            return False, f"Lỗi tìm kiếm thư mục trên Google Drive: {res.text}"
+            return True, f"Không tìm thấy thư mục 'tiktok-record/{user}/' trên Google Drive"
     except Exception as e:
         return False, str(e)
 

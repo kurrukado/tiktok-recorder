@@ -40,6 +40,7 @@ import recorder_core
 import auto_h264
 import gdrive_manager
 import notifier
+import supabase_sync
 
 app = FastAPI(
     title="TikTok Live Recorder & Cloud Sync API",
@@ -442,7 +443,7 @@ def add_user(req: AddUserRequest):
     }
 
 @app.delete("/api/users/{username}")
-def delete_user(username: str, delete_files: bool = False):
+def delete_user(username: str, delete_files: bool = True):
     user = username.strip().replace("@", "").lower()
     cfg = load_config()
     users = cfg.get("monitored_users", [])
@@ -462,8 +463,20 @@ def delete_user(username: str, delete_files: bool = False):
         except Exception:
             pass
 
-    # Chỉ xóa thư mục trên Drive khi người dùng yêu cầu rõ ràng (mặc định giữ lại video đã quay)
-    gdrive_status = "Giữ nguyên thư mục video trên Google Drive để bảo vệ dữ liệu"
+    # Dừng tiến trình ghi hình nếu đang hoạt động
+    with RECORDING_LOCK:
+        task_info = ACTIVE_RECORDING_TASKS.pop(user, None)
+        if task_info and isinstance(task_info, dict):
+            se = task_info.get("stop_event")
+            if se:
+                se.set()
+    try:
+        gdrive_manager.set_user_recording_status_drive(user, False)
+    except Exception:
+        pass
+
+    # Xóa thư mục trên Drive cùng toàn bộ dữ liệu bên trong (mặc định luôn xóa sạch)
+    gdrive_status = "Đã xóa toàn bộ thư mục và file trên Drive"
     if delete_files:
         try:
             ok, msg = gdrive_manager.delete_streamer_folder_drive(user)
@@ -478,8 +491,20 @@ def delete_user(username: str, delete_files: bool = False):
             except Exception:
                 pass
 
+        # Xóa dữ liệu Supabase (bảng recordings, streamers và thumbnail Storage)
+        try:
+            supabase_sync.delete_streamer_data_supabase(user)
+        except Exception as sb_err:
+            print(f"[API] Lỗi xóa dữ liệu Supabase của {user}: {sb_err}")
+
+        # Invalidate và dọn dẹp cache danh sách video trong RAM của API server
+        global _RECORDINGS_CACHE
+        with _RECORDINGS_CACHE_LOCK:
+            _RECORDINGS_CACHE["timestamp"] = 0
+            _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if (v.get("user") != user and v.get("username") != user)]
+
     return {
-        "message": f"Đã xóa @{user} khỏi danh sách theo dõi",
+        "message": f"Đã xóa @{user} khỏi danh sách theo dõi cùng toàn bộ folder và dữ liệu trên Drive",
         "username": user,
         "gdrive_status": gdrive_status,
         "users": users

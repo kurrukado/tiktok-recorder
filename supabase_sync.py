@@ -165,3 +165,49 @@ def sync_recording_to_supabase(
     except Exception as e:
         print(f"[SUPABASE-SYNC] [!] Ngoại lệ khi đồng bộ video lên Supabase: {e}")
         return False
+
+def delete_streamer_data_supabase(user: str) -> bool:
+    """
+    Xóa toàn bộ bản ghi video của streamer trong table 'tiktok_recordings',
+    xóa streamer trong table 'tiktok_streamers', và dọn dẹp ảnh thumbnail trong Supabase Storage.
+    """
+    try:
+        user = user.strip().replace("@", "").lower()
+        headers = get_supabase_headers()
+
+        # 1. Xóa toàn bộ video của user trong table tiktok_recordings
+        rec_url = f"{SUPABASE_URL}/rest/v1/tiktok_recordings?username=eq.{user}"
+        res_rec = requests.delete(rec_url, headers=headers, timeout=10)
+        if res_rec.status_code in (200, 204):
+            print(f"[SUPABASE-SYNC] [✓] Đã xóa toàn bộ video của @{user} trong tiktok_recordings")
+        else:
+            print(f"[SUPABASE-SYNC] [!] Lỗi xóa tiktok_recordings ({res_rec.status_code}): {res_rec.text}")
+
+        # 2. Xóa streamer trong table tiktok_streamers
+        usr_url = f"{SUPABASE_URL}/rest/v1/tiktok_streamers?username=eq.{user}"
+        res_usr = requests.delete(usr_url, headers=headers, timeout=10)
+        if res_usr.status_code in (200, 204):
+            print(f"[SUPABASE-SYNC] [✓] Đã xóa streamer @{user} trong tiktok_streamers")
+        else:
+            print(f"[SUPABASE-SYNC] [!] Lỗi xóa tiktok_streamers ({res_usr.status_code}): {res_usr.text}")
+
+        # 3. Dọn dẹp ảnh thumbnail trong Supabase Storage bucket 'covers/record-thumbnails/{user}/'
+        try:
+            list_url = f"{SUPABASE_URL}/storage/v1/object/list/{STORAGE_BUCKET}"
+            payload = {"prefix": f"record-thumbnails/{user}/", "limit": 100}
+            list_res = requests.post(list_url, headers=headers, json=payload, timeout=10)
+            if list_res.status_code == 200:
+                items = list_res.json()
+                if items and isinstance(items, list):
+                    prefixes = [f"record-thumbnails/{user}/{item['name']}" for item in items if 'name' in item]
+                    if prefixes:
+                        del_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}"
+                        requests.delete(del_url, headers=headers, json={"prefixes": prefixes}, timeout=10)
+                        print(f"[SUPABASE-SYNC] [✓] Đã xóa {len(prefixes)} thumbnail của @{user} trong Storage")
+        except Exception as st_err:
+            print(f"[SUPABASE-SYNC] [!] Lỗi dọn dẹp Storage thumbnail: {st_err}")
+
+        return True
+    except Exception as e:
+        print(f"[SUPABASE-SYNC] [!] Ngoại lệ khi xóa dữ liệu streamer {user} trên Supabase: {e}")
+        return False
