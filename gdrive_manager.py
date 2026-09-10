@@ -588,11 +588,29 @@ def delete_streamer_folder_drive(user: str, access_token=None):
         except Exception:
             pass
 
+        # 3. Xóa thư mục staging tạm nếu có (tiktok-record/_staging/<user>)
+        try:
+            staging_root_q = f"name = '_staging' and mimeType = 'application/vnd.google-apps.folder' and '{root_id}' in parents and trashed = false"
+            s_res = requests.get(f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(staging_root_q)}&fields=files(id)", headers=headers, timeout=10)
+            if s_res.status_code == 200:
+                s_files = s_res.json().get("files", [])
+                if s_files:
+                    s_root_id = s_files[0]["id"]
+                    u_stag_q = f"name = '{user}' and mimeType = 'application/vnd.google-apps.folder' and '{s_root_id}' in parents and trashed = false"
+                    u_s_res = requests.get(f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(u_stag_q)}&fields=files(id)", headers=headers, timeout=10)
+                    if u_s_res.status_code == 200:
+                        for sf in u_s_res.json().get("files", []):
+                            requests.delete(f"https://www.googleapis.com/drive/v3/files/{sf['id']}", headers=headers, timeout=15)
+                            deleted_folders += 1
+        except Exception:
+            pass
+
         # Xóa cache thư mục để tránh trả về folder_id cũ đã bị xóa
         try:
             with _FOLDER_CACHE_LOCK:
                 _FOLDER_CACHE.pop((user, root_id), None)
                 _FOLDER_CACHE.pop((user, None), None)
+                _FOLDER_CACHE.pop(("_staging", root_id), None)
         except Exception:
             pass
 
@@ -602,6 +620,41 @@ def delete_streamer_folder_drive(user: str, access_token=None):
             return True, f"Không tìm thấy thư mục 'tiktok-record/{user}/' trên Google Drive"
     except Exception as e:
         return False, str(e)
+
+def download_file_from_drive(file_id, dest_path, access_token=None):
+    """Tải một file từ Google Drive về đường dẫn cục bộ."""
+    if not access_token:
+        access_token = get_access_token()
+    if not access_token:
+        return False
+    headers = {"Authorization": f"Bearer {access_token}"}
+    url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
+        with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+        return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+    except Exception as e:
+        print(f"[!] Lỗi tải file {file_id} từ Drive: {e}")
+        return False
+
+def delete_file_drive(file_id, access_token=None):
+    """Xóa một file hoặc thư mục đơn lẻ trên Google Drive."""
+    if not access_token:
+        access_token = get_access_token()
+    if not access_token:
+        return False
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        del_res = requests.delete(f"https://www.googleapis.com/drive/v3/files/{file_id}", headers=headers, timeout=15)
+        return del_res.status_code in [200, 204]
+    except Exception as e:
+        print(f"[!] Lỗi xóa file {file_id} trên Drive: {e}")
+        return False
 
 def clean_corrupt_files_from_drive(access_token=None, min_size_bytes=250000):
     """

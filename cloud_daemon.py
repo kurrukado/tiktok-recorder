@@ -363,58 +363,71 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             consecutive_failures = 0
             log(f"[✓] [@{user}] Hoàn tất trọn vẹn Phần {part_number} ({final_dur:.1f}s): {os.path.basename(final_rec_file)}")
 
-            # 1. Trích xuất thumbnail từ 50% thời lượng của đoạn này
-            thumb_file = None
-            try:
-                from api_server import extract_middle_thumbnail
-                thumb_file = extract_middle_thumbnail(final_rec_file)
-                if thumb_file and os.path.exists(thumb_file):
-                    log(f"[✓] [@{user}] Đã tạo thumbnail Phần {part_number}: {os.path.basename(thumb_file)}")
-            except Exception as th_err:
-                log(f"[!] [@{user}] Lỗi tạo thumbnail: {th_err}")
-
-            # 2. Tự động đồng bộ ngay vào Supabase Storage (ảnh thumbnail) & Database
-            rec_file_name = os.path.basename(final_rec_file)
-            rec_file_size = os.path.getsize(final_rec_file) if os.path.exists(final_rec_file) else 0
-            try:
-                import supabase_sync
-                log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
-                supabase_sync.sync_recording_to_supabase(
-                    user=user,
-                    filename=rec_file_name,
-                    size_bytes=rec_file_size,
-                    thumb_source=thumb_file,
-                    source="cloud_daemon"
-                )
-            except Exception as sb_err:
-                log(f"[!] [@{user}] Lỗi đồng bộ Supabase: {sb_err}")
-
-            # 3. Tải video & thumbnail lên Google Drive
-            try:
-                log(f"[*] [@{user}] Đang tải Phần {part_number} ({final_dur:.1f}s) lên Google Drive...")
-                tok = gdrive_manager.get_access_token()
-                if tok:
-                    r_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
-                    s_id = gdrive_manager.find_or_create_folder(user, parent_id=r_id, access_token=tok)
-                    ok = gdrive_manager.upload_file_to_drive(final_rec_file, s_id, access_token=tok)
-                    if ok:
-                        log(f"[✓] [@{user}] Đã lưu video Phần {part_number} lên Google Drive!")
-                        try:
-                            os.remove(final_rec_file)
-                            log(f"🗑️ [@{user}] Đã xóa video tạm Phần {part_number} để giải phóng ổ cứng.")
-                        except Exception:
-                            pass
-                    else:
-                        log(f"[!] [@{user}] Không thể upload video lên Drive sau các lần thử. Giữ lại file local.")
-
+            # Kiểm tra thời lượng video:
+            # Nếu video ngắn dưới 50 phút (< 3000s, chênh lệch 10p so với 60p): Đẩy vào Staging Queue trên Google Drive!
+            if final_dur < 3000:
+                log(f"📦 [@{user}] Video Phần {part_number} ngắn hơn 50 phút ({final_dur/60:.1f}p < 50p). Chuyển vào Cloud Staging Queue trên Google Drive...")
+                try:
+                    import staging_queue
+                    tok = gdrive_manager.get_access_token()
+                    q_res = staging_queue.add_to_staging_queue(user, final_rec_file, final_dur, access_token=tok)
+                    log(f"📋 [@{user}] Trạng thái Staging Queue: {q_res.get('status')} - {q_res.get('message', '')}")
+                except Exception as sq_err:
+                    log(f"[!] [@{user}] Lỗi khi chuyển vào Staging Queue: {sq_err}")
+            else:
+                # Video đã đạt chuẩn >= 50 phút: Xuất bản trực tiếp lên Drive chính và Supabase
+                # 1. Trích xuất thumbnail từ 50% thời lượng của đoạn này
+                thumb_file = None
+                try:
+                    from api_server import extract_middle_thumbnail
+                    thumb_file = extract_middle_thumbnail(final_rec_file)
                     if thumb_file and os.path.exists(thumb_file):
-                        gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
-                        try:
-                            os.remove(thumb_file)
-                        except Exception:
-                            pass
-            except Exception as up_err:
-                log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
+                        log(f"[✓] [@{user}] Đã tạo thumbnail Phần {part_number}: {os.path.basename(thumb_file)}")
+                except Exception as th_err:
+                    log(f"[!] [@{user}] Lỗi tạo thumbnail: {th_err}")
+
+                # 2. Tự động đồng bộ ngay vào Supabase Storage (ảnh thumbnail) & Database
+                rec_file_name = os.path.basename(final_rec_file)
+                rec_file_size = os.path.getsize(final_rec_file) if os.path.exists(final_rec_file) else 0
+                try:
+                    import supabase_sync
+                    log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
+                    supabase_sync.sync_recording_to_supabase(
+                        user=user,
+                        filename=rec_file_name,
+                        size_bytes=rec_file_size,
+                        thumb_source=thumb_file,
+                        source="cloud_daemon"
+                    )
+                except Exception as sb_err:
+                    log(f"[!] [@{user}] Lỗi đồng bộ Supabase: {sb_err}")
+
+                # 3. Tải video & thumbnail lên Google Drive
+                try:
+                    log(f"[*] [@{user}] Đang tải Phần {part_number} ({final_dur:.1f}s) lên Google Drive...")
+                    tok = gdrive_manager.get_access_token()
+                    if tok:
+                        r_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
+                        s_id = gdrive_manager.find_or_create_folder(user, parent_id=r_id, access_token=tok)
+                        ok = gdrive_manager.upload_file_to_drive(final_rec_file, s_id, access_token=tok)
+                        if ok:
+                            log(f"[✓] [@{user}] Đã lưu video Phần {part_number} lên Google Drive!")
+                            try:
+                                os.remove(final_rec_file)
+                                log(f"🗑️ [@{user}] Đã xóa video tạm Phần {part_number} để giải phóng ổ cứng.")
+                            except Exception:
+                                pass
+                        else:
+                            log(f"[!] [@{user}] Không thể upload video lên Drive sau các lần thử. Giữ lại file local.")
+
+                        if thumb_file and os.path.exists(thumb_file):
+                            gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
+                            try:
+                                os.remove(thumb_file)
+                            except Exception:
+                                pass
+                except Exception as up_err:
+                    log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
 
             part_number += 1
 
@@ -526,6 +539,14 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
             active_now = list(ACTIVE_RECORDERS.keys())
         if session_count % 15 == 1:
             log(f"[*] Đang theo dõi {len(users)} streamers. Đang ghi hình song song ({len(active_now)}/{MAX_CONCURRENT_RECORDERS}): {active_now}")
+            # Định kỳ kiểm tra và tự động xả các video trong Staging Queue đã quá 24h không live mới
+            try:
+                import staging_queue
+                flushed = staging_queue.check_and_flush_idle_queues()
+                if flushed:
+                    log(f"⏰ Đã tự động xả Staging Queue cho {len(flushed)} streamer không live trong 24h: {flushed}")
+            except Exception as sq_err:
+                log(f"[!] Lỗi kiểm tra xả Staging Queue: {sq_err}")
 
         with RECORDERS_LOCK:
             active_set = set(ACTIVE_RECORDERS.keys())

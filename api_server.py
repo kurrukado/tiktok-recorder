@@ -767,40 +767,51 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
 
             consecutive_failures = 0
             print(f"[✓] [@{user}] Hoàn tất trọn vẹn Phần {part_number} ({final_dur:.1f}s): {os.path.basename(final_rec_file)}")
-            thumb_f = extract_middle_thumbnail(final_rec_file)
+            # Kiểm tra thời lượng video:
+            # Nếu video ngắn dưới 50 phút (< 3000s, chênh lệch 10p so với 60p): Đẩy vào Staging Queue trên Google Drive!
+            if final_dur < 3000:
+                print(f"[📦] [@{user}] Video Phần {part_number} ngắn hơn 50 phút ({final_dur/60:.1f}p < 50p). Chuyển vào Cloud Staging Queue trên Google Drive...")
+                try:
+                    import staging_queue
+                    token = gdrive_manager.get_access_token()
+                    q_res = staging_queue.add_to_staging_queue(user, final_rec_file, final_dur, access_token=token)
+                    print(f"[📋] [@{user}] Trạng thái Staging Queue: {q_res.get('status')} - {q_res.get('message', '')}")
+                except Exception as sq_err:
+                    print(f"[!] [@{user}] Lỗi khi chuyển vào Staging Queue: {sq_err}")
+            else:
+                # Video đạt chuẩn >= 50 phút: Đồng bộ Supabase Storage & Database và tải lên Drive chính
+                thumb_f = extract_middle_thumbnail(final_rec_file)
+                try:
+                    import supabase_sync
+                    sz = os.path.getsize(final_rec_file)
+                    supabase_sync.sync_recording_to_supabase(
+                        user=user,
+                        filename=os.path.basename(final_rec_file),
+                        size_bytes=sz,
+                        thumb_source=thumb_f,
+                        source="api_server"
+                    )
+                except Exception as sb_err:
+                    print(f"[!] Lỗi đồng bộ Supabase từ bg_record_worker: {sb_err}")
 
-            # Đồng bộ Supabase Storage & Database
-            try:
-                import supabase_sync
-                sz = os.path.getsize(final_rec_file)
-                supabase_sync.sync_recording_to_supabase(
-                    user=user,
-                    filename=os.path.basename(final_rec_file),
-                    size_bytes=sz,
-                    thumb_source=thumb_f,
-                    source="api_server"
-                )
-            except Exception as sb_err:
-                print(f"[!] Lỗi đồng bộ Supabase từ bg_record_worker: {sb_err}")
-
-            # Upload Google Drive
-            token = gdrive_manager.get_access_token()
-            if token:
-                root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
-                sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
-                ok = gdrive_manager.upload_file_to_drive(final_rec_file, sub_id, access_token=token)
-                if ok:
-                    try:
-                        os.remove(final_rec_file)
-                        print(f"[🗑️] [@{user}] Đã xóa video tạm Phần {part_number} sau khi upload Drive thành công.")
-                    except Exception:
-                        pass
-                if thumb_f and os.path.exists(thumb_f):
-                    gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
-                    try:
-                        os.remove(thumb_f)
-                    except Exception:
-                        pass
+                # Upload Google Drive
+                token = gdrive_manager.get_access_token()
+                if token:
+                    root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
+                    sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
+                    ok = gdrive_manager.upload_file_to_drive(final_rec_file, sub_id, access_token=token)
+                    if ok:
+                        try:
+                            os.remove(final_rec_file)
+                            print(f"[🗑️] [@{user}] Đã xóa video tạm Phần {part_number} sau khi upload Drive thành công.")
+                        except Exception:
+                            pass
+                    if thumb_f and os.path.exists(thumb_f):
+                        gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
+                        try:
+                            os.remove(thumb_f)
+                        except Exception:
+                            pass
 
             part_number += 1
 
