@@ -72,18 +72,19 @@ Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.26
 - 🖼️ **Thumbnail 50% Thời Lượng & Timestamp Chuẩn:**
   - Mỗi video được tự động cắt ảnh đại diện tại thời điểm chính giữa (50% thời lượng video) bằng FFmpeg.
   - API `GET /api/recordings` trả về trường `recorded_at` (`YYYY-MM-DD HH:MM:SS`) và `thumbnail_url` giúp website hiển thị lịch sử ghi hình trực quan, đẹp mắt.
-- ⚡ **Ghi hình Đa Luồng Song Song (Tối đa 10 streamer):**
-  - Ghi hình đồng thời nhiều streamer mà không bị nghẽn mạng hay chặn luồng.
-- ✂️ **Tự động Cắt Chia Nhỏ Dưới 2 Tiếng (< 2h/part):**
-  - Mỗi video giới hạn tối đa 1 tiếng 56 phút. Khi live kéo dài nhiều tiếng, bot tự động ngắt Part 1 tải lên Drive và quay tiếp Part 2 liên tục không ngắt quãng.
+- 🤖 **Vận Hành Tự Động 100% 24/7 (Không Cần Thao Tác Thủ Công):**
+  - Loại bỏ hoàn toàn nút "Ghi ngay" và "Dừng ghi" thủ công. Bot đám mây (GitHub Actions) tự động quét và ghi hình ngay khi streamer phát sóng, tự đóng luồng và dọn dẹp khi tắt live.
+- ✂️ **Tự Động Cắt Tách Video Tối Đa 2 Tiếng (2-Hour Chunking):**
+  - Mỗi video giới hạn tối đa 2 giờ (`MAX_CHUNK_SECONDS = 7200`). Nếu live kéo dài > 2h, bot tự chốt file, chuyển mã H.264, upload Drive/Supabase và nối tiếp ghi Part 2, Part 3... liền mạch không gián đoạn.
+- 🎬 **Trình Phát Video Kép Trực Tiếp Trên Web (Dual Player):**
+  - Tích hợp xem trực tiếp trên Web gồm Google Cloud Player (1080p iframe) và HTML5 Direct Player hỗ trợ HTTP Range 206 tua mượt mà, không cần mở Google Drive thủ công.
+- 🛡️ **Chuẩn Hóa H.264 MP4 Không Phụ Đề & Chống Lỗi 0:00s:**
+  - Tự động chuyển mã H.264 (8-bit YUV420p) không dính phụ đề (`-sn -dn`), tương thích mọi thiết bị; bộ thẩm định `validate_playable_video` ngăn chặn 100% video rác 0:00s.
 - 🔴 **Vượt Rào Cản 18+ & Không Bị Chặn:**
   - Bóc tách dữ liệu SIGI_STATE kết hợp Cookie `sessionid_ss`, không bị lỗi giới hạn độ tuổi của TikTok.
-- ⚡ **Quét Live Đa Luồng & Phân Tách Rõ Ràng LIVE / REC:**
-  - `cloud_daemon` quét trạng thái toàn bộ danh sách streamer song song qua `ThreadPoolExecutor` (chỉ 2-3s/chu kỳ thay vì quét tuần tự).
-  - Phân tách rõ ràng trạng thái: 🟢 **LIVE** (streamer đang phát sóng trên TikTok) và 🔴 **REC** (bot đang thực sự ghi hình luồng). Giao diện web hỗ trợ nút **Ghi ngay** và **Dừng ghi** chủ động.
-- 🔒 **Hỗ trợ VIP Sub-Only & Thread-Safe Drive:**
+- 🔒 **Hỗ Trợ VIP Sub-Only & Thread-Safe Drive:**
   - Nhận diện phòng live giới hạn Hội viên Sub-Only và tự sinh guest session fingerprint để trích xuất link xem trước.
-  - Khóa luồng `_DRIVE_STATUS_LOCK` đồng bộ danh sách `active_recordings.json` trên Google Drive an toàn đa luồng, kèm cơ chế TTL tự dọn dẹp trạng thái quá 30 phút.
+  - Khóa luồng `_DRIVE_STATUS_LOCK` đồng bộ danh sách `active_recordings.json` trên Google Drive an toàn đa luồng kèm TTL tự dọn dẹp.
 
 ---
 

@@ -14,9 +14,10 @@ Hệ thống tự động theo dõi, ghi hình livestream TikTok chuẩn HD H.26
   - Thêm streamer trên web ➔ Tự tạo thư mục `tiktok-record/<user>/` trên Drive.
   - Xóa streamer trên web ➔ Tự xóa thư mục và video trên Drive để giải phóng dung lượng.
 - 🖼️ **Thumbnail 50% & Lịch Sử Ghi Hình:** Tự động cắt ảnh đại diện tại điểm 50% thời lượng video, API cung cấp `recorded_at` theo chuẩn ngày giờ để hiển thị trực quan trên giao diện web.
-- ⚡ **Ghi Hình Đa Luồng Song Song:** Ghi hình đồng thời lên tới 10 streamer cùng một thời điểm.
+- 🤖 **Vận Hành Tự Động 100% 24/7:** Loại bỏ thao tác thủ công, bot tự động bắt live và ghi hình liên tục 24/7.
 - ✂️ **Tự Động Cắt Video 2 Tiếng & Ghi Nối Tiếp:** Tự động ngắt video mỗi 2 tiếng (7200s), tự up Cloud (Drive/Supabase), xóa file tạm và tiếp tục ghi nối tiếp Part 2, Part 3... cho đến khi streamer tắt live.
 - 🎬 **Xem Trực Tiếp Trên Web (Dual Player):** Xem video ngay trên web qua Google Cloud Player 1080p hoặc trình phát HTML5 hỗ trợ tua video tức thì (HTTP 206 Range), không cần tải file hay mở Google Drive.
+- 🛡️ **Chuẩn Hóa H.264 MP4 Không Phụ Đề & Chống Lỗi 0:00s:** Chuyển mã H.264 loại bỏ phụ đề (`-sn -dn`), tương thích mọi thiết bị; cơ chế kiểm định `validate_playable_video` ngăn chặn 100% video rác 0:00s.
 - 🔴 **Vượt Rào Cản 18+:** Sử dụng thuật toán bóc tách dữ liệu kết hợp cookie `sessionid_ss`, không bị chặn lứa tuổi.
 - 🔒 **Hỗ trợ VIP Sub-Only & Thread-Safe Drive:** Nhận diện livestream Sub-Only/Preview và sinh guest session fingerprint lấy luồng preview; khóa luồng thread-safe đồng bộ danh sách quay thời gian thực lên Google Drive kèm TTL tự dọn dẹp.
 
