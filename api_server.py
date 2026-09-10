@@ -530,7 +530,9 @@ def bg_record_worker(user: str, duration: Optional[int]):
                 duration=duration,
                 is_sub_only=is_sub_only
             )
-            if output_file and os.path.exists(output_file) and os.path.getsize(output_file) > 1024:
+            from auto_h264 import validate_playable_video
+            is_valid, reason, dur = validate_playable_video(output_file, min_duration=5.0, min_size_bytes=250000)
+            if is_valid:
                 thumb_f = extract_middle_thumbnail(output_file)
                 try:
                     import supabase_sync
@@ -560,6 +562,13 @@ def bg_record_worker(user: str, duration: Optional[int]):
                             os.remove(thumb_f)
                         except Exception:
                             pass
+            else:
+                print(f"[!] [API Server] File ghi hình của @{user} không đạt chuẩn ({reason}). Tự động hủy file lỗi.")
+                if output_file and os.path.exists(output_file):
+                    try:
+                        os.remove(output_file)
+                    except Exception:
+                        pass
     except Exception as e:
         print(f"[!] Lỗi ghi hình worker: {e}")
     finally:
@@ -715,6 +724,9 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
                         recorded_at = f.get("createdTime", "")
                         
                     sz_bytes = int(f.get("size", 0))
+                    # Loại bỏ triệt để các file rác / lỗi 0:00s dưới 250 KB
+                    if sz_bytes < 250 * 1024:
+                        continue
                     cdn_url = f"https://drive.usercontent.google.com/download?id={f['id']}&export=download&authuser=0"
                     folder_recs.append({
                         "filename": fname,
@@ -780,6 +792,9 @@ def list_recordings():
                 if f.endswith(".mp4") and not f.endswith(".tmp.mp4"):
                     fp = os.path.join(u_dir, f)
                     st = os.stat(fp)
+                    # Loại bỏ các file rác / lỗi 0:00s dưới 250 KB
+                    if st.st_size < 250 * 1024:
+                        continue
                     dur = get_video_duration(fp)
                     dur_fmt = f"{int(dur//60):02d}:{int(dur%60):02d}" if dur else "00:00"
                     

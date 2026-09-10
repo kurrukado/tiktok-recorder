@@ -130,6 +130,11 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
     file_size = os.path.getsize(file_path)
     file_size_mb = file_size / (1024 * 1024)
 
+    # Chặn tải lên các file video MP4 dung lượng rác lỗi 0:00s
+    if file_name.lower().endswith(".mp4") and file_size < 250 * 1024:
+        print(f"  [!] Từ chối tải file MP4 lỗi 0:00s / dung lượng quá nhỏ ({file_size} bytes): {file_name}")
+        return False
+
     headers = {"Authorization": f"Bearer {access_token}"}
 
     # Check if file already exists in this folder
@@ -565,6 +570,62 @@ def delete_streamer_folder_drive(user: str, access_token=None):
             return False, f"Lỗi tìm kiếm thư mục trên Google Drive: {res.text}"
     except Exception as e:
         return False, str(e)
+
+def clean_corrupt_files_from_drive(access_token=None, min_size_bytes=250000):
+    """
+    Quét toàn bộ thư mục 'tiktok-record' trên Google Drive và xóa triệt để
+    các file video .mp4 bị lỗi 0:00s hoặc dung lượng rác (< 250 KB) cùng thumbnail rác tương ứng.
+    """
+    if not access_token:
+        access_token = get_access_token()
+    if not access_token:
+        print("[!] Không có access token Google Drive.")
+        return 0
+
+    root_id = find_or_create_folder("tiktok-record", access_token=access_token)
+    headers = {"Authorization": f"Bearer {access_token}"}
+    
+    # 1. Tìm tất cả các subfolder streamer
+    q_folders = f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    res_f = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_folders, "fields": "files(id,name)"}, timeout=15)
+    folders = res_f.json().get("files", [])
+    
+    total_deleted = 0
+    for fold in folders:
+        f_id = fold["id"]
+        f_name = fold["name"]
+        q_files = f"'{f_id}' in parents and trashed = false"
+        res_files = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_files, "fields": "files(id,name,mimeType,size)"}, timeout=15)
+        files = res_files.json().get("files", [])
+        
+        # Tạo map tên thumbnail -> id
+        thumbs = {f["name"]: f["id"] for f in files if f["name"].endswith(".jpg")}
+        
+        for f in files:
+            fname = f["name"]
+            fid = f["id"]
+            if fname.endswith(".mp4"):
+                sz = int(f.get("size", 0))
+                if sz < min_size_bytes:
+                    print(f"  🗑️ [Drive Cleaner] Phát hiện video rác lỗi 0:00s ({sz} bytes): {f_name}/{fname}")
+                    try:
+                        # Xóa file video trên Drive
+                        requests.delete(f"https://www.googleapis.com/drive/v3/files/{fid}", headers=headers, timeout=15)
+                        total_deleted += 1
+                        time.sleep(0.15)
+                        
+                        # Xóa thumbnail tương ứng nếu có
+                        base = fname.replace(".mp4", "")
+                        thumb_name = base + ".jpg"
+                        if thumb_name in thumbs:
+                            requests.delete(f"https://www.googleapis.com/drive/v3/files/{thumbs[thumb_name]}", headers=headers, timeout=15)
+                            print(f"  🗑️ [Drive Cleaner] Đã dọn kèm thumbnail: {thumb_name}")
+                            time.sleep(0.1)
+                    except Exception as del_err:
+                        print(f"  [!] Bỏ qua file do lỗi timeout Drive: {del_err}")
+
+    print(f"[✓] Đã dọn dẹp sạch sẽ {total_deleted} file video lỗi/rác trên Google Drive!")
+    return total_deleted
 
 
 if __name__ == "__main__":

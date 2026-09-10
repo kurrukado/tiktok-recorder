@@ -514,13 +514,13 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
             stagnant_seconds = int(now - last_growth_time)
 
             # Quick Watchdog cho VIP Sub-Only: khi dung lượng không tăng trong >= 6 giây, lập tức chốt file preview nhanh chóng
-            if is_sub_only and size_bytes > 1024 and stagnant_seconds >= 6:
+            if is_sub_only and size_bytes >= 250 * 1024 and stagnant_seconds >= 6:
                 print(f"\n\n[⚡ VIP Preview] [@{target_user}] Luồng preview Sub-Only dừng truyền tải sau {stagnant_seconds}s ({size_mb:.2f} MB). Đang chốt file preview nhanh chóng...")
                 _safe_stop_ffmpeg(proc, timeout=4)
                 break
 
             # Nếu trong 12s liên tục không có thêm dữ liệu mới -> Kiểm tra xem streamer đã tắt live chưa
-            if size_bytes > 1024 and stagnant_seconds >= 12:
+            if size_bytes >= 250 * 1024 and stagnant_seconds >= 12:
                 if (now - last_live_check_time) >= 8:
                     last_live_check_time = now
                     if target_user:
@@ -534,8 +534,9 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
                         except Exception:
                             pass
 
-            # Nếu 30 giây liên tiếp không nhận được bất kỳ byte nào -> Buộc kết thúc để đóng gói video
-            if stagnant_seconds >= 30:
+            # Nếu dữ liệu ngắt quãng: tối đa 15s nếu file chưa đủ 250 KB, tối đa 30s nếu đang ghi dở
+            max_stagnant = 15 if size_bytes < 250 * 1024 else 30
+            if stagnant_seconds >= max_stagnant:
                 print(f"\n\n[!] [@{target_user}] Tín hiệu live ngắt quãng {stagnant_seconds}s. Tự động chốt video...")
                 _safe_stop_ffmpeg(proc, timeout=6)
                 break
@@ -548,42 +549,58 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         print("\n\n[!] Nhận lệnh dừng từ người dùng. Đang đóng gói file video...")
         _safe_stop_ffmpeg(proc, timeout=8)
 
-    if os.path.exists(output_filename) and os.path.getsize(output_filename) > 1024:
-        final_size = os.path.getsize(output_filename) / (1024 * 1024)
-        print(f"\n[✓] Ghi hình thành công! File đã lưu tại:")
-        print(f"    --> {output_filename} ({final_size:.2f} MB)\n")
-        
-        # Tự động kiểm tra và chuyển sang H.264 nếu cần thiết
-        try:
-            from auto_h264 import ensure_h264
-            output_filename = ensure_h264(output_filename)
-        except Exception as e:
-            print(f"[!] Lỗi khi tự động kiểm tra định dạng H.264: {e}")
-
-        # Tự động gửi thông báo Telegram & đồng bộ Google Drive nếu được yêu cầu
-        if auto_sync_gdrive:
+    if os.path.exists(output_filename):
+        from auto_h264 import validate_playable_video
+        is_valid, reason, dur = validate_playable_video(output_filename, min_duration=5.0, min_size_bytes=250000)
+        if is_valid:
+            final_size = os.path.getsize(output_filename) / (1024 * 1024)
+            print(f"\n[✓] Ghi hình thành công! File đạt chuẩn ({dur:.1f}s, {final_size:.2f} MB):")
+            print(f"    --> {output_filename}\n")
+            
+            # Tự động kiểm tra và chuyển sang H.264 nếu cần thiết
             try:
-                from notifier import send_telegram, sync_to_gdrive
-                final_mb = os.path.getsize(output_filename) / (1024 * 1024) if os.path.exists(output_filename) else 0
-                fname = os.path.basename(output_filename)
-                send_telegram(
-                    f"✅ <b>Đã lưu thành công phiên Live!</b>\n"
-                    f"👤 Streamer: <code>@{target_user}</code>\n"
-                    f"📁 File: <code>{fname}</code>\n"
-                    f"💾 Dung lượng: <b>{final_mb:.2f} MB</b> (Chuẩn H.264)"
-                )
-                sync_to_gdrive(output_filename, target_user)
+                from auto_h264 import ensure_h264
+                output_filename = ensure_h264(output_filename)
             except Exception as e:
-                print(f"[!] Lỗi khi gửi thông báo/đồng bộ đám mây: {e}")
+                print(f"[!] Lỗi khi tự động kiểm tra định dạng H.264: {e}")
 
-        return output_filename
-    else:
-        print("\n[!] Stream ngắt hoặc không nhận được dữ liệu hợp lệ.")
-        if os.path.exists(output_filename) and os.path.getsize(output_filename) <= 1024:
+            # Validate lại sau khi chuyển đổi định dạng
+            is_valid_after, reason_after, _ = validate_playable_video(output_filename, min_duration=5.0, min_size_bytes=250000)
+            if not is_valid_after:
+                print(f"[!] File sau khi chuyển mã không đạt chuẩn ({reason_after}). Hủy file lỗi.")
+                if os.path.exists(output_filename):
+                    try:
+                        os.remove(output_filename)
+                    except Exception:
+                        pass
+                return None
+
+            # Tự động gửi thông báo Telegram & đồng bộ Google Drive nếu được yêu cầu
+            if auto_sync_gdrive:
+                try:
+                    from notifier import send_telegram, sync_to_gdrive
+                    final_mb = os.path.getsize(output_filename) / (1024 * 1024) if os.path.exists(output_filename) else 0
+                    fname = os.path.basename(output_filename)
+                    send_telegram(
+                        f"✅ <b>Đã lưu thành công phiên Live!</b>\n"
+                        f"👤 Streamer: <code>@{target_user}</code>\n"
+                        f"📁 File: <code>{fname}</code>\n"
+                        f"💾 Dung lượng: <b>{final_mb:.2f} MB</b> ({dur:.0f}s, Chuẩn H.264)"
+                    )
+                    sync_to_gdrive(output_filename, target_user)
+                except Exception as e:
+                    print(f"[!] Lỗi khi gửi thông báo/đồng bộ đám mây: {e}")
+
+            return output_filename
+        else:
+            print(f"\n[!] Video ghi hình không đạt chuẩn ({reason}). Tự động hủy file lỗi để tránh rác ổ cứng và ngăn gửi video 0:00s.")
             try:
                 os.remove(output_filename)
             except Exception:
                 pass
+            return None
+    else:
+        print("\n[!] Stream ngắt hoặc không nhận được dữ liệu hợp lệ.")
         return None
 
 

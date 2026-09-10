@@ -91,6 +91,49 @@ def get_audio_codec(filepath):
         pass
     return "none"
 
+def validate_playable_video(filepath, min_duration=5.0, min_size_bytes=250000):
+    """
+    Kiểm tra tính toàn vẹn và khả năng phát thực tế của file video:
+    1. File tồn tại và dung lượng >= min_size_bytes (mặc định 250 KB, loại trừ rác container).
+    2. Phải có ít nhất 1 luồng Video ('Video:'), loại trừ các file chỉ có Audio.
+    3. Thời lượng video >= min_duration giây, loại trừ các đoạn thu ngắn ngủi lỗi 0:00s.
+    Returns (is_valid: bool, reason: str, duration: float)
+    """
+    if not filepath or not os.path.exists(filepath):
+        return False, "File không tồn tại", 0.0
+
+    size = os.path.getsize(filepath)
+    if size < min_size_bytes:
+        return False, f"Dung lượng quá nhỏ ({size} bytes < {min_size_bytes} bytes)", 0.0
+
+    cmd = [FFMPEG_PATH, "-i", filepath]
+    try:
+        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", timeout=8)
+        out = p.stderr
+
+        has_video = False
+        for line in out.splitlines():
+            if "Video:" in line:
+                has_video = True
+                break
+
+        if not has_video:
+            return False, "Không tìm thấy luồng hình ảnh (Video Stream) trong file (chỉ có Audio hoặc rỗng)", 0.0
+
+        import re
+        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", out)
+        if not m:
+            return False, "Không xác định được thời lượng video", 0.0
+
+        h, mins, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+        dur = h * 3600 + mins * 60 + s
+        if dur < min_duration:
+            return False, f"Thời lượng video quá ngắn ({dur:.2f}s < {min_duration}s)", dur
+
+        return True, "Hợp lệ", dur
+    except Exception as e:
+        return False, f"Lỗi khi kiểm tra video: {e}", 0.0
+
 def ensure_h264(filepath):
     """
     Ensures the video is encoded in standard H.264 (AVC) and finalized for mobile devices & video editing software.

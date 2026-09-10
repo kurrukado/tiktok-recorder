@@ -113,6 +113,8 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
     current_room_id = initial_room_id
     max_vip_attempts = 5
     guest_session = None
+    consecutive_failures = 0
+    max_consecutive_failures = 4
 
     # Kiểm tra xem buổi live có phải VIP Sub-only không qua check_live_details
     live_details = recorder_core.check_live_details(user)
@@ -182,8 +184,16 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 is_sub_only=is_sub_only
             )
 
-            if rec_result and os.path.exists(rec_result) and os.path.getsize(rec_result) > 1024:
-                log(f"[✓] [@{user}] Hoàn tất Phần {part_number}: {os.path.basename(rec_result)}")
+            from auto_h264 import validate_playable_video
+            is_valid = False
+            v_reason = "Không có kết quả thu"
+            v_dur = 0.0
+            if rec_result and os.path.exists(rec_result):
+                is_valid, v_reason, v_dur = validate_playable_video(rec_result, min_duration=5.0, min_size_bytes=250000)
+
+            if is_valid:
+                consecutive_failures = 0
+                log(f"[✓] [@{user}] Hoàn tất Phần {part_number} ({v_dur:.1f}s): {os.path.basename(rec_result)}")
 
                 # 1. Trích xuất thumbnail từ 50% thời lượng của đoạn này
                 thumb_file = None
@@ -238,6 +248,24 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 except Exception as up_err:
                     log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
 
+                part_number += 1
+            else:
+                consecutive_failures += 1
+                log(f"[!] [@{user}] Đoạn ghi hình Phần {part_number} không đạt chuẩn ({v_reason}). Bỏ qua, KHÔNG lưu lên Google Drive/Supabase.")
+                if rec_result and os.path.exists(rec_result):
+                    try:
+                        os.remove(rec_result)
+                    except Exception:
+                        pass
+
+                if consecutive_failures >= max_consecutive_failures:
+                    log(f"⏸️ [@{user}] Gặp {consecutive_failures} lỗi thu luồng liên tiếp. Dừng luồng để giải phóng tài nguyên và tránh lặp.")
+                    break
+
+                backoff_sec = min(15 * consecutive_failures, 60)
+                log(f"⏳ [@{user}] Tạm nghỉ {backoff_sec}s trước khi thử lại luồng...")
+                time.sleep(backoff_sec)
+
             if stop_event and stop_event.is_set():
                 log(f"⏹️ [@{user}] Nhận lệnh dừng phiên. Không ghi tiếp phần mới.")
                 break
@@ -248,26 +276,24 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     log(f"🛑 [@{user}] Đã đạt giới hạn tối đa {max_vip_attempts} lần xoay Guest Session preview Sub-Only. Kết thúc luồng.")
                     break
 
-                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live VIP Sub-Only để xoay Guest Session cho Phần {part_number + 1}...")
+                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live VIP Sub-Only để xoay Guest Session cho Phần {part_number}...")
                 time.sleep(2)
                 curr_det = recorder_core.check_live_details(user)
                 if curr_det.get("is_live"):
-                    part_number += 1
                     if curr_det.get("room_id"):
                         current_room_id = curr_det.get("room_id")
                     log(f"⏩ [@{user}] Streamer VẪN ĐANG LIVE VIP Sub-Only! Tiếp tục xoay Guest Session ghi tiếp Phần {part_number}...")
                     continue
                 else:
-                    log(f"🏁 [@{user}] Streamer đã xuống live sau {part_number} phần preview.")
+                    log(f"🏁 [@{user}] Streamer đã xuống live sau {part_number - 1} phần preview.")
                     break
             else:
-                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number + 1}...")
+                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number}...")
                 time.sleep(3)
                 curr_det = recorder_core.check_live_details(user)
                 is_live = curr_det.get("is_live", False)
                 new_room_id = curr_det.get("room_id")
                 if is_live and new_room_id:
-                    part_number += 1
                     current_room_id = new_room_id
                     if curr_det.get("is_sub_only"):
                         is_sub_only = True
@@ -275,7 +301,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     log(f"⏩ [@{user}] Streamer VẪN ĐANG LIVE! Tiếp tục ghi hình nối tiếp Phần {part_number} ngay lập tức...")
                     continue
                 else:
-                    log(f"🏁 [@{user}] Phiên livestream đã kết thúc hoàn toàn sau {part_number} phần.")
+                    log(f"🏁 [@{user}] Phiên livestream đã kết thúc hoàn toàn sau {part_number - 1} phần.")
                     break
 
     except Exception as err:

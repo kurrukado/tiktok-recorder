@@ -1,4 +1,4 @@
-﻿import os
+import os
 import re
 import json
 import time
@@ -100,6 +100,11 @@ def sync_recording_to_supabase(
         fname = os.path.basename(filename)
         if not fname.endswith(".mp4"):
             fname = f"{fname}.mp4"
+
+        # Từ chối lưu các video rác lỗi 0:00s (< 250 KB)
+        if size_bytes and int(size_bytes) < 250 * 1024:
+            print(f"[SUPABASE-SYNC] [!] Từ chối đồng bộ video lỗi dung lượng nhỏ ({size_bytes} bytes): {fname}")
+            return False
 
         if not recorded_at:
             m = re.search(r"(\d{4}-\d{2}-\d{2})_(\d{2}-\d{2}-\d{2})", fname)
