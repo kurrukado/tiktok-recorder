@@ -479,11 +479,12 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
     cmd = [
         FFMPEG_PATH,
         "-y",
-        "-rw_timeout", "15000000",
+        "-rw_timeout", "60000000",
         "-reconnect", "1",
+        "-reconnect_at_eof", "1",
         "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1",
-        "-reconnect_delay_max", "5",
+        "-reconnect_delay_max", "15",
         "-fflags", "+genpts+discardcorrupt",
         "-analyzeduration", "10000000",
         "-probesize", "10000000",
@@ -518,6 +519,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         last_size = 0
         last_growth_time = time.time()
         last_live_check_time = time.time()
+        consecutive_offline_checks = 0
 
         while proc.poll() is None:
             if stop_event and stop_event.is_set():
@@ -543,7 +545,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
 
             stagnant_seconds = int(now - last_growth_time)
 
-            # Tự động chốt phân đoạn khi đạt thời lượng tối đa (mặc định 2 tiếng)
+            # Tự động chốt phân đoạn khi đạt thời lượng tối đa (mặc định 1 tiếng = 3600s)
             if duration and elapsed >= duration:
                 h_desc = f"{duration // 3600} tiếng" if duration >= 3600 else f"{duration}s"
                 print(f"\n\n[⏱️ Tối đa {h_desc}] [@{target_user}] Đã đạt thời lượng phân đoạn ({hours:02d}:{mins:02d}:{secs:02d}). Đang chốt file để tải lên Cloud...")
@@ -556,27 +558,39 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
                 _safe_stop_ffmpeg(proc, timeout=4)
                 break
 
-            # Nếu trong 12s liên tục không có thêm dữ liệu mới -> Kiểm tra xem streamer đã tắt live chưa
-            if size_bytes >= 250 * 1024 and stagnant_seconds >= 12:
-                if (now - last_live_check_time) >= 8:
+            # Kiểm tra trạng thái streamer khi dữ liệu chững lại (chỉ với luồng thường, không phải VIP Sub-Only)
+            if not is_sub_only and size_bytes >= 250 * 1024 and stagnant_seconds >= 20:
+                if (now - last_live_check_time) >= 10:
                     last_live_check_time = now
                     if target_user:
                         try:
                             is_still_live, _ = check_live_status(target_user)
                             if not is_still_live:
-                                print(f"\n\n[✓] [@{target_user}] Streamer ĐÃ XUỐNG LIVE (Không còn tín hiệu sau {stagnant_seconds}s).")
-                                print(f"[*] [@{target_user}] Đang chốt file video MP4 và lưu trữ ngay lập tức...")
-                                _safe_stop_ffmpeg(proc, timeout=8)
-                                break
+                                consecutive_offline_checks += 1
+                                if consecutive_offline_checks >= 3:
+                                    print(f"\n\n[✓] [@{target_user}] Streamer ĐÃ XUỐNG LIVE (Xác nhận 3 lần liên tiếp không còn tín hiệu sau {stagnant_seconds}s).")
+                                    print(f"[*] [@{target_user}] Đang chốt file video MP4 và lưu trữ...")
+                                    _safe_stop_ffmpeg(proc, timeout=8)
+                                    break
+                            else:
+                                consecutive_offline_checks = 0
                         except Exception:
                             pass
 
-            # Nếu dữ liệu ngắt quãng: tối đa 15s nếu file chưa đủ 250 KB, tối đa 30s nếu đang ghi dở
-            max_stagnant = 15 if size_bytes < 250 * 1024 else 30
+            # Nếu dữ liệu ngắt quãng: tối đa 30s nếu file chưa đủ 250 KB, tối đa 90s nếu đang ghi dở
+            max_stagnant = 30 if size_bytes < 250 * 1024 else 90
             if stagnant_seconds >= max_stagnant:
-                print(f"\n\n[!] [@{target_user}] Tín hiệu live ngắt quãng {stagnant_seconds}s. Tự động chốt video...")
-                _safe_stop_ffmpeg(proc, timeout=6)
-                break
+                offline_confirmed = False
+                if target_user:
+                    try:
+                        st_check, _ = check_live_status(target_user)
+                        offline_confirmed = not st_check
+                    except Exception:
+                        offline_confirmed = True
+                if offline_confirmed or stagnant_seconds >= 120:
+                    print(f"\n\n[!] [@{target_user}] Tín hiệu live ngắt quãng {stagnant_seconds}s. Tự động chốt phân đoạn...")
+                    _safe_stop_ffmpeg(proc, timeout=6)
+                    break
 
             sys.stdout.write(f"\r🔴 Đang ghi hình: [{hours:02d}:{mins:02d}:{secs:02d}] - Dung lượng: {size_mb:.2f} MB")
             sys.stdout.flush()

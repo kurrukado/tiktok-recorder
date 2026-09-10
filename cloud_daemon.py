@@ -6,6 +6,8 @@ import random
 import argparse
 import re
 import threading
+import subprocess
+import shutil
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -15,6 +17,63 @@ import recorder_core
 import auto_h264
 import gdrive_manager
 import notifier
+
+def concat_mp4_segments(segment_files, output_file):
+    """
+    Ghép nối nhiều phân đoạn MP4 cùng chuẩn H.264/AAC thành 1 file duy nhất bằng FFmpeg concat demuxer (-c copy)
+    hoàn toàn không re-encode, 0% CPU, tốc độ < 1 giây.
+    """
+    if not segment_files:
+        return None
+    valid_files = [f for f in segment_files if f and os.path.exists(f) and os.path.getsize(f) > 50000]
+    if not valid_files:
+        return None
+    if len(valid_files) == 1:
+        if valid_files[0] != output_file:
+            try:
+                shutil.move(valid_files[0], output_file)
+            except Exception:
+                return valid_files[0]
+        return output_file
+
+    list_txt = output_file + ".concat.txt"
+    try:
+        with open(list_txt, "w", encoding="utf-8") as f:
+            for seg in valid_files:
+                clean_path = os.path.abspath(seg).replace("\\", "/")
+                f.write(f"file '{clean_path}'\n")
+
+        cmd = [
+            recorder_core.FFMPEG_PATH,
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_txt,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            output_file
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        if res.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 100000:
+            for seg in valid_files:
+                if seg != output_file and os.path.exists(seg):
+                    try:
+                        os.remove(seg)
+                    except Exception:
+                        pass
+            return output_file
+        else:
+            largest = max(valid_files, key=lambda f: os.path.getsize(f) if os.path.exists(f) else 0)
+            return largest
+    except Exception as e:
+        log(f"[!] Lỗi khi ghép nối phân đoạn video: {e}")
+        return valid_files[0]
+    finally:
+        if os.path.exists(list_txt):
+            try:
+                os.remove(list_txt)
+            except Exception:
+                pass
 
 def log(msg):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -152,131 +211,199 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 except Exception:
                     pass
 
-            stream_url = None
-            for s_attempt in range(3):
-                if is_sub_only:
-                    log(f"🔄 [@{user}] Tạo phiên khách vô danh mới (Guest Session) để lấy link preview Sub-Only Phần {part_number} (lần {s_attempt+1})...")
-                    guest_session = recorder_core.generate_guest_session()
-                    stream_url = recorder_core.get_live_stream_url(current_room_id, user=user, session=guest_session)
-                else:
-                    stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
-                
-                if stream_url:
-                    break
-                time.sleep(2.5)
-
-            if not stream_url:
-                # Thử refresh lại room_id từ live status một lần nữa trước khi kết thúc
-                st_live, new_rid = recorder_core.check_live_status(user)
-                if st_live and new_rid:
-                    current_room_id = new_rid
-                    stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
-
-            if not stream_url:
-                log(f"[!] Không lấy được URL stream của @{user} sau các lần thử, kết thúc luồng.")
-                break
-
             now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             part_suffix = f"_part{part_number}" if part_number > 1 else ""
             user_dir = os.path.join(BASE_DIR, user)
             os.makedirs(user_dir, exist_ok=True)
             output_file = os.path.join(user_dir, f"{user}_{now_str}{part_suffix}.mp4")
 
-            log(f"🔴 [@{user}] Đang ghi hình Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Tối đa 1 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
+            part_segments = []
+            accumulated_seconds = 0.0
+            log(f"🔴 [@{user}] Bắt đầu tích lũy Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Mục tiêu gom đủ 1 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
 
-            # Ghi hình với giới hạn duration và cờ is_sub_only
-            chunk_duration = 300 if is_sub_only else MAX_CHUNK_SECONDS
-            rec_result = recorder_core.record_stream_ffmpeg(
-                stream_url,
-                output_filename=output_file,
-                target_user=user,
-                duration=chunk_duration,
-                stop_event=stop_event,
-                auto_sync_gdrive=False,
-                is_sub_only=is_sub_only
-            )
-
-            from auto_h264 import validate_playable_video
-            is_valid = False
-            v_reason = "Không có kết quả thu"
-            v_dur = 0.0
-            if rec_result and os.path.exists(rec_result):
-                is_valid, v_reason, v_dur = validate_playable_video(rec_result, min_duration=5.0, min_size_bytes=250000)
-
-            if is_valid:
-                consecutive_failures = 0
-                log(f"[✓] [@{user}] Hoàn tất Phần {part_number} ({v_dur:.1f}s): {os.path.basename(rec_result)}")
-
-                # 1. Trích xuất thumbnail từ 50% thời lượng của đoạn này
-                thumb_file = None
-                try:
-                    from api_server import extract_middle_thumbnail
-                    thumb_file = extract_middle_thumbnail(rec_result)
-                    if thumb_file and os.path.exists(thumb_file):
-                        log(f"[✓] [@{user}] Đã tạo thumbnail Phần {part_number}: {os.path.basename(thumb_file)}")
-                except Exception as th_err:
-                    log(f"[!] [@{user}] Lỗi tạo thumbnail: {th_err}")
-
-                # 2. Tự động đồng bộ ngay vào Supabase Storage (ảnh thumbnail) & Database
-                rec_file_name = os.path.basename(rec_result)
-                rec_file_size = os.path.getsize(rec_result) if os.path.exists(rec_result) else 0
-                try:
-                    import supabase_sync
-                    log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
-                    supabase_sync.sync_recording_to_supabase(
-                        user=user,
-                        filename=rec_file_name,
-                        size_bytes=rec_file_size,
-                        thumb_source=thumb_file,
-                        source="cloud_daemon"
-                    )
-                except Exception as sb_err:
-                    log(f"[!] [@{user}] Lỗi đồng bộ Supabase: {sb_err}")
-
-                # 3. Tải video & thumbnail lên Google Drive
-                try:
-                    log(f"[*] [@{user}] Đang tải Phần {part_number} lên Google Drive...")
-                    tok = gdrive_manager.get_access_token()
-                    if tok:
-                        r_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
-                        s_id = gdrive_manager.find_or_create_folder(user, parent_id=r_id, access_token=tok)
-                        ok = gdrive_manager.upload_file_to_drive(rec_result, s_id, access_token=tok)
-                        if ok:
-                            log(f"[✓] [@{user}] Đã lưu video Phần {part_number} lên Google Drive!")
-                            try:
-                                os.remove(rec_result)
-                                log(f"🗑️ [@{user}] Đã xóa video tạm Phần {part_number} để giải phóng ổ cứng.")
-                            except Exception:
-                                pass
-                        else:
-                            log(f"[!] [@{user}] Không thể upload video lên Drive sau các lần thử. Giữ lại file local.")
-
-                        if thumb_file and os.path.exists(thumb_file):
-                            gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
-                            try:
-                                os.remove(thumb_file)
-                            except Exception:
-                                pass
-                except Exception as up_err:
-                    log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
-
-                part_number += 1
-            else:
-                consecutive_failures += 1
-                log(f"[!] [@{user}] Đoạn ghi hình Phần {part_number} không đạt chuẩn ({v_reason}). Bỏ qua, KHÔNG lưu lên Google Drive/Supabase.")
-                if rec_result and os.path.exists(rec_result):
-                    try:
-                        os.remove(rec_result)
-                    except Exception:
-                        pass
-
-                if consecutive_failures >= max_consecutive_failures:
-                    log(f"⏸️ [@{user}] Gặp {consecutive_failures} lỗi thu luồng liên tiếp. Dừng luồng để giải phóng tài nguyên và tránh lặp.")
+            # Vòng lặp thu thập các phân đoạn cho đến khi đủ 1 tiếng hoặc streamer tắt live
+            while accumulated_seconds < (300 if is_sub_only else (MAX_CHUNK_SECONDS - 60)):
+                if stop_event and stop_event.is_set():
                     break
 
-                backoff_sec = min(15 * consecutive_failures, 60)
-                log(f"⏳ [@{user}] Tạm nghỉ {backoff_sec}s trước khi thử lại luồng...")
-                time.sleep(backoff_sec)
+                target_duration = (300 - int(accumulated_seconds)) if is_sub_only else (MAX_CHUNK_SECONDS - int(accumulated_seconds))
+                if target_duration <= 30:
+                    break
+
+                stream_url = None
+                for s_attempt in range(3):
+                    if is_sub_only:
+                        log(f"🔄 [@{user}] Tạo phiên khách vô danh mới (Guest Session) để lấy link preview Sub-Only Phần {part_number}...")
+                        guest_session = recorder_core.generate_guest_session()
+                        stream_url = recorder_core.get_live_stream_url(current_room_id, user=user, session=guest_session)
+                    else:
+                        stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
+                    
+                    if stream_url:
+                        break
+                    time.sleep(2.5)
+
+                if not stream_url:
+                    # Thử refresh lại room_id từ live status
+                    st_live, new_rid = recorder_core.check_live_status(user)
+                    if st_live and new_rid:
+                        current_room_id = new_rid
+                        stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
+
+                if not stream_url:
+                    log(f"[!] Không lấy được URL stream của @{user}. Dừng tích lũy Phần {part_number}.")
+                    break
+
+                seg_name = os.path.join(user_dir, f"{user}_{now_str}_p{part_number}_seg{len(part_segments)+1}.mp4")
+                rec_result = recorder_core.record_stream_ffmpeg(
+                    stream_url,
+                    output_filename=seg_name,
+                    target_user=user,
+                    duration=target_duration,
+                    stop_event=stop_event,
+                    auto_sync_gdrive=False,
+                    is_sub_only=is_sub_only
+                )
+
+                from auto_h264 import validate_playable_video
+                is_valid = False
+                v_reason = "Không có kết quả thu"
+                v_dur = 0.0
+                if rec_result and os.path.exists(rec_result):
+                    is_valid, v_reason, v_dur = validate_playable_video(rec_result, min_duration=5.0, min_size_bytes=250000)
+
+                if is_valid:
+                    consecutive_failures = 0
+                    part_segments.append(rec_result)
+                    accumulated_seconds += v_dur
+                    log(f"[✓] [@{user}] Thu đoạn {len(part_segments)} ({v_dur:.1f}s). Tích lũy Phần {part_number}: {accumulated_seconds:.1f}s / {MAX_CHUNK_SECONDS}s")
+                else:
+                    consecutive_failures += 1
+                    log(f"[!] [@{user}] Phân đoạn {len(part_segments)+1} không đạt chuẩn ({v_reason}).")
+                    if rec_result and os.path.exists(rec_result):
+                        try:
+                            os.remove(rec_result)
+                        except Exception:
+                            pass
+                    if consecutive_failures >= max_consecutive_failures:
+                        log(f"⏸️ [@{user}] Gặp {consecutive_failures} lỗi thu luồng liên tiếp. Dừng tích lũy Phần {part_number}.")
+                        break
+                    time.sleep(5)
+
+                if is_sub_only:
+                    break
+
+                if accumulated_seconds >= MAX_CHUNK_SECONDS - 60:
+                    log(f"[⏱️ Đủ 1 tiếng] [@{user}] Phần {part_number} đã tích lũy đủ 1 tiếng ({accumulated_seconds:.1f}s)!")
+                    break
+
+                # Kiểm tra streamer còn live không để tiếp tục tích lũy vào Phần hiện tại
+                time.sleep(3)
+                curr_det = recorder_core.check_live_details(user)
+                if not curr_det.get("is_live"):
+                    time.sleep(4)
+                    curr_det = recorder_core.check_live_details(user)
+
+                if curr_det.get("is_live"):
+                    if curr_det.get("room_id"):
+                        current_room_id = curr_det.get("room_id")
+                    if curr_det.get("is_sub_only"):
+                        is_sub_only = True
+                    log(f"⏩ [@{user}] Luồng tạm gián đoạn sau {v_dur:.1f}s nhưng streamer VẪN ĐANG LIVE. Tự động thu tiếp nối vào Phần {part_number} (còn thiếu {MAX_CHUNK_SECONDS - int(accumulated_seconds)}s)...")
+                else:
+                    log(f"🏁 [@{user}] Streamer đã xuống live sau {accumulated_seconds:.1f}s tích lũy.")
+                    break
+
+            if not part_segments:
+                if consecutive_failures >= max_consecutive_failures:
+                    break
+                continue
+
+            # Ghép tất cả các đoạn của Phần này lại thành 1 file MP4 duy nhất
+            final_rec_file = output_file
+            if len(part_segments) == 1:
+                if os.path.exists(output_file) and output_file != part_segments[0]:
+                    try:
+                        os.remove(output_file)
+                    except Exception:
+                        pass
+                try:
+                    shutil.move(part_segments[0], output_file)
+                    final_rec_file = output_file
+                except Exception:
+                    final_rec_file = part_segments[0]
+            else:
+                log(f"🧩 [@{user}] Đang ghép nối {len(part_segments)} phân đoạn thành 1 file MP4 duy nhất cho Phần {part_number} ({accumulated_seconds:.1f}s)...")
+                final_rec_file = concat_mp4_segments(part_segments, output_file)
+
+            # Đảm bảo file hợp lệ trước khi đẩy lên Cloud
+            is_valid, v_reason, final_dur = validate_playable_video(final_rec_file, min_duration=5.0, min_size_bytes=250000)
+            if not is_valid:
+                log(f"[!] [@{user}] File Phần {part_number} không đạt chuẩn ({v_reason}). Bỏ qua.")
+                if os.path.exists(final_rec_file):
+                    try:
+                        os.remove(final_rec_file)
+                    except Exception:
+                        pass
+                continue
+
+            consecutive_failures = 0
+            log(f"[✓] [@{user}] Hoàn tất trọn vẹn Phần {part_number} ({final_dur:.1f}s): {os.path.basename(final_rec_file)}")
+
+            # 1. Trích xuất thumbnail từ 50% thời lượng của đoạn này
+            thumb_file = None
+            try:
+                from api_server import extract_middle_thumbnail
+                thumb_file = extract_middle_thumbnail(final_rec_file)
+                if thumb_file and os.path.exists(thumb_file):
+                    log(f"[✓] [@{user}] Đã tạo thumbnail Phần {part_number}: {os.path.basename(thumb_file)}")
+            except Exception as th_err:
+                log(f"[!] [@{user}] Lỗi tạo thumbnail: {th_err}")
+
+            # 2. Tự động đồng bộ ngay vào Supabase Storage (ảnh thumbnail) & Database
+            rec_file_name = os.path.basename(final_rec_file)
+            rec_file_size = os.path.getsize(final_rec_file) if os.path.exists(final_rec_file) else 0
+            try:
+                import supabase_sync
+                log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
+                supabase_sync.sync_recording_to_supabase(
+                    user=user,
+                    filename=rec_file_name,
+                    size_bytes=rec_file_size,
+                    thumb_source=thumb_file,
+                    source="cloud_daemon"
+                )
+            except Exception as sb_err:
+                log(f"[!] [@{user}] Lỗi đồng bộ Supabase: {sb_err}")
+
+            # 3. Tải video & thumbnail lên Google Drive
+            try:
+                log(f"[*] [@{user}] Đang tải Phần {part_number} ({final_dur:.1f}s) lên Google Drive...")
+                tok = gdrive_manager.get_access_token()
+                if tok:
+                    r_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
+                    s_id = gdrive_manager.find_or_create_folder(user, parent_id=r_id, access_token=tok)
+                    ok = gdrive_manager.upload_file_to_drive(final_rec_file, s_id, access_token=tok)
+                    if ok:
+                        log(f"[✓] [@{user}] Đã lưu video Phần {part_number} lên Google Drive!")
+                        try:
+                            os.remove(final_rec_file)
+                            log(f"🗑️ [@{user}] Đã xóa video tạm Phần {part_number} để giải phóng ổ cứng.")
+                        except Exception:
+                            pass
+                    else:
+                        log(f"[!] [@{user}] Không thể upload video lên Drive sau các lần thử. Giữ lại file local.")
+
+                    if thumb_file and os.path.exists(thumb_file):
+                        gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
+                        try:
+                            os.remove(thumb_file)
+                        except Exception:
+                            pass
+            except Exception as up_err:
+                log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
+
+            part_number += 1
 
             if stop_event and stop_event.is_set():
                 log(f"⏹️ [@{user}] Nhận lệnh dừng phiên. Không ghi tiếp phần mới.")
@@ -300,9 +427,13 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     log(f"🏁 [@{user}] Streamer đã xuống live sau {part_number - 1} phần preview.")
                     break
             else:
-                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number}...")
+                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number} (1 tiếng tiếp theo)...")
                 time.sleep(3)
                 curr_det = recorder_core.check_live_details(user)
+                if not curr_det.get("is_live"):
+                    time.sleep(4)
+                    curr_det = recorder_core.check_live_details(user)
+
                 is_live = curr_det.get("is_live", False)
                 new_room_id = curr_det.get("room_id")
                 if is_live and new_room_id:

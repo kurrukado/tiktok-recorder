@@ -5,12 +5,12 @@ on:
     branches:
       - main
   schedule:
-    - cron: '*/30 * * * *'
+    - cron: '0 */3 * * *'
   workflow_dispatch:
 
 concurrency:
   group: tiktok-recorder-runner
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
