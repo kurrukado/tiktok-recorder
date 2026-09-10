@@ -513,6 +513,13 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
 
             stagnant_seconds = int(now - last_growth_time)
 
+            # Tự động chốt phân đoạn khi đạt thời lượng tối đa (mặc định 2 tiếng)
+            if duration and elapsed >= duration:
+                h_desc = f"{duration // 3600} tiếng" if duration >= 3600 else f"{duration}s"
+                print(f"\n\n[⏱️ Tối đa {h_desc}] [@{target_user}] Đã đạt thời lượng phân đoạn ({hours:02d}:{mins:02d}:{secs:02d}). Đang chốt file để tải lên Cloud...")
+                _safe_stop_ffmpeg(proc, timeout=8)
+                break
+
             # Quick Watchdog cho VIP Sub-Only: khi dung lượng không tăng trong >= 6 giây, lập tức chốt file preview nhanh chóng
             if is_sub_only and size_bytes >= 250 * 1024 and stagnant_seconds >= 6:
                 print(f"\n\n[⚡ VIP Preview] [@{target_user}] Luồng preview Sub-Only dừng truyền tải sau {stagnant_seconds}s ({size_mb:.2f} MB). Đang chốt file preview nhanh chóng...")

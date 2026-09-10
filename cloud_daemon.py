@@ -88,15 +88,15 @@ def discover_new_streamers(current_user):
         return []
 
 MAX_CONCURRENT_RECORDERS = 10  # Tối đa 10 streamer ghi hình cùng lúc
-MAX_CHUNK_SECONDS = 7000       # 1 tiếng 56 phút (< 2 tiếng), tự động cắt và ghi tiếp
+MAX_CHUNK_SECONDS = 7200       # Đúng 2 tiếng (2h = 7200s), tự động tách video và up lên Cloud
 ACTIVE_RECORDERS = {}          # {user: {"thread": Thread, "start_time": float}}
 RECORDERS_LOCK = threading.Lock()
 
 def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_event=None):
     """
     Luồng ghi hình độc lập cho từng streamer:
-    - Ghi từng đoạn ngắn dưới 2 tiếng (mặc định 1h56m).
-    - Hết đoạn: tự xuất file MP4 progressive +faststart, cắt thumbnail 50% thời lượng, upload Google Drive và xóa file tạm.
+    - Ghi từng đoạn tối đa 2 tiếng (7200s).
+    - Hết đoạn 2 tiếng: tự xuất file MP4 H.264 +faststart, cắt thumbnail 50% thời lượng, upload Google Drive và Supabase, xóa file tạm.
     - Nếu streamer vẫn đang live: tự động nối tiếp ghi Phần tiếp theo (part 2, part 3...) mà không ngắt quãng bot.
     - Cập nhật trạng thái đang quay lên Google Drive theo thời gian thực để API hiển thị.
     """
@@ -170,7 +170,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             os.makedirs(user_dir, exist_ok=True)
             output_file = os.path.join(user_dir, f"{user}_{now_str}{part_suffix}.mp4")
 
-            log(f"🔴 [@{user}] Đang ghi hình Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Tối đa < 2 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
+            log(f"🔴 [@{user}] Đang ghi hình Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Tối đa 2 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
 
             # Ghi hình với giới hạn duration và cờ is_sub_only
             chunk_duration = 300 if is_sub_only else MAX_CHUNK_SECONDS
