@@ -136,6 +136,38 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
         "preview_duration": None
     }
 
+    # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
+    try:
+        from curl_cffi import requests as c_req
+        api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
+        for imp in ["safari15_5", "chrome136"]:
+            try:
+                api_res = c_req.get(api_url, impersonate=imp, timeout=6)
+                if api_res.status_code == 200:
+                    api_json = api_res.json()
+                    data = api_json.get("data") or {}
+                    live_room = data.get("liveRoom") or {}
+                    user_data = data.get("user") or {}
+                    status = live_room.get("status")
+                    room_id = user_data.get("roomId") or live_room.get("roomId")
+
+                    if live_room.get("liveSubOnly") or live_room.get("subOnly"):
+                        details["is_sub_only"] = True
+                        details["is_preview"] = True
+
+                    if status == 2 and room_id:
+                        details["is_live"] = True
+                        details["room_id"] = str(room_id)
+                        return details
+                    elif status == 4:
+                        details["is_live"] = False
+                        details["room_id"] = None
+                        return details
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     try:
         if cookies is None:
             cookies = load_cookies()
@@ -303,11 +335,63 @@ def get_live_stream_url(room_id, user=None, cookies=None, session=None):
     except Exception:
         return None
 
+def parse_sdk_stream_data(sdk_data_str: str) -> list:
+    candidates = []
+    if not sdk_data_str:
+        return candidates
+    try:
+        sdk_json = json.loads(sdk_data_str).get("data", {})
+        quality_keys = ["origin", "uhd", "hd", "sd", "ld"]
+        ordered_keys = [k for k in quality_keys if k in sdk_json] + [k for k in sdk_json.keys() if k not in quality_keys and k != "ao"]
+
+        h264_candidates = []
+        other_candidates = []
+        for key in ordered_keys:
+            entry = sdk_json.get(key, {})
+            stream_main = entry.get("main", {})
+            flv = stream_main.get("flv")
+            hls = stream_main.get("hls") or stream_main.get("m3u8")
+
+            sdk_p = stream_main.get("sdk_params", "")
+            is_h264 = isinstance(sdk_p, str) and '"VCodec":"h264"' in sdk_p
+
+            target_list = h264_candidates if is_h264 else other_candidates
+            if flv and flv not in target_list and flv not in candidates:
+                target_list.append(flv)
+            if hls and hls not in target_list and hls not in candidates:
+                target_list.append(hls)
+
+        candidates.extend(h264_candidates)
+        candidates.extend(other_candidates)
+    except Exception:
+        pass
+    return candidates
+
 def get_stream_urls(room_id, user, cookies=None, session=None):
     """
     Extract candidate stream URLs (FLV or HLS / m3u8).
     Supports 18+ restricted streams using authenticated sessionid cookies or custom guest session.
     """
+    # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
+    if user:
+        try:
+            from curl_cffi import requests as c_req
+            api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
+            for imp in ["safari15_5", "chrome136"]:
+                try:
+                    api_res = c_req.get(api_url, impersonate=imp, timeout=7)
+                    if api_res.status_code == 200:
+                        d = api_res.json().get("data", {}).get("liveRoom", {})
+                        sd_str = d.get("streamData", {}).get("pull_data", {}).get("stream_data")
+                        if sd_str:
+                            c_urls = parse_sdk_stream_data(sd_str)
+                            if c_urls:
+                                return c_urls
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     if session is None:
         if cookies is None:
             cookies = load_cookies()
