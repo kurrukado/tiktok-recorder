@@ -282,5 +282,218 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
         self.assertEqual(compute_warning(200.0), "LOW")
         self.assertEqual(compute_warning(64.0), "LOW")
 
+    def test_get_stream_urls_closes_session_on_cookie_exception(self):
+        """
+        Adversarial Test: Verify get_stream_urls closes session even if
+        cookie setup or session.cookies.update raises an exception.
+        """
+        import recorder_core
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.cookies.update.side_effect = TypeError("malformed cookie data")
+            mock_s_cls.return_value = mock_s
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                urls = recorder_core.get_stream_urls("12345", user="testuser", cookies={"bad": None}, session=None)
+                self.assertEqual(urls, [])
+                mock_s.close.assert_called_once()
+
+    def test_get_stream_urls_graceful_network_failure(self):
+        """
+        Adversarial Test: Verify get_stream_urls catches network connection / timeout
+        exceptions gracefully, closes the session, and returns [] instead of crashing.
+        """
+        import recorder_core
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s.cookies = {}
+            mock_s.get.side_effect = ConnectionResetError("Connection reset by peer")
+            mock_s_cls.return_value = mock_s
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                urls = recorder_core.get_stream_urls("12345", user="testuser", session=None)
+                self.assertEqual(urls, [])
+                mock_s.close.assert_called_once()
+
+    def test_get_stream_urls_webcast_timeout_and_no_caller_header_mutation(self):
+        """
+        Adversarial Test: Verify session.get in Webcast API call specifies a timeout
+        and passes headers to get() without mutating caller session headers.
+        """
+        import recorder_core
+        caller_session = MagicMock()
+        caller_session.headers = {"Original-Header": "OriginalValue"}
+        caller_session.cookies = {}
+        mock_resp = MagicMock()
+        mock_resp.text = '<html></html>'
+        mock_resp.json.return_value = {"status_code": 0, "data": {}}
+        caller_session.get.return_value = mock_resp
+
+        with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+            urls = recorder_core.get_stream_urls("12345", user="testuser", session=caller_session)
+            # Caller session should NOT be closed
+            caller_session.close.assert_not_called()
+            # session.get should have been called with a timeout
+            caller_session.get.assert_called()
+            call_kwargs = caller_session.get.call_args[1]
+            self.assertIn("timeout", call_kwargs)
+            self.assertEqual(call_kwargs["timeout"], 10)
+            # Caller session headers should NOT have been polluted
+            self.assertEqual(caller_session.headers, {"Original-Header": "OriginalValue"})
+
+    def test_empty_inputs_short_circuit_without_network_or_session(self):
+        """
+        Adversarial Test: Verify empty/whitespace username returns immediately
+        without allocating any Session or making network calls.
+        """
+        import recorder_core
+        with patch("curl_cffi.requests.Session") as mock_s_cls, \
+             patch("curl_cffi.requests.get") as mock_get:
+            
+            # 1. Empty username in check_live_details
+            det1 = recorder_core.check_live_details("")
+            self.assertFalse(det1["is_live"])
+            self.assertIsNone(det1["room_id"])
+
+            det2 = recorder_core.check_live_details("   ")
+            self.assertFalse(det2["is_live"])
+            self.assertIsNone(det2["room_id"])
+
+            # 2. Empty room_id and user in get_stream_urls
+            urls = recorder_core.get_stream_urls("", "")
+            self.assertEqual(urls, [])
+
+            # Neither Session nor get should have been called
+            mock_s_cls.assert_not_called()
+            mock_get.assert_not_called()
+
+    def test_generate_guest_session_exception_safety(self):
+        """
+        Adversarial Test: Verify generate_guest_session closes session if an error
+        occurs during guest cookie/header setup before returning.
+        """
+        import recorder_core
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.cookies.set.side_effect = RuntimeError("Failed to set cookie")
+            mock_s_cls.return_value = mock_s
+
+            with self.assertRaises(RuntimeError):
+                recorder_core.generate_guest_session()
+
+            mock_s.close.assert_called_once()
+
+    def test_direct_scrape_hls_stream_no_name_error(self):
+        """
+        Adversarial Test: Verify direct HTML scrape with HLS (.m3u8) streams
+        correctly extracts clean_hls without NameError 'clean_flv'.
+        """
+        import recorder_core
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s.cookies = {}
+            mock_s_cls.return_value = mock_s
+
+            mock_resp = MagicMock()
+            mock_resp.text = '<html>https://pull-hls.tiktokcdn.com/test_uhd.m3u8?auth=123&amp;exp=456</html>'
+            mock_s.get.return_value = mock_resp
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                urls = recorder_core.get_stream_urls("12345", user="testuser", session=None)
+                self.assertTrue(isinstance(urls, list))
+                self.assertTrue(len(urls) > 0)
+                self.assertTrue(any(".m3u8" in u for u in urls))
+                self.assertNotIn("&amp;", urls[0])
+                mock_s.close.assert_called_once()
+
+    def test_native_api_step0_fallback_to_step1_scrape(self):
+        """
+        Adversarial Test: Verify that when Native Live API (Step 0) fails
+        (e.g. 403 Forbidden, 500 Internal Error, or corrupted JSON),
+        the system cleanly falls back to Step 1 HTML scrape with zero TikTokLive dependency.
+        """
+        import recorder_core
+        # Mock Step 0: returns 500 error
+        mock_step0_resp = MagicMock()
+        mock_step0_resp.status_code = 500
+        mock_step0_resp.text = "Internal Server Error"
+
+        with patch("curl_cffi.requests.get", return_value=mock_step0_resp):
+            with patch("curl_cffi.requests.Session") as mock_s_cls:
+                mock_s = MagicMock()
+                mock_s.headers = {}
+                mock_s.cookies = {}
+                mock_s_cls.return_value = mock_s
+
+                # Mock Step 1: HTML scrape returns live streamer with roomId
+                mock_step1_resp = MagicMock()
+                mock_step1_resp.status_code = 200
+                mock_step1_resp.text = '<html><script id="SIGI_STATE">{"LiveRoom":{"liveRoomUserInfo":{"liveRoom":{"roomId":"7419876543210987654","status":2}}}}</script></html>'
+                mock_s.get.return_value = mock_step1_resp
+
+                det = recorder_core.check_live_details("fallback_user")
+                self.assertTrue(det["is_live"])
+                self.assertEqual(det["room_id"], "7419876543210987654")
+                mock_s.close.assert_called_once()
+
+    def test_cloud_daemon_gc_support(self):
+        """Verify cloud_daemon imports gc and calls gc.collect() in main loop."""
+        import cloud_daemon
+        self.assertTrue(hasattr(cloud_daemon, "gc"), "cloud_daemon must import gc")
+        src = inspect.getsource(cloud_daemon.run_daemon)
+        self.assertIn("gc.collect()", src, "run_daemon must call gc.collect() in its loop")
+
+    def test_concurrent_stress_simulation(self):
+        """
+        Adversarial Stress Test: Simulate 50 concurrent requests across
+        check_live_details, get_stream_urls, /api/users, and /api/memory.
+        Verify zero thread deadlock, all sessions closed, and memory stability.
+        """
+        import concurrent.futures
+        import recorder_core
+        from api_server import app
+
+        client = TestClient(app)
+        num_workers = 10
+        total_tasks = 50
+
+        # Mock network and cloud providers to prevent external latency while testing concurrency & locking
+        with patch("curl_cffi.requests.get") as mock_get, \
+             patch("curl_cffi.requests.Session") as mock_s_cls, \
+             patch("gdrive_manager.load_streamers_from_drive", return_value=["user_a", "user_b"]), \
+             patch("gdrive_manager.load_active_recordings_from_drive", return_value=set()), \
+             patch("supabase_sync.fetch_streamers_from_supabase", return_value=[]):
+
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s.cookies = {}
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.text = '<html><script id="SIGI_STATE">{"LiveRoom":{"liveRoomUserInfo":{"liveRoom":{"roomId":"7419876543210987654","status":4}}}}</script></html>'
+            mock_resp.json.return_value = {"status_code": 0, "data": {}}
+            mock_s.get.return_value = mock_resp
+            mock_s_cls.return_value = mock_s
+            mock_get.return_value = mock_resp
+
+            def _worker_task(i):
+                if i % 4 == 0:
+                    return recorder_core.check_live_details(f"user_{i}")
+                elif i % 4 == 1:
+                    return recorder_core.get_stream_urls(f"room_{i}", user=f"user_{i}")
+                elif i % 4 == 2:
+                    return client.get("/api/users?check_live=false").status_code
+                else:
+                    return client.get("/api/memory").json()
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = [executor.submit(_worker_task, i) for i in range(total_tasks)]
+                results = [f.result() for f in concurrent.futures.as_completed(futures)]
+
+            self.assertEqual(len(results), total_tasks)
+            # Verify mock session was closed every time it was created
+            self.assertEqual(mock_s.close.call_count, mock_s_cls.call_count)
+
 if __name__ == "__main__":
     unittest.main()

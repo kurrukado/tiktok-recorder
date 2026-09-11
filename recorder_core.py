@@ -96,24 +96,30 @@ def generate_guest_session() -> requests.Session:
     impersonates = ["chrome136", "chrome131", "chrome124", "safari17_0", "edge101"]
     chosen_browser = random.choice(impersonates)
     session = requests.Session(impersonate=chosen_browser)
+    try:
+        chrome_vers = ["126.0.6478.127", "128.0.6613.85", "131.0.6778.86", "133.0.6943.53", "136.0.7024.12"]
+        ver = random.choice(chrome_vers)
 
-    chrome_vers = ["126.0.6478.127", "128.0.6613.85", "131.0.6778.86", "133.0.6943.53", "136.0.7024.12"]
-    ver = random.choice(chrome_vers)
+        tt_chain_token = "".join(random.choices("0123456789abcdef", k=32))
+        session.cookies.set("tt_chain_token", tt_chain_token, domain=".tiktok.com")
+        session.cookies.set("odin_tt", "".join(random.choices("0123456789abcdef", k=64)), domain=".tiktok.com")
+        session.cookies.set("msToken", "".join(random.choices("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_", k=128)), domain=".tiktok.com")
 
-    tt_chain_token = "".join(random.choices("0123456789abcdef", k=32))
-    session.cookies.set("tt_chain_token", tt_chain_token, domain=".tiktok.com")
-    session.cookies.set("odin_tt", "".join(random.choices("0123456789abcdef", k=64)), domain=".tiktok.com")
-    session.cookies.set("msToken", "".join(random.choices("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_", k=128)), domain=".tiktok.com")
-
-    session.headers.update({
-        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
-        "Accept-Language": random.choice(["vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7", "en-US,en;q=0.9", "ja-JP,ja;q=0.8"]),
-        "Referer": "https://www.tiktok.com/",
-        "Accept": "*/*",
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-    })
-    return session
+        session.headers.update({
+            "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+            "Accept-Language": random.choice(["vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7", "en-US,en;q=0.9", "ja-JP,ja;q=0.8"]),
+            "Referer": "https://www.tiktok.com/",
+            "Accept": "*/*",
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+        })
+        return session
+    except Exception:
+        try:
+            session.close()
+        except Exception:
+            pass
+        raise
 
 def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
     """
@@ -135,6 +141,8 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
         "paid_type": None,
         "preview_duration": None
     }
+    if not user:
+        return details
 
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     try:
@@ -376,16 +384,23 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
         except Exception:
             pass
 
+    if not room_id and not user:
+        return []
+
     owns_session = False
+    session_to_close = None
     if session is None:
-        if cookies is None:
-            cookies = load_cookies()
-        session = requests.Session(impersonate="chrome136")
         owns_session = True
-        if cookies:
-            session.cookies.update(cookies)
 
     try:
+        if owns_session:
+            if cookies is None:
+                cookies = load_cookies()
+            session = requests.Session(impersonate="chrome136")
+            session_to_close = session
+            if cookies:
+                session.cookies.update(cookies)
+
         # First attempt: Direct scrape of live page HTML with session cookies (bypasses 18+ restriction)
         if user:
             try:
@@ -425,8 +440,7 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
             "Accept": "*/*",
             "Origin": "https://www.tiktok.com",
         }
-        session.headers.update(headers)
-        res = session.get(url)
+        res = session.get(url, headers=headers, timeout=10)
         try:
             data = res.json()
         except Exception:
@@ -490,10 +504,12 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
             candidates.append(hls_pull)
 
         return candidates
+    except Exception:
+        return []
     finally:
-        if owns_session and session:
+        if session_to_close:
             try:
-                session.close()
+                session_to_close.close()
             except Exception:
                 pass
 

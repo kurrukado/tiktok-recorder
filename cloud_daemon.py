@@ -8,6 +8,7 @@ import re
 import threading
 import subprocess
 import shutil
+import gc
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -641,6 +642,7 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
         # Smart Jitter Delay để tránh bị TikTok chặn tần suất
         jitter = random.uniform(-2.0, 3.0)
         time.sleep(max(10, interval + jitter))
+        gc.collect()
 
     # Chờ tất cả luồng ghi hình hoàn tất đóng gói và upload lên Google Drive
     with RECORDERS_LOCK:
