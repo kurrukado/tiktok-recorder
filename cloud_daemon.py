@@ -102,18 +102,44 @@ def load_monitored_users():
     global _LAST_DRIVE_CHECK, _CACHED_DRIVE_USERS
 
     now = time.time()
-    # Kiểm tra danh sách streamer mới từ Google Drive sau mỗi 15 giây
+    # Kiểm tra danh sách streamer mới từ Google Drive & Supabase sau mỗi 15 giây
     if now - _LAST_DRIVE_CHECK > 15:
         _LAST_DRIVE_CHECK = now
+        drive_users = []
         try:
-            drive_users = gdrive_manager.load_streamers_from_drive()
-            if drive_users is not None and isinstance(drive_users, list):
-                cleaned = [u.strip().replace("@", "") for u in drive_users if u.strip()]
-                if _CACHED_DRIVE_USERS != cleaned:
-                    log(f"[*] Cập nhật danh sách từ Google Drive ({len(cleaned)} streamers): {cleaned}")
-                _CACHED_DRIVE_USERS = cleaned
+            d = gdrive_manager.load_streamers_from_drive()
+            if d and isinstance(d, list):
+                drive_users = [u.strip().replace("@", "").lower() for u in d if u.strip()]
         except Exception as e:
             log(f"[!] Lỗi đọc danh sách streamer từ Drive: {e}")
+
+        supa_users = []
+        try:
+            import supabase_sync
+            s = supabase_sync.fetch_streamers_from_supabase()
+            if s and isinstance(s, list):
+                supa_users = [u.strip().replace("@", "").lower() for u in s if u.strip()]
+        except Exception:
+            pass
+
+        merged_map = {}
+        for u in drive_users + supa_users:
+            if u:
+                merged_map[u] = True
+
+        if merged_map:
+            cleaned = list(merged_map.keys())
+            if _CACHED_DRIVE_USERS != cleaned:
+                log(f"[*] Cập nhật danh sách từ Google Drive & Supabase ({len(cleaned)} streamers): {cleaned}")
+            _CACHED_DRIVE_USERS = cleaned
+
+            # Tự động lưu lên Google Drive nếu Supabase có thêm streamer mới
+            if supa_users and (set(supa_users) - set(drive_users)):
+                try:
+                    gdrive_manager.save_streamers_to_drive(cleaned)
+                    log(f"💾 Tự động đồng bộ {len(cleaned)} streamer lên Google Drive streamers.json")
+                except Exception as sync_err:
+                    log(f"[!] Lỗi đồng bộ streamers.json: {sync_err}")
 
     if _CACHED_DRIVE_USERS is not None:
         return _CACHED_DRIVE_USERS
@@ -121,7 +147,7 @@ def load_monitored_users():
     cfg = load_config()
     users = cfg.get("monitored_users")
     if users is not None and isinstance(users, list):
-        return [u.strip().replace("@", "") for u in users if u.strip()]
+        return [u.strip().replace("@", "").lower() for u in users if u.strip()]
     return []
 
 def discover_new_streamers(current_user):

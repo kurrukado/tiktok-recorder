@@ -324,17 +324,46 @@ def get_active_recordings():
 
 @app.get("/api/users")
 def get_users(check_live: bool = True):
-    users = None
-    try:
-        drive_users = gdrive_manager.load_streamers_from_drive()
-        if drive_users is not None and isinstance(drive_users, list):
-            users = drive_users
-    except Exception:
-        pass
+    users_list = []
 
-    if users is None:
-        cfg = load_config()
-        users = cfg.get("monitored_users", [])
+    # 1. Nguồn dữ liệu số 1: Supabase Database (đồng bộ tức thì từ Web)
+    supa_users = []
+    try:
+        import supabase_sync
+        supa_users = supabase_sync.fetch_streamers_from_supabase()
+        if supa_users:
+            users_list.extend(supa_users)
+    except Exception as e:
+        print(f"[!] Lỗi nạp streamers từ Supabase: {e}")
+
+    # 2. Nguồn dữ liệu số 2: Google Drive
+    drive_users = []
+    try:
+        d_users = gdrive_manager.load_streamers_from_drive()
+        if d_users is not None and isinstance(d_users, list):
+            drive_users = [u.strip().replace("@", "").lower() for u in d_users if u.strip()]
+            users_list.extend(drive_users)
+    except Exception as e:
+        print(f"[!] Lỗi nạp streamers từ Drive: {e}")
+
+    # 3. Nguồn dữ liệu số 3: config.json local
+    cfg = load_config()
+    cfg_users = cfg.get("monitored_users", [])
+    if cfg_users:
+        users_list.extend(cfg_users)
+
+    # Khử trùng lặp và giữ thứ tự chuẩn
+    users = list(dict.fromkeys([u.strip().replace("@", "").lower() for u in users_list if u.strip()]))
+
+    # Tự động đồng bộ lên Drive nếu Supabase có streamer mới
+    if supa_users and (set(supa_users) - set(drive_users)):
+        try:
+            gdrive_manager.save_streamers_to_drive(users)
+            for u in supa_users:
+                if u not in drive_users:
+                    gdrive_manager.create_streamer_folder_drive(u)
+        except Exception:
+            pass
 
     active_users = set()
     try:
@@ -538,6 +567,39 @@ def get_stream_url(username: str):
         "format": "flv" if ".flv" in stream_url else "hls_m3u8",
         "note": "Link trực tiếp từ máy chủ CDN của TikTok, có thể phát trực tiếp trên web hoặc tải tốc độ cao tối đa băng thông."
     }
+
+@app.get("/api/test-live/{username}")
+def test_live_diagnostic(username: str):
+    user = username.strip().replace("@", "").lower()
+    import traceback
+    out = {"user": user}
+    try:
+        raw_det = recorder_core.check_live_details(user)
+        out["check_live_details"] = raw_det
+    except Exception as e:
+        out["check_live_details_error"] = traceback.format_exc()
+
+    try:
+        s_live, s_rid = recorder_core.check_live_status(user)
+        out["check_live_status"] = {"is_live": s_live, "room_id": s_rid}
+    except Exception as e:
+        out["check_live_status_error"] = traceback.format_exc()
+
+    try:
+        from curl_cffi import requests as c_req
+        sess = c_req.Session(impersonate="chrome136")
+        r = sess.get(f"https://www.tiktok.com/@{user}/live", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+        out["direct_scrape"] = {
+            "status_code": r.status_code,
+            "text_len": len(r.text),
+            "has_SIGI": '<script id="SIGI_STATE"' in r.text,
+            "has_roomId": bool(re.search(r'"roomId"[:"]+(\d{15,25})', r.text)),
+            "status_match": re.findall(r'"status":\s*(\d+)', r.text)[:5]
+        }
+    except Exception as e:
+        out["direct_scrape_error"] = traceback.format_exc()
+
+    return out
 
 def concat_mp4_segments(segment_files, output_file):
     """

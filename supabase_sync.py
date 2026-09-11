@@ -17,6 +17,20 @@ def get_supabase_headers(content_type: str = "application/json"):
         "Content-Type": content_type
     }
 
+def fetch_streamers_from_supabase() -> list:
+    """Đọc danh sách streamer đang theo dõi trực tiếp từ table 'tiktok_streamers'."""
+    try:
+        headers = get_supabase_headers()
+        url = f"{SUPABASE_URL}/rest/v1/tiktok_streamers?select=username&order=id.asc"
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            if isinstance(data, list):
+                return [d["username"].strip().replace("@", "").lower() for d in data if "username" in d and d["username"]]
+    except Exception as e:
+        print(f"[SUPABASE-SYNC] [!] Lỗi nạp streamers từ Supabase: {e}")
+    return []
+
 def clean_filename(filename: str) -> str:
     """Loại bỏ phần mở rộng file để lấy base name sạch sẽ"""
     base = os.path.basename(filename)

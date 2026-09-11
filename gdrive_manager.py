@@ -41,12 +41,26 @@ def get_access_token(force_refresh=False):
             return _CACHED_ACCESS_TOKEN["token"]
 
         cfg = load_config()
-        refresh_token = os.environ.get("GDRIVE_REFRESH_TOKEN") or cfg.get("gdrive_refresh_token")
+        refresh_token = (
+            os.environ.get("GDRIVE_REFRESH_TOKEN")
+            or os.environ.get("GOOGLE_DRIVE_REFRESH_TOKEN")
+            or cfg.get("gdrive_refresh_token")
+        )
         if not refresh_token:
             return None
 
-        client_id = os.environ.get("GOOGLE_CLIENT_ID") or cfg.get("google_client_id") or CLIENT_ID
-        client_secret = os.environ.get("GOOGLE_CLIENT_SECRET") or cfg.get("google_client_secret") or CLIENT_SECRET
+        client_id = (
+            os.environ.get("GOOGLE_CLIENT_ID")
+            or os.environ.get("GOOGLE_DRIVE_CLIENT_ID")
+            or cfg.get("google_client_id")
+            or CLIENT_ID
+        )
+        client_secret = (
+            os.environ.get("GOOGLE_CLIENT_SECRET")
+            or os.environ.get("GOOGLE_DRIVE_CLIENT_SECRET")
+            or cfg.get("google_client_secret")
+            or CLIENT_SECRET
+        )
 
         url = "https://oauth2.googleapis.com/token"
         data = {
