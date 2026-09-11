@@ -1103,7 +1103,7 @@ def sync_supabase_endpoint(bg_tasks: BackgroundTasks):
         try:
             import supabase_sync
             recs = list_recordings_from_drive()
-            host_base = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_API_URL", "https://tiktok-api-as2y.onrender.com")
+            host_base = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_API_URL", "https://tiktok-api-i0o8.onrender.com")
             for r in recs:
                 u = r["user"]
                 fn = r["filename"]
