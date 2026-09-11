@@ -88,14 +88,17 @@ def save_cookies(cookies_dict):
             pass
 
 
-def generate_guest_session() -> requests.Session:
+def generate_guest_session(proxy: Optional[str] = None) -> requests.Session:
     """
     Tạo phiên khách vô danh mới với browser fingerprint ngẫu nhiên để lấy cookie khách sạch sẽ,
     vượt qua cơ chế giới hạn IP/phiên của TikTok khi xem luồng preview Sub-Only.
     """
     impersonates = ["chrome136", "chrome131", "chrome124", "safari17_0", "edge101"]
     chosen_browser = random.choice(impersonates)
-    session = requests.Session(impersonate=chosen_browser)
+    session_kwargs = {"impersonate": chosen_browser}
+    if proxy:
+        session_kwargs["proxies"] = {"http": proxy, "https": proxy}
+    session = requests.Session(**session_kwargs)
     try:
         chrome_vers = ["126.0.6478.127", "128.0.6613.85", "131.0.6778.86", "133.0.6943.53", "136.0.7024.12"]
         ver = random.choice(chrome_vers)
@@ -121,7 +124,7 @@ def generate_guest_session() -> requests.Session:
             pass
         raise
 
-def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
+def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optional[str] = None) -> dict:
     """
     Trích xuất thông tin chi tiết phiên live:
     - is_live: bool
@@ -184,7 +187,10 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
     try:
         if cookies is None:
             cookies = load_cookies()
-        session = requests.Session(impersonate="chrome136")
+        session_kwargs = {"impersonate": "chrome136"}
+        if proxy:
+            session_kwargs["proxies"] = {"http": proxy, "https": proxy}
+        session = requests.Session(**session_kwargs)
         if cookies:
             session.cookies.update(cookies)
 
@@ -333,9 +339,9 @@ def check_live_status(user: str) -> Tuple[bool, Optional[str]]:
 
 check_user_live = check_live_status
 
-def get_live_stream_url(room_id, user=None, cookies=None, session=None):
+def get_live_stream_url(room_id, user=None, cookies=None, session=None, proxy=None):
     try:
-        urls = get_stream_urls(room_id, user, cookies=cookies, session=session)
+        urls = get_stream_urls(room_id, user, cookies=cookies, session=session, proxy=proxy)
         if isinstance(urls, list) and urls:
             return urls[0]
         return None
@@ -374,7 +380,7 @@ def parse_sdk_stream_data(sdk_data_str: str) -> list:
         pass
     return candidates
 
-def get_stream_urls(room_id, user, cookies=None, session=None):
+def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
     """
     Extract candidate stream URLs (FLV or HLS / m3u8).
     Supports 18+ restricted streams using authenticated sessionid cookies or custom guest session.
@@ -411,7 +417,10 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
         if owns_session:
             if cookies is None:
                 cookies = load_cookies()
-            session = requests.Session(impersonate="chrome136")
+            session_kwargs = {"impersonate": "chrome136"}
+            if proxy:
+                session_kwargs["proxies"] = {"http": proxy, "https": proxy}
+            session = requests.Session(**session_kwargs)
             session_to_close = session
             if cookies:
                 session.cookies.update(cookies)
@@ -452,6 +461,9 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
             except Exception:
                 pass
 
+        candidates = []
+        stream_url_obj = {}
+
         # Second attempt: Webcast room/info API (chỉ gọi khi có room_id)
         if room_id:
             url = f"https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id={room_id}"
@@ -475,7 +487,6 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
             room_data = room_data if isinstance(room_data, dict) else {}
             stream_url_obj = room_data.get("stream_url") if isinstance(room_data, dict) else {}
             stream_url_obj = stream_url_obj if isinstance(stream_url_obj, dict) else {}
-            candidates = []
 
             sdk_data_str = (
                 stream_url_obj.get("live_core_sdk_data", {})
@@ -514,17 +525,17 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
                 except Exception:
                     pass
 
-        # Fallback to direct URLs: FULL_HD1 (1080p) first, then HD1 (720p)
-        flv_pull = stream_url_obj.get("flv_pull_url") or {}
-        if isinstance(flv_pull, dict):
-            for k in ("FULL_HD1", "HD1", "SD2", "SD1"):
-                u = flv_pull.get(k)
-                if u and u not in candidates:
-                    candidates.append(u)
+            # Fallback to direct URLs: FULL_HD1 (1080p) first, then HD1 (720p)
+            flv_pull = stream_url_obj.get("flv_pull_url") or {}
+            if isinstance(flv_pull, dict):
+                for k in ("FULL_HD1", "HD1", "SD2", "SD1"):
+                    u = flv_pull.get(k)
+                    if u and u not in candidates:
+                        candidates.append(u)
 
-        hls_pull = stream_url_obj.get("hls_pull_url")
-        if hls_pull and hls_pull not in candidates:
-            candidates.append(hls_pull)
+            hls_pull = stream_url_obj.get("hls_pull_url")
+            if hls_pull and hls_pull not in candidates:
+                candidates.append(hls_pull)
 
         return candidates
     except Exception:
@@ -623,6 +634,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
     cmd.append(output_filename)
 
     start_time = time.time()
+    proc = None
     try:
         proc = subprocess.Popen(
             cmd,
@@ -711,10 +723,13 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
             sys.stdout.write(f"\r🔴 Đang ghi hình: [{hours:02d}:{mins:02d}:{secs:02d}] - Dung lượng: {size_mb:.2f} MB")
             sys.stdout.flush()
 
-        _safe_stop_ffmpeg(proc, timeout=6)
     except KeyboardInterrupt:
         print("\n\n[!] Nhận lệnh dừng từ người dùng. Đang đóng gói file video...")
-        _safe_stop_ffmpeg(proc, timeout=8)
+    except Exception as e:
+        print(f"\n[!] Lỗi trong tiến trình ghi hình: {e}")
+    finally:
+        if proc:
+            _safe_stop_ffmpeg(proc, timeout=6)
 
     if os.path.exists(output_filename):
         from auto_h264 import validate_playable_video

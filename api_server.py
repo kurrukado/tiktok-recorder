@@ -351,109 +351,111 @@ def get_active_recordings():
 
 @app.get("/api/users")
 def get_users(check_live: bool = True):
-    users_list = []
-
-    # 1. Nguồn dữ liệu số 1: Supabase Database (đồng bộ tức thì từ Web)
-    supa_users = []
     try:
-        import supabase_sync
-        supa_users = supabase_sync.fetch_streamers_from_supabase()
-        if supa_users:
-            users_list.extend(supa_users)
-    except Exception as e:
-        print(f"[!] Lỗi nạp streamers từ Supabase: {e}")
+        users_list = []
 
-    # 2. Nguồn dữ liệu số 2: Google Drive
-    drive_users = []
-    try:
-        d_users = gdrive_manager.load_streamers_from_drive()
-        if d_users is not None and isinstance(d_users, list):
-            drive_users = [u.strip().replace("@", "").lower() for u in d_users if u.strip()]
-            users_list.extend(drive_users)
-    except Exception as e:
-        print(f"[!] Lỗi nạp streamers từ Drive: {e}")
-
-    # 3. Nguồn dữ liệu số 3: config.json local
-    cfg = load_config()
-    cfg_users = cfg.get("monitored_users", [])
-    if cfg_users:
-        users_list.extend(cfg_users)
-
-    # Khử trùng lặp và giữ thứ tự chuẩn
-    users = list(dict.fromkeys([u.strip().replace("@", "").lower() for u in users_list if u.strip()]))
-
-    # Tự động đồng bộ lên Drive nếu Supabase có streamer mới
-    if supa_users and (set(supa_users) - set(drive_users)):
+        # 1. Nguồn dữ liệu số 1: Supabase Database (đồng bộ tức thì từ Web)
+        supa_users = []
         try:
-            gdrive_manager.save_streamers_to_drive(users)
-            for u in supa_users:
-                if u not in drive_users:
-                    gdrive_manager.create_streamer_folder_drive(u)
+            import supabase_sync
+            supa_users = supabase_sync.fetch_streamers_from_supabase()
+            if supa_users:
+                users_list.extend(supa_users)
+        except Exception as e:
+            print(f"[!] Lỗi nạp streamers từ Supabase: {e}")
+
+        # 2. Nguồn dữ liệu số 2: Google Drive
+        drive_users = []
+        try:
+            d_users = gdrive_manager.load_streamers_from_drive()
+            if d_users is not None and isinstance(d_users, list):
+                drive_users = [u.strip().replace("@", "").lower() for u in d_users if u.strip()]
+                users_list.extend(drive_users)
+        except Exception as e:
+            print(f"[!] Lỗi nạp streamers từ Drive: {e}")
+
+        # 3. Nguồn dữ liệu số 3: config.json local
+        cfg = load_config()
+        cfg_users = cfg.get("monitored_users", [])
+        if cfg_users:
+            users_list.extend(cfg_users)
+
+        # Khử trùng lặp và giữ thứ tự chuẩn
+        users = list(dict.fromkeys([u.strip().replace("@", "").lower() for u in users_list if u.strip()]))
+
+        # Tự động đồng bộ lên Drive nếu Supabase có streamer mới
+        if supa_users and (set(supa_users) - set(drive_users)):
+            try:
+                gdrive_manager.save_streamers_to_drive(users)
+                for u in supa_users:
+                    if u not in drive_users:
+                        gdrive_manager.create_streamer_folder_drive(u)
+            except Exception:
+                pass
+
+        active_users = set()
+        try:
+            drive_act = gdrive_manager.load_active_recordings_from_drive()
+            if drive_act:
+                active_users.update(drive_act)
+        except Exception:
+            pass
+        active_users.update(ACTIVE_RECORDING_TASKS.keys())
+        
+        # Kiểm tra live đa luồng song song (ThreadPoolExecutor) để tốc độ siêu nhanh
+        live_statuses = {}
+        if check_live and users:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users), 3)) as executor:
+                future_to_user = {executor.submit(get_user_live_details_cached, u): u for u in users}
+                for fut in concurrent.futures.as_completed(future_to_user):
+                    u = future_to_user[fut]
+                    try:
+                        live_statuses[u] = fut.result()
+                    except Exception:
+                        live_statuses[u] = {"is_live": False, "room_id": None, "is_sub_only": False, "is_preview": False}
+
+        # Tự động quét dọn dẹp Zombie Recording
+        try:
+            zombies_cleaned = clean_zombie_recordings(live_statuses=live_statuses)
+            for z in zombies_cleaned:
+                active_users.discard(z)
         except Exception:
             pass
 
-    active_users = set()
-    try:
-        drive_act = gdrive_manager.load_active_recordings_from_drive()
-        if drive_act:
-            active_users.update(drive_act)
-    except Exception:
-        pass
-    active_users.update(ACTIVE_RECORDING_TASKS.keys())
-    
-    # Kiểm tra live đa luồng song song (ThreadPoolExecutor) để tốc độ siêu nhanh
-    live_statuses = {}
-    if check_live and users:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users), 3)) as executor:
-            future_to_user = {executor.submit(get_user_live_details_cached, u): u for u in users}
-            for fut in concurrent.futures.as_completed(future_to_user):
-                u = future_to_user[fut]
-                try:
-                    live_statuses[u] = fut.result()
-                except Exception:
-                    live_statuses[u] = {"is_live": False, "room_id": None, "is_sub_only": False, "is_preview": False}
+        result = []
+        for u in users:
+            det = live_statuses.get(u, {})
+            is_live = det.get("is_live", False)
+            room_id = det.get("room_id")
+            is_sub_only = det.get("is_sub_only", False)
+            is_preview = det.get("is_preview", False)
+            is_recording = (u in active_users)
+            if is_recording:
+                status_str = "recording"
+                is_live = True
+            elif is_live:
+                status_str = "live"
+            else:
+                status_str = "offline"
+            result.append({
+                "username": u,
+                "is_live": is_live,
+                "room_id": room_id,
+                "is_recording": is_recording,
+                "status": status_str,
+                "is_sub_only": is_sub_only,
+                "is_preview": is_preview
+            })
 
-    # Tự động quét dọn dẹp Zombie Recording
-    try:
-        zombies_cleaned = clean_zombie_recordings(live_statuses=live_statuses)
-        for z in zombies_cleaned:
-            active_users.discard(z)
-    except Exception:
-        pass
-
-    result = []
-    for u in users:
-        det = live_statuses.get(u, {})
-        is_live = det.get("is_live", False)
-        room_id = det.get("room_id")
-        is_sub_only = det.get("is_sub_only", False)
-        is_preview = det.get("is_preview", False)
-        is_recording = (u in active_users)
-        if is_recording:
-            status_str = "recording"
-            is_live = True
-        elif is_live:
-            status_str = "live"
-        else:
-            status_str = "offline"
-        result.append({
-            "username": u,
-            "is_live": is_live,
-            "room_id": room_id,
-            "is_recording": is_recording,
-            "status": status_str,
-            "is_sub_only": is_sub_only,
-            "is_preview": is_preview
-        })
-    # Thu hồi RAM sau khi xử lý endpoint nặng (curl_cffi C-level memory)
-    gc.collect()
-
-    return {
-        "users": result,
-        "streamers": users,
-        "total": len(users),
-        "currently_recording": list(active_users)
-    }
+        return {
+            "users": result,
+            "streamers": users,
+            "total": len(users),
+            "currently_recording": list(active_users)
+        }
+    finally:
+        # Thu hồi RAM sau khi xử lý endpoint nặng (curl_cffi C-level memory)
+        gc.collect()
 
 @app.get("/api/memory")
 def get_memory_usage():
@@ -634,75 +636,77 @@ def get_version():
 
 @app.get("/api/test-live/{username}")
 def test_live_diagnostic(username: str):
-    user = username.strip().replace("@", "").lower()
-    import traceback
-    out = {"user": user, "api_version": "2.2.0"}
     try:
-        raw_det = recorder_core.check_live_details(user)
-        out["check_live_details"] = raw_det
-    except Exception as e:
-        out["check_live_details_error"] = traceback.format_exc()
+        user = username.strip().replace("@", "").lower()
+        import traceback
+        out = {"user": user, "api_version": "2.2.0"}
+        try:
+            raw_det = recorder_core.check_live_details(user)
+            out["check_live_details"] = raw_det
+        except Exception as e:
+            out["check_live_details_error"] = traceback.format_exc()
 
-    try:
-        s_live, s_rid = recorder_core.check_live_status(user)
-        out["check_live_status"] = {"is_live": s_live, "room_id": s_rid}
-    except Exception as e:
-        out["check_live_status_error"] = traceback.format_exc()
+        try:
+            s_live, s_rid = recorder_core.check_live_status(user)
+            out["check_live_status"] = {"is_live": s_live, "room_id": s_rid}
+        except Exception as e:
+            out["check_live_status_error"] = traceback.format_exc()
 
-    # Thử nghiệm trực tiếp TikTok Native API
-    try:
-        from curl_cffi import requests as c_req
-        api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
-        r_nat = c_req.get(api_url, impersonate="safari15_5", timeout=7)
-        out["native_api"] = {
-            "status_code": r_nat.status_code,
-            "text_len": len(r_nat.text),
-            "is_json": False
-        }
-        if r_nat.status_code == 200:
-            try:
-                j = r_nat.json()
-                if isinstance(j, dict):
-                    out["native_api"]["is_json"] = True
-                    d = j.get("data")
-                    d = d if isinstance(d, dict) else {}
-                    lr = d.get("liveRoom")
-                    lr = lr if isinstance(lr, dict) else {}
-                    u = d.get("user")
-                    u = u if isinstance(u, dict) else {}
-                    out["native_api"]["status"] = lr.get("status")
-                    out["native_api"]["roomId"] = u.get("roomId") or lr.get("roomId")
-            except Exception as j_err:
-                out["native_api"]["json_error"] = str(j_err)
+        # Thử nghiệm trực tiếp TikTok Native API
+        try:
+            from curl_cffi import requests as c_req
+            api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
+            r_nat = c_req.get(api_url, impersonate="safari15_5", timeout=7)
+            out["native_api"] = {
+                "status_code": r_nat.status_code,
+                "text_len": len(r_nat.text),
+                "is_json": False
+            }
+            if r_nat.status_code == 200:
+                try:
+                    j = r_nat.json()
+                    if isinstance(j, dict):
+                        out["native_api"]["is_json"] = True
+                        d = j.get("data")
+                        d = d if isinstance(d, dict) else {}
+                        lr = d.get("liveRoom")
+                        lr = lr if isinstance(lr, dict) else {}
+                        u = d.get("user")
+                        u = u if isinstance(u, dict) else {}
+                        out["native_api"]["status"] = lr.get("status")
+                        out["native_api"]["roomId"] = u.get("roomId") or lr.get("roomId")
+                except Exception as j_err:
+                    out["native_api"]["json_error"] = str(j_err)
+                    out["native_api"]["text_preview"] = r_nat.text[:200]
+            else:
                 out["native_api"]["text_preview"] = r_nat.text[:200]
-        else:
-            out["native_api"]["text_preview"] = r_nat.text[:200]
-    except Exception as e:
-        out["native_api_error"] = traceback.format_exc()
+        except Exception as e:
+            out["native_api_error"] = traceback.format_exc()
 
-    sess = None
-    try:
-        from curl_cffi import requests as c_req
-        sess = c_req.Session(impersonate="chrome136")
-        r = sess.get(f"https://www.tiktok.com/@{user}/live", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        out["direct_scrape"] = {
-            "status_code": r.status_code,
-            "text_len": len(r.text),
-            "has_SIGI": '<script id="SIGI_STATE"' in r.text,
-            "has_roomId": bool(re.search(r'"roomId"[:"]+(\d{15,25})', r.text)),
-            "status_match": re.findall(r'"status":\s*(\d+)', r.text)[:5]
-        }
-    except Exception as e:
-        out["direct_scrape_error"] = traceback.format_exc()
+        sess = None
+        try:
+            from curl_cffi import requests as c_req
+            sess = c_req.Session(impersonate="chrome136")
+            r = sess.get(f"https://www.tiktok.com/@{user}/live", headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
+            out["direct_scrape"] = {
+                "status_code": r.status_code,
+                "text_len": len(r.text),
+                "has_SIGI": '<script id="SIGI_STATE"' in r.text,
+                "has_roomId": bool(re.search(r'"roomId"[:"]+(\d{15,25})', r.text)),
+                "status_match": re.findall(r'"status":\s*(\d+)', r.text)[:5]
+            }
+        except Exception as e:
+            out["direct_scrape_error"] = traceback.format_exc()
+        finally:
+            if sess:
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+
+        return out
     finally:
-        if sess:
-            try:
-                sess.close()
-            except Exception:
-                pass
-
-    gc.collect()
-    return out
+        gc.collect()
 
 def concat_mp4_segments(segment_files, output_file):
     """
@@ -771,6 +775,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
     part_number = 1
     consecutive_failures = 0
     max_consecutive_failures = 4
+    max_vip_attempts = 5
 
     try:
         while True:
@@ -896,6 +901,9 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             if not part_segments:
                 if consecutive_failures >= max_consecutive_failures:
                     break
+                if is_sub_only and part_number >= max_vip_attempts:
+                    print(f"🛑 [@{user}] Đã đạt giới hạn tối đa {max_vip_attempts} lần xoay Guest Session preview Sub-Only. Kết thúc luồng.")
+                    break
                 time.sleep(5)
                 continue
 
@@ -943,6 +951,10 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                         os.remove(final_rec_file)
                     except Exception:
                         pass
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    print(f"⏸️ [@{user}] Gặp {consecutive_failures} lỗi tạo video liên tiếp. Dừng luồng ghi hình.")
+                    break
                 continue
 
             consecutive_failures = 0
@@ -994,6 +1006,10 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                             pass
 
             part_number += 1
+
+            if is_sub_only and part_number > max_vip_attempts:
+                print(f"🛑 [@{user}] Đã đạt giới hạn tối đa {max_vip_attempts} lần xoay Guest Session preview Sub-Only. Kết thúc luồng.")
+                break
 
             if stop_event and stop_event.is_set():
                 break
@@ -1466,8 +1482,15 @@ def stream_video_by_id(file_id: str, request: Request):
         if "Content-Disposition" in drive_resp.headers:
             resp_headers["Content-Disposition"] = "inline"
 
+        def _stream_iterator():
+            try:
+                for chunk in drive_resp.iter_content(chunk_size=128 * 1024):
+                    yield chunk
+            finally:
+                drive_resp.close()
+
         return StreamingResponse(
-            drive_resp.iter_content(chunk_size=128 * 1024),
+            _stream_iterator(),
             status_code=drive_resp.status_code,
             headers=resp_headers
         )

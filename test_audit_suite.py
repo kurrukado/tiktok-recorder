@@ -604,7 +604,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
              patch("recorder_core.check_live_details", return_value={"is_live": True, "is_sub_only": True, "room_id": "111"}), \
              patch("gdrive_manager.set_user_recording_status_drive"), \
              patch("gdrive_manager.create_streamer_folder_drive"), \
-             patch("time.sleep"):
+             patch.object(time, "sleep"):
 
             stop_ev = threading.Event()
             # Run worker; should encounter consecutive failures and break out safely without infinite loop
@@ -661,6 +661,183 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
             res = cloud_daemon.discover_new_streamers("someuser")
             self.assertEqual(res, [])
             mock_s.close.assert_called_once()
+
+    def test_bg_record_worker_infinite_retry_prevention(self):
+        """
+        Adversarial Test: Verify bg_record_worker in api_server prevents infinite busy loops:
+        - When final_rec_file validation fails, increments consecutive_failures and stops after max_consecutive_failures.
+        - When room is VIP sub-only and preview generation fails, stops after max_vip_attempts.
+        """
+        import api_server
+
+        # 1. Video validation failure stops after 4 consecutive failures
+        with patch("api_server.get_user_live_details_cached", return_value={"is_live": True, "room_id": "999", "is_sub_only": False}), \
+             patch("recorder_core.get_live_stream_url", return_value="https://live.tiktok.com/stream.flv"), \
+             patch("recorder_core.record_stream_ffmpeg", return_value="mock_invalid.mp4"), \
+             patch("auto_h264.validate_playable_video", side_effect=[
+                 (True, "seg ok", 10.0),             # seg validation passes
+                 (False, "corrupt container", 0.0),  # final file validation fails (failure 1)
+                 (True, "seg ok", 10.0),
+                 (False, "corrupt container", 0.0),  # (failure 2)
+                 (True, "seg ok", 10.0),
+                 (False, "corrupt container", 0.0),  # (failure 3)
+                 (True, "seg ok", 10.0),
+                 (False, "corrupt container", 0.0),  # (failure 4 -> breaks out!)
+             ]), \
+             patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.remove"), \
+             patch.object(time, "sleep"):
+
+            # Run worker; should encounter consecutive failures and break cleanly without infinite loop
+            api_server.bg_record_worker("worker_test_user")
+
+        # 2. Sub-only preview reaches max_vip_attempts
+        with patch("api_server.get_user_live_details_cached", return_value={"is_live": True, "room_id": "999", "is_sub_only": True}), \
+             patch("recorder_core.generate_guest_session", side_effect=RuntimeError("Captcha")), \
+             patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch.object(time, "sleep"):
+
+            api_server.bg_record_worker("vip_worker_user")
+
+    def test_gc_collect_exception_safety_in_api_server(self):
+        """
+        Adversarial Test: Verify that gc.collect() is called in get_users() and
+        test_live_diagnostic() even when partial exceptions or unexpected errors occur.
+        """
+        import api_server
+
+        # 1. get_users raises unexpected exception during user fetching
+        with patch("supabase_sync.fetch_streamers_from_supabase", side_effect=TypeError("Unexpected mock failure")), \
+             patch("api_server.clean_zombie_recordings", side_effect=RuntimeError("Zombie cleaner crash")), \
+             patch("gc.collect") as mock_gc:
+
+            try:
+                api_server.get_users()
+            except Exception:
+                pass
+            mock_gc.assert_called()
+
+        # 2. test_live_diagnostic raises exception during processing
+        with patch("recorder_core.check_live_details", side_effect=ValueError("Test crash")), \
+             patch("gc.collect") as mock_gc:
+
+            res = api_server.test_live_diagnostic("error_user")
+            mock_gc.assert_called()
+            self.assertIn("error_user", res.get("user", ""))
+
+    def test_get_stream_urls_no_room_id_and_unbound_variable(self):
+        """
+        Adversarial Test: Verify get_stream_urls(room_id=None, user='someuser')
+        executes cleanly without UnboundLocalError when HTML scraping returns no streams.
+        """
+        import recorder_core
+
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s.cookies = {}
+            mock_s_cls.return_value = mock_s
+            mock_resp = MagicMock(status_code=200, text="<html>No streams here</html>")
+            mock_s.get.return_value = mock_resp
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                # When room_id is None, candidates and stream_url_obj must be safely initialized
+                urls = recorder_core.get_stream_urls(room_id=None, user="unbound_test_user", session=None)
+                self.assertEqual(urls, [])
+                mock_s.close.assert_called_once()
+
+    def test_proxy_resilience_and_session_cleanup(self):
+        """
+        Adversarial Test: Verify proxy parameter handling and proxy failure resilience
+        (proxy timeout, connection reset, 407 Proxy Auth failure) across:
+        - generate_guest_session
+        - check_live_details
+        - get_stream_urls
+        Ensures sessions are 100% closed and no unhandled crashes occur.
+        """
+        import recorder_core
+
+        # 1. generate_guest_session accepts proxy and properly sets proxies
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s_cls.return_value = mock_s
+
+            sess = recorder_core.generate_guest_session(proxy="http://user:pass@1.2.3.4:8080")
+            self.assertEqual(sess, mock_s)
+            mock_s_cls.assert_called_with(impersonate=mock_s_cls.call_args[1]["impersonate"],
+                                          proxies={"http": "http://user:pass@1.2.3.4:8080",
+                                                   "https": "http://user:pass@1.2.3.4:8080"})
+
+        # 2. check_live_details with proxy connection reset / 407 error closes session
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s_cls.return_value = mock_s
+            mock_s.get.side_effect = ConnectionResetError("407 Proxy Authentication Required")
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                det = recorder_core.check_live_details("proxy_fail_user", proxy="http://bad-proxy:8080")
+                self.assertFalse(det["is_live"])
+                mock_s.close.assert_called_once()
+
+        # 3. get_stream_urls with proxy timeout closes owned session
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s_cls.return_value = mock_s
+            mock_s.get.side_effect = TimeoutError("Proxy connect timed out")
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                urls = recorder_core.get_stream_urls("12345", user="proxy_user", session=None, proxy="http://proxy:8080")
+                self.assertEqual(urls, [])
+                mock_s.close.assert_called_once()
+
+    def test_record_stream_ffmpeg_process_cleanup_on_exception(self):
+        """
+        Adversarial Test: Verify that record_stream_ffmpeg always cleans up proc in finally:
+        even if an unexpected exception occurs inside the recording loop.
+        """
+        import recorder_core
+
+        mock_proc = MagicMock()
+        mock_proc.poll.side_effect = [None, None]  # First 2 calls running, then exception
+        mock_proc.stdin = MagicMock()
+
+        with patch("subprocess.Popen", return_value=mock_proc), \
+             patch("time.sleep", side_effect=RuntimeError("Unexpected error inside recording loop")), \
+             patch("os.path.exists", return_value=False), \
+             patch("shutil.which", return_value="/usr/bin/ffmpeg"):
+
+            try:
+                recorder_core.record_stream_ffmpeg("http://test.flv", output_filename="dummy.mp4")
+            except RuntimeError:
+                pass
+
+            # Verify _safe_stop_ffmpeg attempted to stop the proc
+            self.assertTrue(mock_proc.wait.called or mock_proc.terminate.called or mock_proc.kill.called or mock_proc.stdin.write.called)
+
+    def test_streaming_response_socket_closure(self):
+        """
+        Adversarial Test: Verify that stream_video_by_id wraps drive_resp in an iterator
+        that ensures drive_resp.close() is called when the client finishes or disconnects.
+        """
+        import api_server
+
+        mock_drive_resp = MagicMock()
+        mock_drive_resp.status_code = 200
+        mock_drive_resp.headers = {"Content-Type": "video/mp4", "Content-Length": "100"}
+        mock_drive_resp.iter_content.return_value = [b"chunk1", b"chunk2"]
+
+        with patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("requests.get", return_value=mock_drive_resp):
+
+            client = TestClient(api_server.app)
+            resp = client.get("/api/stream-video-id/file_123")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.content, b"chunk1chunk2")
+            mock_drive_resp.close.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()
