@@ -154,6 +154,7 @@ def discover_new_streamers(current_user):
     """
     Tự động phát hiện đối thủ PK, khách mời co-host hoặc streamer liên quan từ trang Live.
     """
+    s = None
     try:
         from curl_cffi import requests
         cookies = recorder_core.load_cookies()
@@ -171,6 +172,12 @@ def discover_new_streamers(current_user):
         return list(found)
     except Exception:
         return []
+    finally:
+        if s:
+            try:
+                s.close()
+            except Exception:
+                pass
 
 MAX_CONCURRENT_RECORDERS = 10  # Tối đa 10 streamer ghi hình cùng lúc
 MAX_CHUNK_SECONDS = 3600       # Đúng 1 tiếng (1h = 3600s), tự động tách video và up lên Cloud
@@ -261,7 +268,13 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     if is_sub_only:
                         log(f"🔄 [@{user}] Tạo phiên khách vô danh mới (Guest Session) để lấy link preview Sub-Only Phần {part_number}...")
                         guest_session = recorder_core.generate_guest_session()
-                        stream_url = recorder_core.get_live_stream_url(current_room_id, user=user, session=guest_session)
+                        try:
+                            stream_url = recorder_core.get_live_stream_url(current_room_id, user=user, session=guest_session)
+                        finally:
+                            try:
+                                guest_session.close()
+                            except Exception:
+                                pass
                     else:
                         stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
                     
