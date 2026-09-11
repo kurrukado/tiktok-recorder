@@ -42,11 +42,34 @@ import auto_h264
 import gdrive_manager
 import notifier
 import supabase_sync
+from contextlib import asynccontextmanager
+
+ACTIVE_RECORDING_TASKS = {}
+RECORDING_LOCK = threading.Lock()
+
+def shutdown_all_recording_tasks():
+    """
+    Dừng an toàn tất cả các tiến trình ghi hình khi server tắt hoặc nhận tín hiệu SIGTERM/SIGINT.
+    Gửi tín hiệu stop_event để FFmpeg chốt moov atom chuẩn MP4, tránh hỏng video.
+    """
+    with RECORDING_LOCK:
+        active_list = list(ACTIVE_RECORDING_TASKS.items())
+        for u, info in active_list:
+            if isinstance(info, dict):
+                se = info.get("stop_event")
+                if se:
+                    se.set()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    shutdown_all_recording_tasks()
 
 app = FastAPI(
     title="TikTok Live Recorder & Cloud Sync API",
     description="API kết nối web: thêm streamer, kiểm tra live, ghi hình chuẩn H.264, cắt ảnh xem trước (thumbnail) giữa video và tải video tốc độ cao.",
-    version="2.1.0"
+    version="2.1.0",
+    lifespan=lifespan
 )
 
 # Enable CORS for any external web integration
@@ -57,9 +80,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-ACTIVE_RECORDING_TASKS = {}
-RECORDING_LOCK = threading.Lock()
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -642,9 +662,16 @@ def test_live_diagnostic(username: str):
         if r_nat.status_code == 200:
             try:
                 j = r_nat.json()
-                out["native_api"]["is_json"] = True
-                out["native_api"]["status"] = j.get("data", {}).get("liveRoom", {}).get("status")
-                out["native_api"]["roomId"] = j.get("data", {}).get("user", {}).get("roomId") or j.get("data", {}).get("liveRoom", {}).get("roomId")
+                if isinstance(j, dict):
+                    out["native_api"]["is_json"] = True
+                    d = j.get("data")
+                    d = d if isinstance(d, dict) else {}
+                    lr = d.get("liveRoom")
+                    lr = lr if isinstance(lr, dict) else {}
+                    u = d.get("user")
+                    u = u if isinstance(u, dict) else {}
+                    out["native_api"]["status"] = lr.get("status")
+                    out["native_api"]["roomId"] = u.get("roomId") or lr.get("roomId")
             except Exception as j_err:
                 out["native_api"]["json_error"] = str(j_err)
                 out["native_api"]["text_preview"] = r_nat.text[:200]
@@ -780,7 +807,22 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
 
                 stream_url = None
                 for s_att in range(3):
-                    stream_url = recorder_core.get_live_stream_url(room_id, user=user)
+                    if is_sub_only:
+                        guest_session = None
+                        try:
+                            guest_session = recorder_core.generate_guest_session()
+                            stream_url = recorder_core.get_live_stream_url(room_id, user=user, session=guest_session)
+                        except Exception as gs_err:
+                            print(f"[!] [API Server] Lỗi xoay Guest Session cho @{user}: {gs_err}")
+                            stream_url = None
+                        finally:
+                            if guest_session:
+                                try:
+                                    guest_session.close()
+                                except Exception:
+                                    pass
+                    else:
+                        stream_url = recorder_core.get_live_stream_url(room_id, user=user)
                     if stream_url:
                         break
                     time.sleep(2.5)
@@ -1477,6 +1519,17 @@ def stream_video(user: str, filename: str, request: Request):
 def trigger_gdrive_sync(bg_tasks: BackgroundTasks):
     bg_tasks.add_task(gdrive_manager.sync_all_to_gdrive)
     return {"message": "Đã kích hoạt tiến trình đồng bộ toàn bộ video lên Google Drive ngầm"}
+
+import signal
+
+def _signal_handler(sig, frame):
+    shutdown_all_recording_tasks()
+
+try:
+    signal.signal(signal.SIGTERM, _signal_handler)
+    signal.signal(signal.SIGINT, _signal_handler)
+except Exception:
+    pass
 
 if __name__ == "__main__":
     import uvicorn

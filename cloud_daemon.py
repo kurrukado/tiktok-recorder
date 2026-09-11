@@ -155,6 +155,8 @@ def discover_new_streamers(current_user):
     """
     Tự động phát hiện đối thủ PK, khách mời co-host hoặc streamer liên quan từ trang Live.
     """
+    if not current_user:
+        return []
     s = None
     try:
         from curl_cffi import requests
@@ -166,11 +168,13 @@ def discover_new_streamers(current_user):
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }, timeout=8)
-        found = set(re.findall(r'"uniqueId":"([a-zA-Z0-9_\.]+)"', resp.text))
-        found.discard(current_user.lower())
-        for sys_id in ["tiktok", "live", "admin", "help", "privacy"]:
-            found.discard(sys_id)
-        return list(found)
+        if resp.status_code == 200 and len(resp.text) <= 3 * 1024 * 1024:
+            found = set(re.findall(r'"uniqueId":"([a-zA-Z0-9_\.]+)"', resp.text))
+            found.discard(current_user.lower())
+            for sys_id in ["tiktok", "live", "admin", "help", "privacy"]:
+                found.discard(sys_id)
+            return list(found)
+        return []
     except Exception:
         return []
     finally:
@@ -268,14 +272,19 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 for s_attempt in range(3):
                     if is_sub_only:
                         log(f"🔄 [@{user}] Tạo phiên khách vô danh mới (Guest Session) để lấy link preview Sub-Only Phần {part_number}...")
-                        guest_session = recorder_core.generate_guest_session()
+                        guest_session = None
                         try:
+                            guest_session = recorder_core.generate_guest_session()
                             stream_url = recorder_core.get_live_stream_url(current_room_id, user=user, session=guest_session)
+                        except Exception as gs_err:
+                            log(f"[!] Lỗi khi lấy link preview Sub-Only cho @{user}: {gs_err}")
+                            stream_url = None
                         finally:
-                            try:
-                                guest_session.close()
-                            except Exception:
-                                pass
+                            if guest_session:
+                                try:
+                                    guest_session.close()
+                                except Exception:
+                                    pass
                     else:
                         stream_url = recorder_core.get_live_stream_url(current_room_id, user=user)
                     
@@ -358,6 +367,10 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
 
             if not part_segments:
                 if consecutive_failures >= max_consecutive_failures:
+                    log(f"⏸️ [@{user}] Gặp {consecutive_failures} lỗi liên tiếp. Dừng luồng ghi hình.")
+                    break
+                if is_sub_only and part_number >= max_vip_attempts:
+                    log(f"🛑 [@{user}] Đã đạt giới hạn tối đa {max_vip_attempts} lần xoay Guest Session preview Sub-Only. Kết thúc luồng.")
                     break
                 time.sleep(5)
                 continue
@@ -398,6 +411,10 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                         os.remove(final_rec_file)
                     except Exception:
                         pass
+                consecutive_failures += 1
+                if consecutive_failures >= max_consecutive_failures:
+                    log(f"⏸️ [@{user}] Gặp {consecutive_failures} lỗi tạo video liên tiếp. Dừng luồng ghi hình.")
+                    break
                 continue
 
             consecutive_failures = 0

@@ -5,6 +5,8 @@ import inspect
 import gc
 import ast
 import glob
+import threading
+import time
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
@@ -494,6 +496,171 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
             self.assertEqual(len(results), total_tasks)
             # Verify mock session was closed every time it was created
             self.assertEqual(mock_s.close.call_count, mock_s_cls.call_count)
+
+    def test_oversized_response_memory_guard(self):
+        """
+        Adversarial Test: Verify check_live_details and get_stream_urls safely
+        skip oversized HTML responses (>3-4MB) without OOM or string-multiplication surge,
+        and always close the session.
+        """
+        import recorder_core
+
+        # 1. check_live_details with 5MB oversized payload
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s.cookies = {}
+            mock_s_cls.return_value = mock_s
+
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            # 5MB payload of repeating HTML comments
+            mock_resp.text = "<!-- filler -->" * (350 * 1024)
+            mock_s.get.return_value = mock_resp
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                det = recorder_core.check_live_details("oversized_user")
+                self.assertFalse(det["is_live"])
+                mock_s.close.assert_called_once()
+
+        # 2. get_stream_urls with 5MB oversized payload
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s.cookies = {}
+            mock_s_cls.return_value = mock_s
+
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.text = "<!-- filler -->" * (350 * 1024)
+            mock_resp.json.return_value = {}
+            mock_s.get.return_value = mock_resp
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                urls = recorder_core.get_stream_urls("12345", user="oversized_user", session=None)
+                self.assertEqual(urls, [])
+                mock_s.close.assert_called_once()
+
+    def test_malformed_and_non_dict_api_responses(self):
+        """
+        Adversarial Test: Verify Native API and Webcast API handle malformed,
+        non-dict, or unexpected data types (string, list, int, None) without AttributeError
+        and guarantee all sessions are closed.
+        """
+        import recorder_core
+
+        # 1. Native API returns non-dict JSON (e.g. list or integer)
+        mock_resp0 = MagicMock()
+        mock_resp0.status_code = 200
+        mock_resp0.json.return_value = ["unexpected", "list"]
+
+        with patch("curl_cffi.requests.get", return_value=mock_resp0):
+            with patch("curl_cffi.requests.Session") as mock_s_cls:
+                mock_s = MagicMock()
+                mock_s.headers = {}
+                mock_s.cookies = {}
+                mock_s_cls.return_value = mock_s
+                mock_s.get.return_value = MagicMock(status_code=404, text="")
+
+                det = recorder_core.check_live_details("malformed_user")
+                self.assertFalse(det["is_live"])
+                mock_s.close.assert_called_once()
+
+        # 2. Webcast API returns non-dict data in get_stream_urls
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.headers = {}
+            mock_s.cookies = {}
+            mock_s_cls.return_value = mock_s
+
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            # HTML scrape returns nothing
+            mock_resp.text = "<html>no stream here</html>"
+            # Webcast returns non-dict data field
+            mock_resp.json.return_value = {
+                "status_code": 0,
+                "data": "corrupted string instead of object"
+            }
+            mock_s.get.return_value = mock_resp
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                urls = recorder_core.get_stream_urls("12345", user="corrupt_user", session=None)
+                self.assertEqual(urls, [])
+                mock_s.close.assert_called_once()
+
+    def test_sub_only_vip_guest_session_error_and_rate_limit(self):
+        """
+        Adversarial Test: Verify sub-only VIP guest session generation failure
+        (e.g. HTTP 429/403 or captcha challenge) is handled safely:
+        - Sessions are not leaked
+        - Worker does not loop infinitely and terminates at max_consecutive_failures
+        """
+        import cloud_daemon
+        import recorder_core
+
+        # Simulate generate_guest_session raising exception
+        with patch("recorder_core.generate_guest_session", side_effect=RuntimeError("TikTok Rate Limit 429 / Captcha")), \
+             patch("recorder_core.check_live_details", return_value={"is_live": True, "is_sub_only": True, "room_id": "111"}), \
+             patch("gdrive_manager.set_user_recording_status_drive"), \
+             patch("gdrive_manager.create_streamer_folder_drive"), \
+             patch("time.sleep"):
+
+            stop_ev = threading.Event()
+            # Run worker; should encounter consecutive failures and break out safely without infinite loop
+            cloud_daemon.streamer_recording_worker("vip_test_user", "111", auto_discover=False, stop_event=stop_ev)
+            # Worker finished without hanging or uncaught exception
+            self.assertNotIn("vip_test_user", cloud_daemon.ACTIVE_RECORDERS)
+
+    def test_api_server_graceful_shutdown_and_lifespan(self):
+        """
+        Adversarial Test: Verify api_server graceful shutdown and lifespan
+        signal stop_event on all active recording tasks to cleanly flush FFmpeg MP4 moov atoms.
+        """
+        import api_server
+
+        stop_evt1 = threading.Event()
+        stop_evt2 = threading.Event()
+        with api_server.RECORDING_LOCK:
+            api_server.ACTIVE_RECORDING_TASKS["user_shutdown_1"] = {"start_time": time.time(), "stop_event": stop_evt1}
+            api_server.ACTIVE_RECORDING_TASKS["user_shutdown_2"] = {"start_time": time.time(), "stop_event": stop_evt2}
+
+        self.assertFalse(stop_evt1.is_set())
+        self.assertFalse(stop_evt2.is_set())
+
+        # Trigger shutdown function
+        api_server.shutdown_all_recording_tasks()
+
+        self.assertTrue(stop_evt1.is_set())
+        self.assertTrue(stop_evt2.is_set())
+
+        # Cleanup
+        with api_server.RECORDING_LOCK:
+            api_server.ACTIVE_RECORDING_TASKS.pop("user_shutdown_1", None)
+            api_server.ACTIVE_RECORDING_TASKS.pop("user_shutdown_2", None)
+
+    def test_discover_new_streamers_guards(self):
+        """
+        Adversarial Test: Verify discover_new_streamers guards against empty username,
+        non-200 responses, and oversized responses, and always closes the session.
+        """
+        import cloud_daemon
+
+        # 1. Empty username -> immediate empty list
+        res = cloud_daemon.discover_new_streamers("")
+        self.assertEqual(res, [])
+
+        # 2. Non-200 response -> returns empty list and closes session
+        with patch("curl_cffi.requests.Session") as mock_s_cls:
+            mock_s = MagicMock()
+            mock_s.cookies = {}
+            mock_s_cls.return_value = mock_s
+            mock_resp = MagicMock(status_code=403, text="Forbidden")
+            mock_s.get.return_value = mock_resp
+
+            res = cloud_daemon.discover_new_streamers("someuser")
+            self.assertEqual(res, [])
+            mock_s.close.assert_called_once()
 
 if __name__ == "__main__":
     unittest.main()

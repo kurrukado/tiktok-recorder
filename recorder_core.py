@@ -153,24 +153,28 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
                 api_res = c_req.get(api_url, impersonate=imp, timeout=6)
                 if api_res.status_code == 200:
                     api_json = api_res.json()
-                    data = api_json.get("data") or {}
-                    live_room = data.get("liveRoom") or {}
-                    user_data = data.get("user") or {}
-                    status = live_room.get("status")
-                    room_id = user_data.get("roomId") or live_room.get("roomId")
+                    if isinstance(api_json, dict):
+                        data = api_json.get("data")
+                        data = data if isinstance(data, dict) else {}
+                        live_room = data.get("liveRoom")
+                        live_room = live_room if isinstance(live_room, dict) else {}
+                        user_data = data.get("user")
+                        user_data = user_data if isinstance(user_data, dict) else {}
+                        status = live_room.get("status")
+                        room_id = user_data.get("roomId") or live_room.get("roomId")
 
-                    if live_room.get("liveSubOnly") or live_room.get("subOnly"):
-                        details["is_sub_only"] = True
-                        details["is_preview"] = True
+                        if live_room.get("liveSubOnly") or live_room.get("subOnly"):
+                            details["is_sub_only"] = True
+                            details["is_preview"] = True
 
-                    if status == 2 and room_id:
-                        details["is_live"] = True
-                        details["room_id"] = str(room_id)
-                        return details
-                    elif status == 4:
-                        details["is_live"] = False
-                        details["room_id"] = None
-                        return details
+                        if status == 2 and room_id:
+                            details["is_live"] = True
+                            details["room_id"] = str(room_id)
+                            return details
+                        elif status == 4:
+                            details["is_live"] = False
+                            details["room_id"] = None
+                            return details
             except Exception:
                 continue
     except Exception:
@@ -192,76 +196,81 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
         }
         res = session.get(url, headers=headers, timeout=7)
         if res.status_code == 200:
-            # 1. Phân tích thẻ SIGI_STATE
-            m = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', res.text, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group(1))
-                    live_user_info = data.get("LiveRoom", {}).get("liveRoomUserInfo", {})
-                    room_info = live_user_info.get("liveRoom", {})
-                    user_info = live_user_info.get("user", {})
-                    status = room_info.get("status")
-                    room_id = room_info.get("roomId") or user_info.get("roomId")
+            res_text = res.text
+            # Guard: Giới hạn xử lý tối đa 4MB để tránh regex backtracking / phình RAM khi gặp response lỗi
+            if len(res_text) <= 4 * 1024 * 1024:
+                # 1. Phân tích thẻ SIGI_STATE
+                m = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', res_text, re.DOTALL)
+                if m:
+                    try:
+                        data = json.loads(m.group(1))
+                        if isinstance(data, dict):
+                            live_user_info = data.get("LiveRoom", {})
+                            live_user_info = live_user_info.get("liveRoomUserInfo", {}) if isinstance(live_user_info, dict) else {}
+                            room_info = live_user_info.get("liveRoom", {}) if isinstance(live_user_info, dict) else {}
+                            user_info = live_user_info.get("user", {}) if isinstance(live_user_info, dict) else {}
+                            status = room_info.get("status") if isinstance(room_info, dict) else None
+                            room_id = (room_info.get("roomId") or user_info.get("roomId")) if (isinstance(room_info, dict) and isinstance(user_info, dict)) else None
 
-                    # Kiểm tra các cờ VIP Sub-Only / Paid Event
-                    live_sub_only = room_info.get("liveSubOnly", False)
-                    sub_only = room_info.get("subOnly", False)
-                    paid_evt = room_info.get("paidEvent") or {}
-                    p_type = paid_evt.get("paidType") if isinstance(paid_evt, dict) else None
-                    p_dur = room_info.get("previewDuration") or room_info.get("preview_duration")
+                            # Kiểm tra các cờ VIP Sub-Only / Paid Event
+                            live_sub_only = room_info.get("liveSubOnly", False) if isinstance(room_info, dict) else False
+                            sub_only = room_info.get("subOnly", False) if isinstance(room_info, dict) else False
+                            paid_evt = room_info.get("paidEvent") if isinstance(room_info, dict) else {}
+                            p_type = paid_evt.get("paidType") if isinstance(paid_evt, dict) else None
+                            p_dur = (room_info.get("previewDuration") or room_info.get("preview_duration")) if isinstance(room_info, dict) else None
 
-                    if live_sub_only or sub_only or (isinstance(paid_evt, dict) and paid_evt.get("paidType", 0) > 0) or (paid_evt is True):
-                        details["is_sub_only"] = True
-                        details["is_preview"] = True
-                    if p_type is not None:
-                        details["paid_type"] = p_type
-                    if p_dur is not None:
-                        details["preview_duration"] = int(p_dur)
+                            if live_sub_only or sub_only or (isinstance(paid_evt, dict) and paid_evt.get("paidType", 0) > 0) or (paid_evt is True):
+                                details["is_sub_only"] = True
+                                details["is_preview"] = True
+                            if p_type is not None:
+                                details["paid_type"] = p_type
+                            if p_dur is not None:
+                                details["preview_duration"] = int(p_dur)
 
-                    # status == 2 nghĩa là ĐANG LIVE, status == 4 nghĩa là ĐÃ XUỐNG LIVE
-                    if status == 2:
-                        if not room_id:
-                            r_match = re.search(r'"roomId"[:\"]+(\d{15,25})', res.text)
-                            if r_match:
-                                room_id = r_match.group(1)
-                        if room_id:
-                            details["is_live"] = True
-                            details["room_id"] = str(room_id)
-                    elif status == 4:
-                        details["is_live"] = False
-                        details["room_id"] = None
-                        return details
-                except Exception:
-                    pass
+                            # status == 2 nghĩa là ĐANG LIVE, status == 4 nghĩa là ĐÃ XUỐNG LIVE
+                            if status == 2:
+                                if not room_id:
+                                    r_match = re.search(r'"roomId"[:\"]+(\d{15,25})', res_text)
+                                    if r_match:
+                                        room_id = r_match.group(1)
+                                if room_id:
+                                    details["is_live"] = True
+                                    details["room_id"] = str(room_id)
+                            elif status == 4:
+                                details["is_live"] = False
+                                details["room_id"] = None
+                                return details
+                    except Exception:
+                        pass
 
-            # Regex kiểm tra nhanh toàn bộ HTML
-            if re.search(r'"liveSubOnly"\s*:\s*(true|1)', res.text, re.IGNORECASE) or \
-               re.search(r'"subOnly"\s*:\s*(true|1)', res.text, re.IGNORECASE) or \
-               re.search(r'"is_sub_only"\s*:\s*(true|1)', res.text, re.IGNORECASE):
-                details["is_sub_only"] = True
-                details["is_preview"] = True
+                # Regex kiểm tra nhanh toàn bộ HTML
+                if re.search(r'"liveSubOnly"\s*:\s*(true|1)', res_text, re.IGNORECASE) or \
+                   re.search(r'"subOnly"\s*:\s*(true|1)', res_text, re.IGNORECASE) or \
+                   re.search(r'"is_sub_only"\s*:\s*(true|1)', res_text, re.IGNORECASE):
+                    details["is_sub_only"] = True
+                    details["is_preview"] = True
 
-            p_match = re.search(r'"paidEvent"\s*:\s*\{[^}]*"paidType"\s*:\s*([1-9]\d*)', res.text)
-            if p_match:
-                details["is_sub_only"] = True
-                details["is_preview"] = True
-                try:
-                    details["paid_type"] = int(p_match.group(1))
-                except Exception:
-                    pass
+                p_match = re.search(r'"paidEvent"\s*:\s*\{[^}]*"paidType"\s*:\s*([1-9]\d*)', res_text)
+                if p_match:
+                    details["is_sub_only"] = True
+                    details["is_preview"] = True
+                    try:
+                        details["paid_type"] = int(p_match.group(1))
+                    except Exception:
+                        pass
 
-            # Kiểm tra text đặc trưng nếu streamer đã tắt live
-            m_stat = re.search(r'"uniqueId":"' + re.escape(user) + r'"[^\}]*?"status":\s*(\d+)', res.text)
-            if m_stat and int(m_stat.group(1)) == 4:
-                details["is_live"] = False
-                details["room_id"] = None
-                return details
+                # Kiểm tra text đặc trưng nếu streamer đã tắt live
+                m_stat = re.search(r'"uniqueId":"' + re.escape(user) + r'"[^\}]*?"status":\s*(\d+)', res_text)
+                if m_stat and int(m_stat.group(1)) == 4:
+                    details["is_live"] = False
+                    details["room_id"] = None
+                    return details
 
-            if not details["is_live"]:
-                r_match = re.search(r'"roomId"[:\"]+(\d{15,25})', res.text)
-                if r_match and ('"status":2' in res.text or 'liveRoomUserInfo' in res.text):
-                    details["is_live"] = True
-                    details["room_id"] = r_match.group(1)
+                if not details["is_live"]:
+                    r_match = re.search(r'"roomId"[:\"]+(\d{15,25})', res_text)
+                    if r_match and ('"status":2' in res_text or 'liveRoomUserInfo' in res_text):
+                        details["is_live"] = True
+                        details["room_id"] = r_match.group(1)
 
         # 2. Bổ sung trích xuất qua Webcast API nếu đã phát hiện live
         if details["is_live"] and details["room_id"]:
@@ -275,17 +284,23 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
                 }
                 w_res = session.get(w_url, headers=w_headers, timeout=4)
                 if w_res.status_code == 200:
-                    w_json = w_res.json()
-                    r_data = w_json.get("data") or {}
-                    sub_flag = r_data.get("sub_only") or r_data.get("live_sub_only")
-                    paid_data = r_data.get("paid_event") or {}
-                    p_type = paid_data.get("paid_type") if isinstance(paid_data, dict) else None
+                    try:
+                        w_json = w_res.json()
+                    except Exception:
+                        w_json = {}
+                    if isinstance(w_json, dict):
+                        r_data = w_json.get("data")
+                        r_data = r_data if isinstance(r_data, dict) else {}
+                        sub_flag = r_data.get("sub_only") or r_data.get("live_sub_only")
+                        paid_data = r_data.get("paid_event")
+                        paid_data = paid_data if isinstance(paid_data, dict) else {}
+                        p_type = paid_data.get("paid_type") if isinstance(paid_data, dict) else None
 
-                    if sub_flag or (isinstance(paid_data, dict) and paid_data.get("paid_type", 0) > 0):
-                        details["is_sub_only"] = True
-                        details["is_preview"] = True
-                    if p_type is not None:
-                        details["paid_type"] = p_type
+                        if sub_flag or (isinstance(paid_data, dict) and paid_data.get("paid_type", 0) > 0):
+                            details["is_sub_only"] = True
+                            details["is_preview"] = True
+                        if p_type is not None:
+                            details["paid_type"] = p_type
             except Exception:
                 pass
 
@@ -411,85 +426,93 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
                     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 }
                 page_res = session.get(live_page_url, headers=page_headers, timeout=15)
-                content = page_res.text.replace('\\"', '"').replace('\\u0026', '&').replace('&amp;', '&').replace('\\/', '/')
-                
-                flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv\?[^\s"\'<>]+', content)
-                if flv_matches:
-                    clean_flv = [u.replace('&amp;', '&') for u in flv_matches]
-                    # Ưu tiên độ phân giải 1080p (_or4, _uhd) trước, sau đó đến 720p (_hd), rồi các luồng khác
-                    p1080 = [u for u in clean_flv if "_or4" in u or "_uhd" in u]
-                    p720 = [u for u in clean_flv if "_hd" in u]
-                    sorted_flv = p1080 + p720 + [u for u in clean_flv if u not in p1080 and u not in p720]
-                    return sorted_flv
+                sc = getattr(page_res, "status_code", 200)
+                if sc == 200 or not isinstance(sc, (int, float)):
+                    raw_text = page_res.text
+                    # Guard: Giới hạn xử lý tối đa 3MB để tránh duplicate string nhiều lần làm phình RAM
+                    if len(raw_text) <= 3 * 1024 * 1024:
+                        content = raw_text.replace('\\"', '"').replace('\\u0026', '&').replace('&amp;', '&').replace('\\/', '/')
+                        
+                        flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv\?[^\s"\'<>]+', content)
+                        if flv_matches:
+                            clean_flv = [u.replace('&amp;', '&') for u in flv_matches]
+                            # Ưu tiên độ phân giải 1080p (_or4, _uhd) trước, sau đó đến 720p (_hd), rồi các luồng khác
+                            p1080 = [u for u in clean_flv if "_or4" in u or "_uhd" in u]
+                            p720 = [u for u in clean_flv if "_hd" in u]
+                            sorted_flv = p1080 + p720 + [u for u in clean_flv if u not in p1080 and u not in p720]
+                            return sorted_flv
 
-                hls_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8\?[^\s"\'<>]*', content)
-                if hls_matches:
-                    clean_hls = [u.replace('&amp;', '&') for u in hls_matches]
-                    p1080 = [u for u in clean_hls if "_or4" in u or "_uhd" in u]
-                    p720 = [u for u in clean_hls if "_hd" in u]
-                    sorted_hls = p1080 + p720 + [u for u in clean_hls if u not in p1080 and u not in p720]
-                    return sorted_hls
+                        hls_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8\?[^\s"\'<>]*', content)
+                        if hls_matches:
+                            clean_hls = [u.replace('&amp;', '&') for u in hls_matches]
+                            p1080 = [u for u in clean_hls if "_or4" in u or "_uhd" in u]
+                            p720 = [u for u in clean_hls if "_hd" in u]
+                            sorted_hls = p1080 + p720 + [u for u in clean_hls if u not in p1080 and u not in p720]
+                            return sorted_hls
             except Exception:
                 pass
 
-        # Second attempt: Webcast room/info API
-        url = f"https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id={room_id}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
-            "Referer": "https://www.tiktok.com/",
-            "Accept": "*/*",
-            "Origin": "https://www.tiktok.com",
-        }
-        res = session.get(url, headers=headers, timeout=10)
-        try:
-            data = res.json()
-        except Exception:
-            data = {}
-
-        status_code = data.get("status_code", -1)
-        if status_code == 4003110:
-            return "AGE_RESTRICTED"
-
-        room_data = data.get("data") or {}
-        stream_url_obj = room_data.get("stream_url") or {}
-        candidates = []
-
-        sdk_data_str = (
-            stream_url_obj.get("live_core_sdk_data", {})
-            .get("pull_data", {})
-            .get("stream_data")
-        )
-        if sdk_data_str:
+        # Second attempt: Webcast room/info API (chỉ gọi khi có room_id)
+        if room_id:
+            url = f"https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id={room_id}"
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+                "Referer": "https://www.tiktok.com/",
+                "Accept": "*/*",
+                "Origin": "https://www.tiktok.com",
+            }
+            res = session.get(url, headers=headers, timeout=10)
             try:
-                sdk_json = json.loads(sdk_data_str).get("data", {})
-                # Phân cấp độ phân giải: origin/uhd (1080p) -> hd (720p) -> sd -> ld
-                quality_keys = ["origin", "uhd", "hd", "sd", "ld"]
-                ordered_keys = [k for k in quality_keys if k in sdk_json] + [k for k in sdk_json.keys() if k not in quality_keys and k != "ao"]
-                
-                # Ưu tiên luồng H.264 của từng độ phân giải để copy nguyên bản 0% CPU, mượt mà không giật
-                h264_candidates = []
-                other_candidates = []
-                for key in ordered_keys:
-                    entry = sdk_json.get(key, {})
-                    stream_main = entry.get("main", {})
-                    flv = stream_main.get("flv")
-                    hls = stream_main.get("hls") or stream_main.get("m3u8")
-                    
-                    sdk_p = stream_main.get("sdk_params", "")
-                    is_h264 = False
-                    if isinstance(sdk_p, str) and '"VCodec":"h264"' in sdk_p:
-                        is_h264 = True
-                    
-                    target_list = h264_candidates if is_h264 else other_candidates
-                    if flv and flv not in target_list and flv not in candidates:
-                        target_list.append(flv)
-                    if hls and hls not in target_list and hls not in candidates:
-                        target_list.append(hls)
-
-                candidates.extend(h264_candidates)
-                candidates.extend(other_candidates)
+                data = res.json()
             except Exception:
-                pass
+                data = {}
+
+            status_code = data.get("status_code", -1) if isinstance(data, dict) else -1
+            if status_code == 4003110:
+                return "AGE_RESTRICTED"
+
+            room_data = data.get("data") if isinstance(data, dict) else {}
+            room_data = room_data if isinstance(room_data, dict) else {}
+            stream_url_obj = room_data.get("stream_url") if isinstance(room_data, dict) else {}
+            stream_url_obj = stream_url_obj if isinstance(stream_url_obj, dict) else {}
+            candidates = []
+
+            sdk_data_str = (
+                stream_url_obj.get("live_core_sdk_data", {})
+                .get("pull_data", {})
+                .get("stream_data")
+            ) if isinstance(stream_url_obj, dict) else None
+            if sdk_data_str and isinstance(sdk_data_str, str):
+                try:
+                    sdk_json = json.loads(sdk_data_str).get("data", {})
+                    # Phân cấp độ phân giải: origin/uhd (1080p) -> hd (720p) -> sd -> ld
+                    quality_keys = ["origin", "uhd", "hd", "sd", "ld"]
+                    ordered_keys = [k for k in quality_keys if k in sdk_json] + [k for k in sdk_json.keys() if k not in quality_keys and k != "ao"]
+                    
+                    # Ưu tiên luồng H.264 của từng độ phân giải để copy nguyên bản 0% CPU, mượt mà không giật
+                    h264_candidates = []
+                    other_candidates = []
+                    for key in ordered_keys:
+                        entry = sdk_json.get(key, {})
+                        stream_main = entry.get("main", {})
+                        flv = stream_main.get("flv")
+                        hls = stream_main.get("hls") or stream_main.get("m3u8")
+                        
+                        sdk_p = stream_main.get("sdk_params", "")
+                        is_h264 = False
+                        if isinstance(sdk_p, str) and '"VCodec":"h264"' in sdk_p:
+                            is_h264 = True
+                        
+                        target_list = h264_candidates if is_h264 else other_candidates
+                        if flv and flv not in target_list and flv not in candidates:
+                            target_list.append(flv)
+                        if hls and hls not in target_list and hls not in candidates:
+                            target_list.append(hls)
+
+                    candidates.extend(h264_candidates)
+                    candidates.extend(other_candidates)
+                except Exception:
+                    pass
 
         # Fallback to direct URLs: FULL_HD1 (1080p) first, then HD1 (720p)
         flv_pull = stream_url_obj.get("flv_pull_url") or {}
