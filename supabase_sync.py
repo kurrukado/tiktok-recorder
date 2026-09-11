@@ -2,9 +2,17 @@ import os
 import re
 import json
 import time
+import sys
 from datetime import datetime
 from typing import Optional, Union, Tuple
 import requests
+
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://jetwtqakyxjcffbwhhot.supabase.co").rstrip("/")
 SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY", "sb_publishable_GBb8NqVZfF7_jeyzKvRbiA_yKF4KQ76")
@@ -37,22 +45,38 @@ def clean_filename(filename: str) -> str:
     clean = re.sub(r'\.(mp4|jpg|jpeg|png|webp)$', '', base, flags=re.IGNORECASE)
     return clean
 
-def upload_thumbnail_to_supabase(
-    thumb_source: Union[str, bytes],
-    user: str,
-    filename: str
-) -> Optional[str]:
+def upload_thumbnail_to_supabase(*args, **kwargs) -> Optional[str]:
     """
     Tải ảnh thumbnail lên Supabase Storage bucket 'covers/record-thumbnails/{user}/{clean_name}.jpg'.
     Hỗ trợ thumb_source là:
     - Đường dẫn file cục bộ (str)
     - Dữ liệu bytes ảnh (bytes)
     - URL ảnh tải từ web/drive (str bắt đầu bằng http)
+    Hỗ trợ cả hai kiểu gọi:
+    1. upload_thumbnail_to_supabase(thumb_source, user, filename)
+    2. upload_thumbnail_to_supabase(user, filename, thumb_source=...)
     Trả về URL công khai Supabase CDN nếu thành công.
     """
+    thumb_source = kwargs.get("thumb_source")
+    user = kwargs.get("user")
+    filename = kwargs.get("filename")
+
+    if len(args) == 3:
+        thumb_source, user, filename = args[0], args[1], args[2]
+    elif len(args) == 2:
+        if thumb_source is not None:
+            user, filename = args[0], args[1]
+        else:
+            thumb_source, user = args[0], args[1]
+    elif len(args) == 1:
+        if thumb_source is None:
+            thumb_source = args[0]
+        elif user is None:
+            user = args[0]
+
     try:
-        user = user.strip().replace("@", "").lower()
-        base_name = clean_filename(filename)
+        user = str(user or "").strip().replace("@", "").lower()
+        base_name = clean_filename(str(filename or ""))
         storage_path = f"record-thumbnails/{user}/{base_name}.jpg"
         target_upload_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}/{storage_path}"
 
@@ -63,8 +87,11 @@ def upload_thumbnail_to_supabase(
         elif isinstance(thumb_source, str):
             if thumb_source.startswith("http://") or thumb_source.startswith("https://"):
                 resp = requests.get(thumb_source, timeout=15)
-                if resp.status_code == 200 and len(resp.content) > 200:
-                    img_bytes = resp.content
+                try:
+                    if resp.status_code == 200 and len(resp.content) > 200:
+                        img_bytes = resp.content
+                finally:
+                    resp.close()
             elif os.path.exists(thumb_source) and os.path.getsize(thumb_source) > 200:
                 with open(thumb_source, "rb") as f:
                     img_bytes = f.read()
@@ -91,6 +118,8 @@ def upload_thumbnail_to_supabase(
     except Exception as e:
         print(f"[SUPABASE-SYNC] [!] Ngoại lệ khi upload thumbnail lên Supabase: {e}")
         return None
+
+sync_thumbnail_to_supabase = upload_thumbnail_to_supabase
 
 def sync_recording_to_supabase(
     user: str,

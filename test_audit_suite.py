@@ -839,5 +839,141 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
             self.assertEqual(resp.content, b"chunk1chunk2")
             mock_drive_resp.close.assert_called_once()
 
+    def test_malformed_intermediate_sdk_data_fallback(self):
+        """
+        Adversarial Test: Verify get_stream_urls when live_core_sdk_data is a string
+        or pull_data is None/string does not crash with AttributeError and properly
+        extracts fallback flv_pull_url and hls_pull_url.
+        """
+        import recorder_core
+
+        # 1. live_core_sdk_data is string instead of dict
+        mock_s = MagicMock()
+        mock_s.headers = {}
+        mock_s.cookies = {}
+        mock_resp = MagicMock(status_code=200, text="<html>no stream here</html>")
+        mock_resp.json.return_value = {
+            "status_code": 0,
+            "data": {
+                "stream_url": {
+                    "live_core_sdk_data": "corrupt_string",
+                    "flv_pull_url": {"FULL_HD1": "https://pull.flv/stream1.flv"},
+                    "hls_pull_url": "https://pull.hls/stream1.m3u8"
+                }
+            }
+        }
+        mock_s.get.return_value = mock_resp
+
+        with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+            urls = recorder_core.get_stream_urls("12345", user="sdk_corrupt_user", session=mock_s)
+            self.assertIn("https://pull.flv/stream1.flv", urls)
+            self.assertIn("https://pull.hls/stream1.m3u8", urls)
+
+        # 2. pull_data is None instead of dict
+        mock_resp.json.return_value = {
+            "status_code": 0,
+            "data": {
+                "stream_url": {
+                    "live_core_sdk_data": {"pull_data": None},
+                    "flv_pull_url": {"FULL_HD1": "https://pull.flv/stream2.flv"}
+                }
+            }
+        }
+        with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+            urls = recorder_core.get_stream_urls("12345", user="sdk_corrupt_user2", session=mock_s)
+            self.assertEqual(urls, ["https://pull.flv/stream2.flv"])
+
+    def test_streaming_response_error_status_and_exception_cleanup(self):
+        """
+        Adversarial Test: Verify stream_video_by_id raises HTTPException and closes
+        drive_resp immediately when Google Drive returns non-200/206 status (e.g. 404),
+        or when an error occurs before StreamingResponse is returned.
+        """
+        import api_server
+
+        # 1. Google Drive returns 404
+        mock_drive_resp = MagicMock()
+        mock_drive_resp.status_code = 404
+        mock_drive_resp.headers = {}
+
+        with patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("requests.get", return_value=mock_drive_resp):
+
+            client = TestClient(api_server.app)
+            resp = client.get("/api/stream-video-id/not_found_123")
+            self.assertEqual(resp.status_code, 404)
+            mock_drive_resp.close.assert_called_once()
+
+    def test_thumbnail_response_socket_closure(self):
+        """
+        Adversarial Test: Verify get_thumbnail explicitly closes img_res socket.
+        """
+        import api_server
+
+        mock_th_list = MagicMock()
+        mock_th_list.status_code = 200
+        mock_th_list.json.return_value = {"files": [{"id": "img_file_123"}]}
+
+        mock_img_resp = MagicMock()
+        mock_img_resp.status_code = 200
+        mock_img_resp.content = b"\xff\xd8\xff\xe0" + b"\x00" * 300
+
+        with patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("gdrive_manager.find_or_create_folder", return_value="fake_fid"), \
+             patch("requests.get", side_effect=[mock_th_list, mock_img_resp]):
+
+            client = TestClient(api_server.app)
+            resp = client.get("/api/thumbnail/test_user/test_video.mp4")
+            self.assertEqual(resp.status_code, 200)
+            mock_img_resp.close.assert_called_once()
+
+    def test_supabase_sync_thumb_socket_closure(self):
+        """
+        Adversarial Test: Verify sync_thumbnail_to_supabase closes response when downloading thumb_source from URL.
+        """
+        import supabase_sync
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"\xff\xd8\xff\xe0" + b"\x00" * 300
+
+        mock_post = MagicMock()
+        mock_post.status_code = 200
+
+        with patch("requests.get", return_value=mock_resp), \
+             patch("requests.post", return_value=mock_post):
+
+            url = supabase_sync.upload_thumbnail_to_supabase("test_user", "vid.mp4", thumb_source="https://cdn.example.com/thumb.jpg")
+            self.assertIsNotNone(url)
+            mock_resp.close.assert_called_once()
+
+    def test_cloud_daemon_vip_preview_max_attempts(self):
+        """
+        Adversarial Test: Verify cloud_daemon streamer_recording_worker allows full 5 VIP preview
+        attempts (parts 1 through 5) before terminating at max_vip_attempts.
+        """
+        import cloud_daemon
+
+        recorded_parts = []
+        def fake_record(url, output_filename=None, **kwargs):
+            recorded_parts.append(output_filename)
+            return output_filename
+
+        with patch("recorder_core.generate_guest_session") as mock_gs, \
+             patch("recorder_core.get_live_stream_url", return_value="http://pull.flv/stream.flv"), \
+             patch("recorder_core.record_stream_ffmpeg", side_effect=fake_record), \
+             patch("auto_h264.validate_playable_video", return_value=(True, "ok", 10.0)), \
+             patch("recorder_core.check_live_details", return_value={"is_live": True, "room_id": "111", "is_sub_only": True}), \
+             patch("gdrive_manager.get_access_token", return_value="fake_tok"), \
+             patch("gdrive_manager.find_or_create_folder", return_value="fake_fid"), \
+             patch("staging_queue.add_to_staging_queue", return_value={"status": "ok"}), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.remove"), \
+             patch("shutil.move"), \
+             patch("time.sleep"):
+
+            cloud_daemon.streamer_recording_worker("vip_full_user", "111")
+            self.assertEqual(len(recorded_parts), 5)
+
 if __name__ == "__main__":
     unittest.main()

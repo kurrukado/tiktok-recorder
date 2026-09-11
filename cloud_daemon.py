@@ -494,7 +494,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
 
             # 4. Kiểm tra xem streamer còn live hay không để ghi tiếp Phần tiếp theo
             if is_sub_only:
-                if part_number >= max_vip_attempts:
+                if part_number > max_vip_attempts:
                     log(f"🛑 [@{user}] Đã đạt giới hạn tối đa {max_vip_attempts} lần xoay Guest Session preview Sub-Only. Kết thúc luồng.")
                     break
 

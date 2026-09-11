@@ -1359,8 +1359,11 @@ def get_thumbnail(user: str, filename: str):
             if th_files:
                 img_id = th_files[0]["id"]
                 img_res = requests.get(f"https://www.googleapis.com/drive/v3/files/{img_id}?alt=media", headers=headers, timeout=15)
-                if img_res.status_code == 200:
-                    return Response(content=img_res.content, media_type="image/jpeg")
+                try:
+                    if img_res.status_code == 200:
+                        return Response(content=img_res.content, media_type="image/jpeg")
+                finally:
+                    img_res.close()
 
             # Nếu chưa có ảnh .jpg riêng, tìm file .mp4 để lấy thumbnail tích hợp sẵn của Google Drive
             q_vid = f"name = '{clean_name}.mp4' and '{user_fid}' in parents and trashed = false"
@@ -1462,6 +1465,7 @@ def stream_video_by_id(file_id: str, request: Request):
     if range_header:
         req_headers["Range"] = range_header
 
+    drive_resp = None
     try:
         drive_resp = requests.get(
             f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
@@ -1469,6 +1473,11 @@ def stream_video_by_id(file_id: str, request: Request):
             stream=True,
             timeout=15
         )
+
+        if drive_resp.status_code not in (200, 206):
+            sc = drive_resp.status_code
+            drive_resp.close()
+            raise HTTPException(status_code=sc, detail="Không tìm thấy file hoặc lỗi Google Drive")
 
         resp_headers = {
             "Accept-Ranges": "bytes",
@@ -1494,7 +1503,14 @@ def stream_video_by_id(file_id: str, request: Request):
             status_code=drive_resp.status_code,
             headers=resp_headers
         )
+    except HTTPException:
+        raise
     except Exception as e:
+        if drive_resp:
+            try:
+                drive_resp.close()
+            except Exception:
+                pass
         print(f"[!] Lỗi stream video ID {file_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Lỗi khi phát video: {e}")
 
