@@ -10,7 +10,7 @@ on:
 
 concurrency:
   group: tiktok-recorder-runner
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 permissions:
   contents: write
