@@ -545,6 +545,14 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
             dead_users = [u for u, info in ACTIVE_RECORDERS.items() if not info["thread"].is_alive()]
             for u in dead_users:
                 ACTIVE_RECORDERS.pop(u, None)
+            active_now = list(ACTIVE_RECORDERS.keys())
+
+        # Gửi Heartbeat lên Google Drive cho tất cả các streamer đang quay thực tế
+        for act_u in active_now:
+            try:
+                gdrive_manager.set_user_recording_status_drive(act_u, True)
+            except Exception:
+                pass
 
         # Kiểm tra điều kiện luân chuyển phiên mượt mà (Graceful Rotation)
         if elapsed >= max_seconds:

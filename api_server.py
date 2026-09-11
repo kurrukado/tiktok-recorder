@@ -225,6 +225,7 @@ def clean_zombie_recordings(live_statuses=None):
         if not drive_details:
             return []
 
+        now_ts = int(time.time())
         zombies_cleaned = []
         for item in drive_details:
             u = item.get("username") if isinstance(item, dict) else str(item)
@@ -236,7 +237,12 @@ def clean_zombie_recordings(live_statuses=None):
             if is_local_recorder_running_for_user(u):
                 continue
 
-            # Kiểm tra trạng thái trực tiếp trên TikTok
+            # Heartbeat check: Nếu vừa mới được cập nhật trong 10 phút thì chắc chắn đang chạy trên Cloud Runner
+            updated_at = item.get("updated_at", 0) if isinstance(item, dict) else 0
+            if updated_at and (now_ts - updated_at) < 600:
+                continue
+
+            # Nếu quá 10 phút không có heartbeat, kiểm tra trực tiếp trên TikTok
             is_live = False
             if live_statuses and u in live_statuses:
                 val = live_statuses[u]
@@ -245,7 +251,7 @@ def clean_zombie_recordings(live_statuses=None):
                 is_live, _ = get_user_live_status_cached(u)
 
             if not is_live:
-                print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (Offline & không có PID). Đang dọn dẹp...")
+                print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (quá 10p không heartbeat & Offline). Đang dọn dẹp...")
                 gdrive_manager.set_user_recording_status_drive(u, False)
                 zombies_cleaned.append(u)
 
@@ -404,6 +410,7 @@ def get_users(check_live: bool = True):
         is_recording = (u in active_users)
         if is_recording:
             status_str = "recording"
+            is_live = True
         elif is_live:
             status_str = "live"
         else:
