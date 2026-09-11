@@ -568,11 +568,15 @@ def get_stream_url(username: str):
         "note": "Link trực tiếp từ máy chủ CDN của TikTok, có thể phát trực tiếp trên web hoặc tải tốc độ cao tối đa băng thông."
     }
 
+@app.get("/api/version")
+def get_version():
+    return {"version": "2.2.0", "build": "native-safari-tls-sync", "time": datetime.now().isoformat()}
+
 @app.get("/api/test-live/{username}")
 def test_live_diagnostic(username: str):
     user = username.strip().replace("@", "").lower()
     import traceback
-    out = {"user": user}
+    out = {"user": user, "api_version": "2.2.0"}
     try:
         raw_det = recorder_core.check_live_details(user)
         out["check_live_details"] = raw_det
@@ -584,6 +588,30 @@ def test_live_diagnostic(username: str):
         out["check_live_status"] = {"is_live": s_live, "room_id": s_rid}
     except Exception as e:
         out["check_live_status_error"] = traceback.format_exc()
+
+    # Thử nghiệm trực tiếp TikTok Native API
+    try:
+        from curl_cffi import requests as c_req
+        api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
+        r_nat = c_req.get(api_url, impersonate="safari15_5", timeout=7)
+        out["native_api"] = {
+            "status_code": r_nat.status_code,
+            "text_len": len(r_nat.text),
+            "is_json": False
+        }
+        if r_nat.status_code == 200:
+            try:
+                j = r_nat.json()
+                out["native_api"]["is_json"] = True
+                out["native_api"]["status"] = j.get("data", {}).get("liveRoom", {}).get("status")
+                out["native_api"]["roomId"] = j.get("data", {}).get("user", {}).get("roomId") or j.get("data", {}).get("liveRoom", {}).get("roomId")
+            except Exception as j_err:
+                out["native_api"]["json_error"] = str(j_err)
+                out["native_api"]["text_preview"] = r_nat.text[:200]
+        else:
+            out["native_api"]["text_preview"] = r_nat.text[:200]
+    except Exception as e:
+        out["native_api_error"] = traceback.format_exc()
 
     try:
         from curl_cffi import requests as c_req
