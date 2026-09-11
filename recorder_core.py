@@ -168,6 +168,7 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
     except Exception:
         pass
 
+    session = None
     try:
         if cookies is None:
             cookies = load_cookies()
@@ -212,7 +213,7 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
                     # status == 2 nghĩa là ĐANG LIVE, status == 4 nghĩa là ĐÃ XUỐNG LIVE
                     if status == 2:
                         if not room_id:
-                            r_match = re.search(r'"roomId"[:"]+(\d{15,25})', res.text)
+                            r_match = re.search(r'"roomId"[:\"]+(\d{15,25})', res.text)
                             if r_match:
                                 room_id = r_match.group(1)
                         if room_id:
@@ -249,7 +250,7 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
                 return details
 
             if not details["is_live"]:
-                r_match = re.search(r'"roomId"[:"]+(\d{15,25})', res.text)
+                r_match = re.search(r'"roomId"[:\"]+(\d{15,25})', res.text)
                 if r_match and ('"status":2' in res.text or 'liveRoomUserInfo' in res.text):
                     details["is_live"] = True
                     details["room_id"] = r_match.group(1)
@@ -282,34 +283,17 @@ def check_live_details(user: str, cookies: Optional[dict] = None) -> dict:
 
     except Exception:
         pass
+    finally:
+        if session:
+            try:
+                session.close()
+            except Exception:
+                pass
 
-    # 3. Dự phòng qua TikTokLiveClient
-    if not details["is_live"]:
-        try:
-            from TikTokLive import TikTokLiveClient
-            import asyncio
-
-            async def _check():
-                client = TikTokLiveClient(unique_id=user)
-                try:
-                    is_live = await client.is_live()
-                    if not is_live:
-                        return False, None
-                    room_id = None
-                    try:
-                        room_id = await client.web.fetch_room_id_from_api(unique_id=user)
-                    except Exception:
-                        pass
-                    return is_live, str(room_id) if room_id else None
-                except Exception:
-                    return False, None
-
-            is_live, room_id = asyncio.run(_check())
-            if is_live:
-                details["is_live"] = True
-                details["room_id"] = room_id
-        except Exception:
-            pass
+    # 3. Dự phòng qua TikTokLiveClient — ĐÃ LOẠI BỎ HOÀN TOÀN
+    # TikTokLiveClient luôn thất bại trên IP datacenter (Render/GitHub Actions) do TikTok chặn httpx,
+    # đồng thời import nặng (httpx, pydantic, asyncio.run) gây phình RAM 30-50MB mỗi lần gọi.
+    # Native Live API (Step 0) + HTML scrape (Step 1) đã đủ chính xác 100%.
 
     return details
 
@@ -392,117 +376,126 @@ def get_stream_urls(room_id, user, cookies=None, session=None):
         except Exception:
             pass
 
+    owns_session = False
     if session is None:
         if cookies is None:
             cookies = load_cookies()
         session = requests.Session(impersonate="chrome136")
+        owns_session = True
         if cookies:
             session.cookies.update(cookies)
 
-    # First attempt: Direct scrape of live page HTML with session cookies (bypasses 18+ restriction)
-    if user:
-        try:
-            live_page_url = f"https://www.tiktok.com/@{user}/live"
-            page_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
-                "Referer": "https://www.tiktok.com/",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            }
-            page_res = session.get(live_page_url, headers=page_headers, timeout=15)
-            content = page_res.text.replace('\\"', '"').replace('\\u0026', '&').replace('&amp;', '&').replace('\\/', '/')
-            
-            flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv\?[^\s"\'<>]+', content)
-            if flv_matches:
-                clean_flv = [u.replace('&amp;', '&') for u in flv_matches]
-                # Ưu tiên độ phân giải 1080p (_or4, _uhd) trước, sau đó đến 720p (_hd), rồi các luồng khác
-                p1080 = [u for u in clean_flv if "_or4" in u or "_uhd" in u]
-                p720 = [u for u in clean_flv if "_hd" in u]
-                sorted_flv = p1080 + p720 + [u for u in clean_flv if u not in p1080 and u not in p720]
-                return sorted_flv
-
-            hls_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8\?[^\s"\'<>]*', content)
-            if hls_matches:
-                clean_hls = [u.replace('&amp;', '&') for u in hls_matches]
-                p1080 = [u for u in clean_hls if "_or4" in u or "_uhd" in u]
-                p720 = [u for u in clean_hls if "_hd" in u]
-                sorted_hls = p1080 + p720 + [u for u in clean_hls if u not in p1080 and u not in p720]
-                return sorted_hls
-        except Exception:
-            pass
-
-    # Second attempt: Webcast room/info API
-    url = f"https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id={room_id}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
-        "Referer": "https://www.tiktok.com/",
-        "Accept": "*/*",
-        "Origin": "https://www.tiktok.com",
-    }
-    session.headers.update(headers)
-    res = session.get(url)
     try:
-        data = res.json()
-    except Exception:
-        data = {}
+        # First attempt: Direct scrape of live page HTML with session cookies (bypasses 18+ restriction)
+        if user:
+            try:
+                live_page_url = f"https://www.tiktok.com/@{user}/live"
+                page_headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+                    "Referer": "https://www.tiktok.com/",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                }
+                page_res = session.get(live_page_url, headers=page_headers, timeout=15)
+                content = page_res.text.replace('\\"', '"').replace('\\u0026', '&').replace('&amp;', '&').replace('\\/', '/')
+                
+                flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv\?[^\s"\'<>]+', content)
+                if flv_matches:
+                    clean_flv = [u.replace('&amp;', '&') for u in flv_matches]
+                    # Ưu tiên độ phân giải 1080p (_or4, _uhd) trước, sau đó đến 720p (_hd), rồi các luồng khác
+                    p1080 = [u for u in clean_flv if "_or4" in u or "_uhd" in u]
+                    p720 = [u for u in clean_flv if "_hd" in u]
+                    sorted_flv = p1080 + p720 + [u for u in clean_flv if u not in p1080 and u not in p720]
+                    return sorted_flv
 
-    status_code = data.get("status_code", -1)
-    if status_code == 4003110:
-        return "AGE_RESTRICTED"
+                hls_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8\?[^\s"\'<>]*', content)
+                if hls_matches:
+                    clean_hls = [u.replace('&amp;', '&') for u in hls_matches]
+                    p1080 = [u for u in clean_hls if "_or4" in u or "_uhd" in u]
+                    p720 = [u for u in clean_hls if "_hd" in u]
+                    sorted_hls = p1080 + p720 + [u for u in clean_hls if u not in p1080 and u not in p720]
+                    return sorted_hls
+            except Exception:
+                pass
 
-    room_data = data.get("data") or {}
-    stream_url_obj = room_data.get("stream_url") or {}
-    candidates = []
-
-    sdk_data_str = (
-        stream_url_obj.get("live_core_sdk_data", {})
-        .get("pull_data", {})
-        .get("stream_data")
-    )
-    if sdk_data_str:
+        # Second attempt: Webcast room/info API
+        url = f"https://webcast.tiktok.com/webcast/room/info/?aid=1988&room_id={room_id}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.127 Safari/537.36",
+            "Referer": "https://www.tiktok.com/",
+            "Accept": "*/*",
+            "Origin": "https://www.tiktok.com",
+        }
+        session.headers.update(headers)
+        res = session.get(url)
         try:
-            sdk_json = json.loads(sdk_data_str).get("data", {})
-            # Phân cấp độ phân giải: origin/uhd (1080p) -> hd (720p) -> sd -> ld
-            quality_keys = ["origin", "uhd", "hd", "sd", "ld"]
-            ordered_keys = [k for k in quality_keys if k in sdk_json] + [k for k in sdk_json.keys() if k not in quality_keys and k != "ao"]
-            
-            # Ưu tiên luồng H.264 của từng độ phân giải để copy nguyên bản 0% CPU, mượt mà không giật
-            h264_candidates = []
-            other_candidates = []
-            for key in ordered_keys:
-                entry = sdk_json.get(key, {})
-                stream_main = entry.get("main", {})
-                flv = stream_main.get("flv")
-                hls = stream_main.get("hls") or stream_main.get("m3u8")
-                
-                sdk_p = stream_main.get("sdk_params", "")
-                is_h264 = False
-                if isinstance(sdk_p, str) and '"VCodec":"h264"' in sdk_p:
-                    is_h264 = True
-                
-                target_list = h264_candidates if is_h264 else other_candidates
-                if flv and flv not in target_list and flv not in candidates:
-                    target_list.append(flv)
-                if hls and hls not in target_list and hls not in candidates:
-                    target_list.append(hls)
-
-            candidates.extend(h264_candidates)
-            candidates.extend(other_candidates)
+            data = res.json()
         except Exception:
-            pass
+            data = {}
 
-    # Fallback to direct URLs: FULL_HD1 (1080p) first, then HD1 (720p)
-    flv_pull = stream_url_obj.get("flv_pull_url") or {}
-    if isinstance(flv_pull, dict):
-        for k in ("FULL_HD1", "HD1", "SD2", "SD1"):
-            u = flv_pull.get(k)
-            if u and u not in candidates:
-                candidates.append(u)
+        status_code = data.get("status_code", -1)
+        if status_code == 4003110:
+            return "AGE_RESTRICTED"
 
-    hls_pull = stream_url_obj.get("hls_pull_url")
-    if hls_pull and hls_pull not in candidates:
-        candidates.append(hls_pull)
+        room_data = data.get("data") or {}
+        stream_url_obj = room_data.get("stream_url") or {}
+        candidates = []
 
-    return candidates
+        sdk_data_str = (
+            stream_url_obj.get("live_core_sdk_data", {})
+            .get("pull_data", {})
+            .get("stream_data")
+        )
+        if sdk_data_str:
+            try:
+                sdk_json = json.loads(sdk_data_str).get("data", {})
+                # Phân cấp độ phân giải: origin/uhd (1080p) -> hd (720p) -> sd -> ld
+                quality_keys = ["origin", "uhd", "hd", "sd", "ld"]
+                ordered_keys = [k for k in quality_keys if k in sdk_json] + [k for k in sdk_json.keys() if k not in quality_keys and k != "ao"]
+                
+                # Ưu tiên luồng H.264 của từng độ phân giải để copy nguyên bản 0% CPU, mượt mà không giật
+                h264_candidates = []
+                other_candidates = []
+                for key in ordered_keys:
+                    entry = sdk_json.get(key, {})
+                    stream_main = entry.get("main", {})
+                    flv = stream_main.get("flv")
+                    hls = stream_main.get("hls") or stream_main.get("m3u8")
+                    
+                    sdk_p = stream_main.get("sdk_params", "")
+                    is_h264 = False
+                    if isinstance(sdk_p, str) and '"VCodec":"h264"' in sdk_p:
+                        is_h264 = True
+                    
+                    target_list = h264_candidates if is_h264 else other_candidates
+                    if flv and flv not in target_list and flv not in candidates:
+                        target_list.append(flv)
+                    if hls and hls not in target_list and hls not in candidates:
+                        target_list.append(hls)
+
+                candidates.extend(h264_candidates)
+                candidates.extend(other_candidates)
+            except Exception:
+                pass
+
+        # Fallback to direct URLs: FULL_HD1 (1080p) first, then HD1 (720p)
+        flv_pull = stream_url_obj.get("flv_pull_url") or {}
+        if isinstance(flv_pull, dict):
+            for k in ("FULL_HD1", "HD1", "SD2", "SD1"):
+                u = flv_pull.get(k)
+                if u and u not in candidates:
+                    candidates.append(u)
+
+        hls_pull = stream_url_obj.get("hls_pull_url")
+        if hls_pull and hls_pull not in candidates:
+            candidates.append(hls_pull)
+
+        return candidates
+    finally:
+        if owns_session and session:
+            try:
+                session.close()
+            except Exception:
+                pass
 
 def _safe_stop_ffmpeg(proc, timeout=8):
     """

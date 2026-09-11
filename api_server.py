@@ -8,6 +8,7 @@ import subprocess
 import re
 import requests
 import concurrent.futures
+import gc
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel
@@ -152,7 +153,7 @@ def extract_middle_thumbnail(video_path, output_thumb=None):
 
 # ---------------- LIVE STATUS CACHE ----------------
 LIVE_CACHE = {}  # {username: {"is_live": bool, "room_id": str, "is_sub_only": bool, "is_preview": bool, "timestamp": float}}
-LIVE_CACHE_TTL = 15.0  # Cache 15 giây để phản hồi API siêu nhanh, không gây nghẽn
+LIVE_CACHE_TTL = 60.0  # Cache 60 giây — frontend poll mỗi 25s sẽ dùng cache, giảm tải RAM và network
 
 def get_user_live_details_cached(user: str) -> dict:
     user = user.strip().replace("@", "").lower()
@@ -383,7 +384,7 @@ def get_users(check_live: bool = True):
     # Kiểm tra live đa luồng song song (ThreadPoolExecutor) để tốc độ siêu nhanh
     live_statuses = {}
     if check_live and users:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users), 8)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users), 3)) as executor:
             future_to_user = {executor.submit(get_user_live_details_cached, u): u for u in users}
             for fut in concurrent.futures.as_completed(future_to_user):
                 u = future_to_user[fut]
@@ -424,11 +425,43 @@ def get_users(check_live: bool = True):
             "is_sub_only": is_sub_only,
             "is_preview": is_preview
         })
+    # Thu hồi RAM sau khi xử lý endpoint nặng (curl_cffi C-level memory)
+    gc.collect()
+
     return {
         "users": result,
         "streamers": users,
         "total": len(users),
         "currently_recording": list(active_users)
+    }
+
+@app.get("/api/memory")
+def get_memory_usage():
+    """Endpoint giám sát RAM thời gian thực trên Render — giúp phát hiện rò rỉ bộ nhớ sớm."""
+    try:
+        import psutil
+        proc = psutil.Process()
+        mem = proc.memory_info()
+        rss_mb = mem.rss / (1024 * 1024)
+        vms_mb = mem.vms / (1024 * 1024)
+    except Exception:
+        import resource
+        try:
+            rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            rss_mb = rss_kb / 1024
+            vms_mb = 0
+        except Exception:
+            rss_mb = 0
+            vms_mb = 0
+    return {
+        "rss_mb": round(rss_mb, 2),
+        "vms_mb": round(vms_mb, 2),
+        "render_limit_mb": 512,
+        "cache_ttl_seconds": LIVE_CACHE_TTL,
+        "live_cache_entries": len(LIVE_CACHE),
+        "active_recordings": len(ACTIVE_RECORDING_TASKS),
+        "gc_counts": gc.get_count(),
+        "warning": "HIGH" if rss_mb > 350 else ("MEDIUM" if rss_mb > 200 else "LOW")
     }
 
 @app.post("/api/users")
@@ -620,6 +653,7 @@ def test_live_diagnostic(username: str):
     except Exception as e:
         out["native_api_error"] = traceback.format_exc()
 
+    sess = None
     try:
         from curl_cffi import requests as c_req
         sess = c_req.Session(impersonate="chrome136")
@@ -633,7 +667,14 @@ def test_live_diagnostic(username: str):
         }
     except Exception as e:
         out["direct_scrape_error"] = traceback.format_exc()
+    finally:
+        if sess:
+            try:
+                sess.close()
+            except Exception:
+                pass
 
+    gc.collect()
     return out
 
 def concat_mp4_segments(segment_files, output_file):
@@ -1110,7 +1151,7 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
             return folder_recs
 
         if folders:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(folders), 8)) as ex:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(folders), 3)) as ex:
                 results = ex.map(_fetch_folder_files, folders)
                 for r in results:
                     recordings.extend(r)
