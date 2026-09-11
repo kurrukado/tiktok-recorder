@@ -488,11 +488,11 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
             stream_url_obj = room_data.get("stream_url") if isinstance(room_data, dict) else {}
             stream_url_obj = stream_url_obj if isinstance(stream_url_obj, dict) else {}
 
-            sdk_data_str = (
-                stream_url_obj.get("live_core_sdk_data", {})
-                .get("pull_data", {})
-                .get("stream_data")
-            ) if isinstance(stream_url_obj, dict) else None
+            live_sdk = stream_url_obj.get("live_core_sdk_data")
+            live_sdk = live_sdk if isinstance(live_sdk, dict) else {}
+            pull_data = live_sdk.get("pull_data")
+            pull_data = pull_data if isinstance(pull_data, dict) else {}
+            sdk_data_str = pull_data.get("stream_data")
             if sdk_data_str and isinstance(sdk_data_str, str):
                 try:
                     sdk_json = json.loads(sdk_data_str).get("data", {})
