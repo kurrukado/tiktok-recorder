@@ -348,34 +348,107 @@ def get_live_stream_url(room_id, user=None, cookies=None, session=None, proxy=No
     except Exception:
         return None
 
+def classify_stream_urls(raw_urls: list) -> list:
+    """
+    Sắp xếp các link stream theo thứ tự ưu tiên độ phân giải nghiêm ngặt:
+    Tier 1 (1080p Full HD): link có _or4, full_hd1, _uhd, 1080p, 1080, fhd hoặc luồng origin gốc không bị nén hạ cấp.
+    Tier 2 (720p HD): _hd, hd1, 720p, 720.
+    Tier 3 (540p/SD): _sd, sd1, sd2, 540p, 480p.
+    Tier 4 (360p/LD): _ld, 360p.
+    Loại bỏ hoàn toàn luồng chỉ có tiếng (only_audio=1, stream_suffix=ao).
+    """
+    if not raw_urls:
+        return []
+    clean = [u.replace('&amp;', '&') for u in raw_urls if "only_audio=1" not in u and "stream_suffix=ao" not in u]
+    p1080_explicit, p1080_origin, p720, psd, pld, other = [], [], [], [], [], []
+    for u in clean:
+        u_lower = u.lower()
+        if any(s in u_lower for s in ("_or4", "full_hd1", "_uhd", "1080p", "1080", "fhd", "_fhd")):
+            p1080_explicit.append(u)
+        elif re.search(r'stream-\d+\.(flv|m3u8)', u_lower) or any(s in u_lower for s in ("origin", "_origin")):
+            p1080_origin.append(u)
+        elif any(s in u_lower for s in ("_hd", "hd1", "720p", "720")):
+            p720.append(u)
+        elif any(s in u_lower for s in ("_sd", "sd1", "sd2", "540p", "480p")):
+            psd.append(u)
+        elif any(s in u_lower for s in ("_ld", "360p")):
+            pld.append(u)
+        else:
+            other.append(u)
+    return p1080_explicit + p1080_origin + p720 + psd + pld + other
+
 def parse_sdk_stream_data(sdk_data_str: str) -> list:
+    """
+    Phân tích chuỗi JSON stream_data của TikTok Live SDK và ưu tiên cố định 1080p Full HD:
+    1. 1080p H.264 (Copy luồng nguyên bản 0% CPU, mượt mà chuẩn tương thích)
+    2. 1080p Codec khác (HEVC/ByteVC1)
+    3. 720p H.264
+    4. 720p Codec khác
+    5. SD (540p/480p)
+    6. LD (360p)
+    Không bao giờ để 720p hoặc 360p vượt lên trên 1080p!
+    """
     candidates = []
     if not sdk_data_str:
         return candidates
     try:
         sdk_json = json.loads(sdk_data_str).get("data", {})
-        quality_keys = ["origin", "uhd", "hd", "sd", "ld"]
-        ordered_keys = [k for k in quality_keys if k in sdk_json] + [k for k in sdk_json.keys() if k not in quality_keys and k != "ao"]
+        if not isinstance(sdk_json, dict):
+            return candidates
 
-        h264_candidates = []
-        other_candidates = []
-        for key in ordered_keys:
-            entry = sdk_json.get(key, {})
-            stream_main = entry.get("main", {})
+        tier_1080_h264, tier_1080_other = [], []
+        tier_720_h264, tier_720_other = [], []
+        tier_sd_h264, tier_sd_other = [], []
+        tier_ld_h264, tier_ld_other = [], []
+        tier_other = []
+
+        for key, entry in sdk_json.items():
+            if key == "ao":
+                continue
+            stream_main = entry.get("main", {}) if isinstance(entry, dict) else {}
             flv = stream_main.get("flv")
             hls = stream_main.get("hls") or stream_main.get("m3u8")
-
             sdk_p = stream_main.get("sdk_params", "")
-            is_h264 = isinstance(sdk_p, str) and '"VCodec":"h264"' in sdk_p
+            p_str = str(sdk_p).lower()
 
-            target_list = h264_candidates if is_h264 else other_candidates
-            if flv and flv not in target_list and flv not in candidates:
-                target_list.append(flv)
-            if hls and hls not in target_list and hls not in candidates:
-                target_list.append(hls)
+            if "only_audio=1" in p_str or "stream_suffix\":\"ao\"" in p_str:
+                continue
 
-        candidates.extend(h264_candidates)
-        candidates.extend(other_candidates)
+            is_h264 = "h264" in p_str or "avc" in p_str
+
+            # Phân loại độ phân giải chính xác
+            is_1080 = any(s in p_str for s in ("1080", "or4", "uhd", "fhd", "origin")) or key in ("origin", "uhd")
+            is_720 = "720" in p_str or key == "hd" or "stream_suffix\":\"hd\"" in p_str
+            is_sd = any(s in p_str for s in ("540", "480", "sd")) or key == "sd"
+            is_ld = "360" in p_str or key == "ld" or "stream_suffix\":\"ld\"" in p_str
+
+            if is_1080 and not ("640x1280" in p_str or "720" in p_str or is_sd or is_ld):
+                t_flv, t_hls = (tier_1080_h264, tier_1080_h264) if is_h264 else (tier_1080_other, tier_1080_other)
+            elif is_720:
+                t_flv, t_hls = (tier_720_h264, tier_720_h264) if is_h264 else (tier_720_other, tier_720_other)
+            elif is_sd:
+                t_flv, t_hls = (tier_sd_h264, tier_sd_h264) if is_h264 else (tier_sd_other, tier_sd_other)
+            elif is_ld:
+                t_flv, t_hls = (tier_ld_h264, tier_ld_h264) if is_h264 else (tier_ld_other, tier_ld_other)
+            else:
+                t_flv, t_hls = tier_other, tier_other
+
+            # Luôn ưu tiên FLV trước HLS để tránh adaptive switching giật độ phân giải
+            if flv and flv not in t_flv and flv not in candidates:
+                t_flv.append(flv)
+            if hls and hls not in t_hls and hls not in candidates:
+                t_hls.append(hls)
+
+        ordered = (
+            tier_1080_h264 + tier_1080_other +
+            tier_720_h264 + tier_720_other +
+            tier_sd_h264 + tier_sd_other +
+            tier_ld_h264 + tier_ld_other +
+            tier_other
+        )
+        for u in ordered:
+            if u not in candidates:
+                candidates.append(u)
     except Exception:
         pass
     return candidates
@@ -440,24 +513,49 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
                     raw_text = page_res.text
                     # Guard: Giới hạn xử lý tối đa 3MB để tránh duplicate string nhiều lần làm phình RAM
                     if len(raw_text) <= 3 * 1024 * 1024:
+                        # 1. Trích xuất trực tiếp từ thẻ SIGI_STATE (chứa luồng gốc 1080p chuẩn xác nhất)
+                        m_sigi = re.search(r'<script id="SIGI_STATE"[^>]*>(.*?)</script>', raw_text, re.DOTALL)
+                        if m_sigi:
+                            try:
+                                sigi_d = json.loads(m_sigi.group(1))
+                                lr = sigi_d.get("LiveRoom", {}).get("liveRoomUserInfo", {}).get("liveRoom", {})
+                                sd = lr.get("streamData", {})
+                                if isinstance(sd, dict):
+                                    p_data = sd.get("pull_data", {})
+                                    if isinstance(p_data, dict):
+                                        sd_str = p_data.get("stream_data")
+                                        if sd_str:
+                                            sigi_urls = parse_sdk_stream_data(sd_str)
+                                            if sigi_urls:
+                                                return sigi_urls
+                                    flv_p = sd.get("flv_pull_url")
+                                    if isinstance(flv_p, dict) and "FULL_HD1" in flv_p:
+                                        return [flv_p["FULL_HD1"]]
+                                h_sd = lr.get("hevcStreamData", {})
+                                if isinstance(h_sd, dict):
+                                    hp_data = h_sd.get("pull_data", {})
+                                    if isinstance(hp_data, dict):
+                                        hsd_str = hp_data.get("stream_data")
+                                        if hsd_str:
+                                            sigi_urls = parse_sdk_stream_data(hsd_str)
+                                            if sigi_urls:
+                                                return sigi_urls
+                            except Exception:
+                                pass
+
                         content = raw_text.replace('\\"', '"').replace('\\u0026', '&').replace('&amp;', '&').replace('\\/', '/')
                         
                         flv_matches = re.findall(r'https?://[^\s"\'<>]+\.flv\?[^\s"\'<>]+', content)
                         if flv_matches:
-                            clean_flv = [u.replace('&amp;', '&') for u in flv_matches]
-                            # Ưu tiên độ phân giải 1080p (_or4, _uhd) trước, sau đó đến 720p (_hd), rồi các luồng khác
-                            p1080 = [u for u in clean_flv if "_or4" in u or "_uhd" in u]
-                            p720 = [u for u in clean_flv if "_hd" in u]
-                            sorted_flv = p1080 + p720 + [u for u in clean_flv if u not in p1080 and u not in p720]
-                            return sorted_flv
+                            sorted_flv = classify_stream_urls(flv_matches)
+                            if sorted_flv:
+                                return sorted_flv
 
                         hls_matches = re.findall(r'https?://[^\s"\'<>]+\.m3u8\?[^\s"\'<>]*', content)
                         if hls_matches:
-                            clean_hls = [u.replace('&amp;', '&') for u in hls_matches]
-                            p1080 = [u for u in clean_hls if "_or4" in u or "_uhd" in u]
-                            p720 = [u for u in clean_hls if "_hd" in u]
-                            sorted_hls = p1080 + p720 + [u for u in clean_hls if u not in p1080 and u not in p720]
-                            return sorted_hls
+                            sorted_hls = classify_stream_urls(hls_matches)
+                            if sorted_hls:
+                                return sorted_hls
             except Exception:
                 pass
 
@@ -494,48 +592,32 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
             pull_data = pull_data if isinstance(pull_data, dict) else {}
             sdk_data_str = pull_data.get("stream_data")
             if sdk_data_str and isinstance(sdk_data_str, str):
-                try:
-                    sdk_json = json.loads(sdk_data_str).get("data", {})
-                    # Phân cấp độ phân giải: origin/uhd (1080p) -> hd (720p) -> sd -> ld
-                    quality_keys = ["origin", "uhd", "hd", "sd", "ld"]
-                    ordered_keys = [k for k in quality_keys if k in sdk_json] + [k for k in sdk_json.keys() if k not in quality_keys and k != "ao"]
-                    
-                    # Ưu tiên luồng H.264 của từng độ phân giải để copy nguyên bản 0% CPU, mượt mà không giật
-                    h264_candidates = []
-                    other_candidates = []
-                    for key in ordered_keys:
-                        entry = sdk_json.get(key, {})
-                        stream_main = entry.get("main", {})
-                        flv = stream_main.get("flv")
-                        hls = stream_main.get("hls") or stream_main.get("m3u8")
-                        
-                        sdk_p = stream_main.get("sdk_params", "")
-                        is_h264 = False
-                        if isinstance(sdk_p, str) and '"VCodec":"h264"' in sdk_p:
-                            is_h264 = True
-                        
-                        target_list = h264_candidates if is_h264 else other_candidates
-                        if flv and flv not in target_list and flv not in candidates:
-                            target_list.append(flv)
-                        if hls and hls not in target_list and hls not in candidates:
-                            target_list.append(hls)
+                candidates.extend(parse_sdk_stream_data(sdk_data_str))
 
-                    candidates.extend(h264_candidates)
-                    candidates.extend(other_candidates)
-                except Exception:
-                    pass
-
-            # Fallback to direct URLs: FULL_HD1 (1080p) first, then HD1 (720p)
+            # Fallback to direct URLs: FULL_HD1 (1080p) phải là ưu tiên số 1!
             flv_pull = stream_url_obj.get("flv_pull_url") or {}
             if isinstance(flv_pull, dict):
-                for k in ("FULL_HD1", "HD1", "SD2", "SD1"):
+                full_hd = flv_pull.get("FULL_HD1")
+                if full_hd:
+                    if full_hd in candidates:
+                        candidates.remove(full_hd)
+                    candidates.insert(0, full_hd)
+                for k in ("HD1", "SD2", "SD1"):
                     u = flv_pull.get(k)
                     if u and u not in candidates:
                         candidates.append(u)
 
             hls_pull = stream_url_obj.get("hls_pull_url")
-            if hls_pull and hls_pull not in candidates:
+            if isinstance(hls_pull, str) and hls_pull and hls_pull not in candidates:
                 candidates.append(hls_pull)
+            elif isinstance(hls_pull, dict):
+                hls_fhd = hls_pull.get("FULL_HD1")
+                if hls_fhd and hls_fhd not in candidates:
+                    candidates.append(hls_fhd)
+                for k in ("HD1", "SD2", "SD1"):
+                    u = hls_pull.get(k)
+                    if u and u not in candidates:
+                        candidates.append(u)
 
         return candidates
     except Exception:

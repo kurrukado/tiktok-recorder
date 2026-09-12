@@ -430,6 +430,13 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     tok = gdrive_manager.get_access_token()
                     q_res = staging_queue.add_to_staging_queue(user, final_rec_file, final_dur, access_token=tok)
                     log(f"📋 [@{user}] Trạng thái Staging Queue: {q_res.get('status')} - {q_res.get('message', '')}")
+                    if q_res.get("status") in ("queued", "packaged"):
+                        if final_rec_file and os.path.exists(final_rec_file):
+                            try:
+                                os.remove(final_rec_file)
+                                log(f"🗑️ [@{user}] Đã giải phóng ổ cứng: xóa video tạm ({final_dur/60:.1f}p) sau khi chuyển vào Staging Queue.")
+                            except Exception:
+                                pass
                 except Exception as sq_err:
                     log(f"[!] [@{user}] Lỗi khi chuyển vào Staging Queue: {sq_err}")
             else:

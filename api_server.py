@@ -1030,6 +1030,13 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                     token = gdrive_manager.get_access_token()
                     q_res = staging_queue.add_to_staging_queue(user, final_rec_file, final_dur, access_token=token)
                     print(f"[📋] [@{user}] Trạng thái Staging Queue: {q_res.get('status')} - {q_res.get('message', '')}")
+                    if q_res.get("status") in ("queued", "packaged"):
+                        if final_rec_file and os.path.exists(final_rec_file):
+                            try:
+                                os.remove(final_rec_file)
+                                print(f"[🗑️] [@{user}] Đã giải phóng ổ cứng Render: xóa video tạm ({final_dur/60:.1f}p) sau khi chuyển vào Staging Queue thành công.")
+                            except Exception:
+                                pass
                 except Exception as sq_err:
                     print(f"[!] [@{user}] Lỗi khi chuyển vào Staging Queue: {sq_err}")
             else:
