@@ -108,8 +108,20 @@ def save_config(cfg):
             try: os.remove(tmp_path)
             except: pass
 
+_DURATION_CACHE = {}
+_DURATION_CACHE_LOCK = threading.Lock()
+
 def get_video_duration(filepath):
-    """Lấy thời lượng video tính bằng giây."""
+    """Lấy thời lượng video tính bằng giây, có cache theo mtime để không spawn subprocess lặp lại."""
+    try:
+        mtime = os.path.getmtime(filepath)
+        with _DURATION_CACHE_LOCK:
+            cached = _DURATION_CACHE.get(filepath)
+            if cached and cached[0] == mtime:
+                return cached[1]
+    except Exception:
+        mtime = None
+
     cmd = [FFMPEG_PATH, "-i", filepath]
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", timeout=6)
@@ -118,7 +130,11 @@ def get_video_duration(filepath):
             hours = int(m.group(1))
             mins = int(m.group(2))
             secs = float(m.group(3))
-            return round(hours * 3600 + mins * 60 + secs, 2)
+            dur = round(hours * 3600 + mins * 60 + secs, 2)
+            if mtime is not None:
+                with _DURATION_CACHE_LOCK:
+                    _DURATION_CACHE[filepath] = (mtime, dur)
+            return dur
     except Exception:
         pass
     return None
@@ -493,8 +509,23 @@ def get_memory_usage():
         except Exception:
             rss_mb = 0
             vms_mb = 0
+    if rss_mb > 300:
+        # Chủ động dọn dẹp các cache khi RAM chạm ngưỡng 300MB để không bao giờ chạm tới 512MB
+        try:
+            with LIVE_CACHE_LOCK:
+                LIVE_CACHE.clear()
+            with _RECORDINGS_CACHE_LOCK:
+                _RECORDINGS_CACHE["data"] = []
+                _RECORDINGS_CACHE["timestamp"] = 0
+            with _DURATION_CACHE_LOCK:
+                _DURATION_CACHE.clear()
+            gc.collect()
+        except Exception:
+            pass
+
     with RECORDING_LOCK:
         active_count = len(ACTIVE_RECORDING_TASKS)
+
     return {
         "rss_mb": round(rss_mb, 2),
         "vms_mb": round(vms_mb, 2),
@@ -1180,8 +1211,9 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
     """
     global _RECORDINGS_CACHE
     now = time.time()
-    if not force_refresh and (now - _RECORDINGS_CACHE["timestamp"] < 10) and _RECORDINGS_CACHE["data"]:
-        return _RECORDINGS_CACHE["data"]
+    with _RECORDINGS_CACHE_LOCK:
+        if not force_refresh and (now - _RECORDINGS_CACHE["timestamp"] < 60) and _RECORDINGS_CACHE["data"]:
+            return _RECORDINGS_CACHE["data"]
 
     recordings = []
     try:
@@ -1500,13 +1532,22 @@ def get_cdn_url(user: str, filename: str, redirect: bool = False):
     raise HTTPException(status_code=404, detail="File video không tồn tại trên CDN Drive")
 
 @app.get("/api/stream-video-id/{file_id}")
-def stream_video_by_id(file_id: str, request: Request):
+def stream_video_by_id(file_id: str, request: Request, redirect: bool = False):
     """
     Phát trực tiếp video từ Google Drive với hỗ trợ tua timeline tức thì (HTTP 206 Partial Content và Range Request).
+    Nếu truyền ?redirect=true, tự động cấp quyền public và chuyển hướng 302 sang Google Edge CDN (0-byte RAM/Bandwidth).
     """
     tok = gdrive_manager.get_access_token()
     if not tok:
         raise HTTPException(status_code=500, detail="Không có quyền truy cập Google Drive")
+
+    if redirect:
+        try:
+            gdrive_manager.make_file_public(file_id, access_token=tok)
+            cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
+            return RedirectResponse(url=cdn_url, status_code=302)
+        except Exception as e:
+            print(f"[!] Chuyển hướng CDN không thành công cho file {file_id}: {e}")
 
     req_headers = {"Authorization": f"Bearer {tok}"}
     range_header = request.headers.get("range")

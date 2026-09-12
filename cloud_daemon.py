@@ -238,6 +238,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                                 added_any = True
                                 log(f"✨ [Auto-Discover] Tự động phát hiện streamer mới từ phiên live: @{nf}")
                         if added_any:
+                            global _CACHED_DRIVE_USERS
                             _CACHED_DRIVE_USERS = current_list
                             cfg = load_config()
                             cfg["monitored_users"] = current_list
