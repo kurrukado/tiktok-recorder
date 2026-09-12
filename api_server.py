@@ -46,6 +46,9 @@ from contextlib import asynccontextmanager
 
 ACTIVE_RECORDING_TASKS = {}
 RECORDING_LOCK = threading.Lock()
+LIVE_CACHE_LOCK = threading.Lock()
+_RECORDINGS_CACHE = {"timestamp": 0, "data": []}
+_RECORDINGS_CACHE_LOCK = threading.Lock()
 
 def shutdown_all_recording_tasks():
     """
@@ -94,8 +97,16 @@ def load_config():
     }
 
 def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4, ensure_ascii=False)
+    tmp_path = CONFIG_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+        os.replace(tmp_path, CONFIG_FILE)
+    except Exception as e:
+        print(f"[!] Lỗi ghi config: {e}")
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
 
 def get_video_duration(filepath):
     """Lấy thời lượng video tính bằng giây."""
@@ -203,7 +214,8 @@ def get_user_live_details_cached(user: str) -> dict:
         except Exception:
             pass
 
-    LIVE_CACHE[user] = details
+    with LIVE_CACHE_LOCK:
+        LIVE_CACHE[user] = details
     return details
 
 def get_user_live_status_cached(user: str):
@@ -296,7 +308,9 @@ def health_check():
         active.update(drive_act)
     except Exception:
         pass
-    active.update(ACTIVE_RECORDING_TASKS.keys())
+    with RECORDING_LOCK:
+        active_keys = list(ACTIVE_RECORDING_TASKS.keys())
+    active.update(active_keys)
     all_active = list(active)
     return {
         "status": "online",
@@ -322,7 +336,9 @@ def get_active_recordings():
         recording.update(drive_act)
     except Exception:
         pass
-    recording.update(ACTIVE_RECORDING_TASKS.keys())
+    with RECORDING_LOCK:
+        active_keys = list(ACTIVE_RECORDING_TASKS.keys())
+    recording.update(active_keys)
 
     # Danh sách các user đang phát live trên TikTok
     live_streamers = []
@@ -400,7 +416,9 @@ def get_users(check_live: bool = True):
                 active_users.update(drive_act)
         except Exception:
             pass
-        active_users.update(ACTIVE_RECORDING_TASKS.keys())
+        with RECORDING_LOCK:
+            active_keys = list(ACTIVE_RECORDING_TASKS.keys())
+        active_users.update(active_keys)
         
         # Kiểm tra live đa luồng song song (ThreadPoolExecutor) để tốc độ siêu nhanh
         live_statuses = {}
@@ -467,21 +485,23 @@ def get_memory_usage():
         rss_mb = mem.rss / (1024 * 1024)
         vms_mb = mem.vms / (1024 * 1024)
     except Exception:
-        import resource
         try:
+            import resource
             rss_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
             rss_mb = rss_kb / 1024
             vms_mb = 0
         except Exception:
             rss_mb = 0
             vms_mb = 0
+    with RECORDING_LOCK:
+        active_count = len(ACTIVE_RECORDING_TASKS)
     return {
         "rss_mb": round(rss_mb, 2),
         "vms_mb": round(vms_mb, 2),
         "render_limit_mb": 512,
         "cache_ttl_seconds": LIVE_CACHE_TTL,
         "live_cache_entries": len(LIVE_CACHE),
-        "active_recordings": len(ACTIVE_RECORDING_TASKS),
+        "active_recordings": active_count,
         "gc_counts": gc.get_count(),
         "warning": "HIGH" if rss_mb > 350 else ("MEDIUM" if rss_mb > 200 else "LOW")
     }
@@ -566,8 +586,14 @@ def delete_user(username: str, delete_files: bool = True):
     except Exception:
         pass
 
-    # Đợi 3s để FFmpeg và thread worker kịp thời đóng luồng và giải phóng file lock
-    time.sleep(3)
+    if task_info and isinstance(task_info, dict):
+        t = task_info.get("thread")
+        if t and hasattr(t, 'join'):
+            t.join(timeout=10)
+        else:
+            time.sleep(5)
+    else:
+        time.sleep(5)
 
     # Xóa thư mục trên Drive cùng toàn bộ dữ liệu bên trong (mặc định luôn xóa sạch)
     gdrive_status = "Đã xóa toàn bộ thư mục và file trên Drive"
@@ -597,6 +623,9 @@ def delete_user(username: str, delete_files: bool = True):
             _RECORDINGS_CACHE["timestamp"] = 0
             _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if (v.get("user") != user and v.get("username") != user)]
 
+    with LIVE_CACHE_LOCK:
+        LIVE_CACHE.pop(user, None)
+
     return {
         "message": f"Đã xóa @{user} khỏi danh sách theo dõi cùng toàn bộ folder và dữ liệu trên Drive",
         "username": user,
@@ -607,6 +636,7 @@ def delete_user(username: str, delete_files: bool = True):
 @app.get("/api/stream/{username}")
 def get_stream_url(username: str):
     user = username.strip().replace("@", "").lower()
+    if not user: raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
     is_live, room_id = get_user_live_status_cached(user)
     if not is_live or not room_id:
         return {
@@ -638,6 +668,7 @@ def get_version():
 def test_live_diagnostic(username: str):
     try:
         user = username.strip().replace("@", "").lower()
+        if not user: raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
         import traceback
         out = {"user": user, "api_version": "2.2.0"}
         try:
@@ -768,16 +799,16 @@ def concat_mp4_segments(segment_files, output_file):
 MAX_CHUNK_SECONDS = 3600  # Đúng 1 tiếng (1h = 3600s), tự động tách video và up lên Cloud
 
 def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Optional[threading.Event] = None):
-    # Chỉ chạy local recorder nếu hệ thống có sẵn ffmpeg
-    if not shutil.which("ffmpeg") and not (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)):
-        return
-
     part_number = 1
     consecutive_failures = 0
     max_consecutive_failures = 4
     max_vip_attempts = 5
 
     try:
+        # Chỉ chạy local recorder nếu hệ thống có sẵn ffmpeg
+        if not shutil.which("ffmpeg") and not (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)):
+            return
+
         while True:
             if stop_event and stop_event.is_set():
                 print(f"[⏹️] [@{user}] Nhận tín hiệu dừng từ người dùng.")
@@ -936,7 +967,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 final_rec_file = concat_mp4_segments(part_segments, output_file)
 
             if stop_event and stop_event.is_set():
-                if os.path.exists(final_rec_file):
+                if final_rec_file and os.path.exists(final_rec_file):
                     try:
                         os.remove(final_rec_file)
                     except Exception:
@@ -946,7 +977,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             is_valid, reason, final_dur = validate_playable_video(final_rec_file, min_duration=5.0, min_size_bytes=250000)
             if not is_valid:
                 print(f"[!] File Phần {part_number} không đạt chuẩn ({reason}). Bỏ qua.")
-                if os.path.exists(final_rec_file):
+                if final_rec_file and os.path.exists(final_rec_file):
                     try:
                         os.remove(final_rec_file)
                     except Exception:
@@ -1036,11 +1067,13 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             gdrive_manager.set_user_recording_status_drive(user, False)
         except Exception:
             pass
+        gc.collect()
 
 @app.post("/api/record/start")
 @app.post("/api/record")
 def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     user = req.username.strip().replace("@", "").lower()
+    if not user: raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
     
     # Đảm bảo streamer có trong danh sách theo dõi
     cfg = load_config()
@@ -1076,6 +1109,9 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     has_ffmpeg = bool(shutil.which("ffmpeg") or (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)))
 
     if is_live:
+        with RECORDING_LOCK:
+            if user in ACTIVE_RECORDING_TASKS:
+                return {"message": f"@{user} đang ghi hình rồi", "is_recording": True, "status": "already_recording"}
         if has_ffmpeg:
             stop_evt = threading.Event()
             with RECORDING_LOCK:
@@ -1120,6 +1156,7 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
 @app.post("/api/record/stop")
 def stop_record(req: AddUserRequest):
     user = req.username.strip().replace("@", "").lower()
+    if not user: raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
     with RECORDING_LOCK:
         task_info = ACTIVE_RECORDING_TASKS.pop(user, None)
         if task_info and isinstance(task_info, dict):
@@ -1136,9 +1173,6 @@ def stop_record(req: AddUserRequest):
         "is_recording": False,
         "username": user
     }
-
-_RECORDINGS_CACHE = {"timestamp": 0, "data": []}
-_RECORDINGS_CACHE_LOCK = threading.Lock()
 
 def list_recordings_from_drive(access_token=None, force_refresh=False):
     """
@@ -1329,10 +1363,15 @@ def get_thumbnail(user: str, filename: str):
     Hỗ trợ đọc từ cả ổ đĩa local và Google Drive.
     """
     user = user.strip().replace("@", "").lower()
+    user = os.path.basename(user)
+    filename = os.path.basename(filename)
     clean_name = filename.replace(".jpg", "").replace(".mp4", "")
     
     video_path = os.path.join(BASE_DIR, user, clean_name + ".mp4")
     thumb_path = os.path.join(BASE_DIR, user, clean_name + ".jpg")
+
+    resolved = os.path.abspath(video_path)
+    if not resolved.startswith(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
 
     # 1. Nếu thumbnail đã có sẵn dưới máy local
     if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 500:
@@ -1353,7 +1392,8 @@ def get_thumbnail(user: str, filename: str):
             headers = {"Authorization": f"Bearer {tok}"}
             
             # Tìm ảnh .jpg trước
-            q_thumb = f"name = '{clean_name}.jpg' and '{user_fid}' in parents and trashed = false"
+            safe_name = clean_name.replace("'", "\\'")
+            q_thumb = f"name = '{safe_name}.jpg' and '{user_fid}' in parents and trashed = false"
             res_th = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_thumb, "fields": "files(id)"}, timeout=10)
             th_files = res_th.json().get("files", [])
             if th_files:
@@ -1366,7 +1406,7 @@ def get_thumbnail(user: str, filename: str):
                     img_res.close()
 
             # Nếu chưa có ảnh .jpg riêng, tìm file .mp4 để lấy thumbnail tích hợp sẵn của Google Drive
-            q_vid = f"name = '{clean_name}.mp4' and '{user_fid}' in parents and trashed = false"
+            q_vid = f"name = '{safe_name}.mp4' and '{user_fid}' in parents and trashed = false"
             res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,thumbnailLink)"}, timeout=10)
             vid_files = res_vid.json().get("files", [])
             if vid_files:
@@ -1386,7 +1426,11 @@ def download_video(user: str, filename: str):
     Tải video về máy qua CDN tốc độ cao của Google Edge (Hỗ trợ IDM đa luồng, tua video Range 206).
     """
     user = user.strip().replace("@", "").lower()
+    user = os.path.basename(user)
+    filename = os.path.basename(filename)
     fp = os.path.join(BASE_DIR, user, filename)
+    resolved = os.path.abspath(fp)
+    if not resolved.startswith(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
     if os.path.exists(fp):
         return FileResponse(path=fp, media_type="video/mp4", filename=filename)
     
@@ -1397,7 +1441,8 @@ def download_video(user: str, filename: str):
             root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
             user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
             headers = {"Authorization": f"Bearer {tok}"}
-            q_vid = f"name = '{filename}' and '{user_fid}' in parents and trashed = false"
+            safe_name = filename.replace("'", "\\'")
+            q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"
             res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id)"}, timeout=10)
             vid_files = res_vid.json().get("files", [])
             if vid_files:
@@ -1425,7 +1470,8 @@ def get_cdn_url(user: str, filename: str, redirect: bool = False):
             root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
             user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
             headers = {"Authorization": f"Bearer {tok}"}
-            q_vid = f"name = '{filename}' and '{user_fid}' in parents and trashed = false"
+            safe_name = filename.replace("'", "\\'")
+            q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"
             res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,size,createdTime)"}, timeout=10)
             vid_files = res_vid.json().get("files", [])
             if vid_files:
@@ -1450,6 +1496,8 @@ def get_cdn_url(user: str, filename: str, redirect: bool = False):
                 }
     except Exception as e:
         print(f"[!] Lỗi CDN trên Google Drive: {e}")
+    
+    raise HTTPException(status_code=404, detail="File video không tồn tại trên CDN Drive")
 
 @app.get("/api/stream-video-id/{file_id}")
 def stream_video_by_id(file_id: str, request: Request):
@@ -1521,7 +1569,12 @@ def stream_video(user: str, filename: str, request: Request):
     Hỗ trợ cả file local và file lưu trên Google Drive với timeline scrub (HTTP 206 Partial Content).
     """
     user = user.strip().replace("@", "").lower()
+    user = os.path.basename(user)
+    filename = os.path.basename(filename)
     local_path = os.path.join(BASE_DIR, user, filename)
+
+    resolved = os.path.abspath(local_path)
+    if not resolved.startswith(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
 
     # 1. Nếu file có sẵn dưới local
     if os.path.exists(local_path):
@@ -1539,7 +1592,8 @@ def stream_video(user: str, filename: str, request: Request):
             root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
             user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
             headers = {"Authorization": f"Bearer {tok}"}
-            q_vid = f"name = '{filename}' and '{user_fid}' in parents and trashed = false"
+            safe_name = filename.replace("'", "\\'")
+            q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"
             res_vid = requests.get(
                 "https://www.googleapis.com/drive/v3/files",
                 headers=headers,
@@ -1559,16 +1613,7 @@ def trigger_gdrive_sync(bg_tasks: BackgroundTasks):
     bg_tasks.add_task(gdrive_manager.sync_all_to_gdrive)
     return {"message": "Đã kích hoạt tiến trình đồng bộ toàn bộ video lên Google Drive ngầm"}
 
-import signal
 
-def _signal_handler(sig, frame):
-    shutdown_all_recording_tasks()
-
-try:
-    signal.signal(signal.SIGTERM, _signal_handler)
-    signal.signal(signal.SIGINT, _signal_handler)
-except Exception:
-    pass
 
 if __name__ == "__main__":
     import uvicorn
