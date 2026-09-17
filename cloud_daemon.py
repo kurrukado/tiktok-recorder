@@ -19,62 +19,8 @@ import auto_h264
 import gdrive_manager
 import notifier
 
-def concat_mp4_segments(segment_files, output_file):
-    """
-    Ghép nối nhiều phân đoạn MP4 cùng chuẩn H.264/AAC thành 1 file duy nhất bằng FFmpeg concat demuxer (-c copy)
-    hoàn toàn không re-encode, 0% CPU, tốc độ < 1 giây.
-    """
-    if not segment_files:
-        return None
-    valid_files = [f for f in segment_files if f and os.path.exists(f) and os.path.getsize(f) > 50000]
-    if not valid_files:
-        return None
-    if len(valid_files) == 1:
-        if valid_files[0] != output_file:
-            try:
-                shutil.move(valid_files[0], output_file)
-            except Exception:
-                return valid_files[0]
-        return output_file
-
-    list_txt = output_file + ".concat.txt"
-    try:
-        with open(list_txt, "w", encoding="utf-8") as f:
-            for seg in valid_files:
-                clean_path = os.path.abspath(seg).replace("\\", "/")
-                f.write(f"file '{clean_path}'\n")
-
-        cmd = [
-            recorder_core.FFMPEG_PATH,
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", list_txt,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            output_file
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
-        if res.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 100000:
-            for seg in valid_files:
-                if seg != output_file and os.path.exists(seg):
-                    try:
-                        os.remove(seg)
-                    except Exception:
-                        pass
-            return output_file
-        else:
-            largest = max(valid_files, key=lambda f: os.path.getsize(f) if os.path.exists(f) else 0)
-            return largest
-    except Exception as e:
-        log(f"[!] Lỗi khi ghép nối phân đoạn video: {e}")
-        return valid_files[0]
-    finally:
-        if os.path.exists(list_txt):
-            try:
-                os.remove(list_txt)
-            except Exception:
-                pass
+# ponytail: centralized in recorder_core to break circular dependency with staging_queue
+concat_mp4_segments = recorder_core.concat_mp4_segments
 
 def log(msg):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -89,12 +35,22 @@ def load_config():
             pass
     return {}
 
+_CONFIG_USERS_LOCK = threading.RLock()
+
 def save_config(cfg):
-    try:
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=4, ensure_ascii=False)
-    except Exception as e:
-        log(f"[!] Không thể ghi config.json: {e}")
+    with _CONFIG_USERS_LOCK:
+        tmp_path = CONFIG_FILE + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=4, ensure_ascii=False)
+            os.replace(tmp_path, CONFIG_FILE)
+        except Exception as e:
+            log(f"[!] Không thể ghi config.json: {e}")
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
 
 _LAST_DRIVE_CHECK = 0
 _CACHED_DRIVE_USERS = None
@@ -102,54 +58,56 @@ _CACHED_DRIVE_USERS = None
 def load_monitored_users():
     global _LAST_DRIVE_CHECK, _CACHED_DRIVE_USERS
 
-    now = time.time()
-    # Kiểm tra danh sách streamer mới từ Google Drive & Supabase sau mỗi 15 giây
-    if now - _LAST_DRIVE_CHECK > 15:
-        _LAST_DRIVE_CHECK = now
-        drive_users = []
-        try:
-            d = gdrive_manager.load_streamers_from_drive()
-            if d and isinstance(d, list):
-                drive_users = [u.strip().replace("@", "").lower() for u in d if u.strip()]
-        except Exception as e:
-            log(f"[!] Lỗi đọc danh sách streamer từ Drive: {e}")
+    with _CONFIG_USERS_LOCK:
+        now = time.time()
+        # Kiểm tra danh sách streamer mới từ Google Drive & Supabase sau mỗi 15 giây
+        if now - _LAST_DRIVE_CHECK > 15:
+            _LAST_DRIVE_CHECK = now
+            drive_users = []
+            d = None
+            try:
+                d = gdrive_manager.load_streamers_from_drive()
+                if d and isinstance(d, list):
+                    drive_users = [u.strip().replace("@", "").lower() for u in d if u.strip()]
+            except Exception as e:
+                log(f"[!] Lỗi đọc danh sách streamer từ Drive: {e}")
 
-        supa_users = []
-        try:
-            import supabase_sync
-            s = supabase_sync.fetch_streamers_from_supabase()
-            if s and isinstance(s, list):
-                supa_users = [u.strip().replace("@", "").lower() for u in s if u.strip()]
-        except Exception:
-            pass
+            supa_users = []
+            try:
+                import supabase_sync
+                s = supabase_sync.fetch_streamers_from_supabase()
+                if s and isinstance(s, list):
+                    supa_users = [u.strip().replace("@", "").lower() for u in s if u.strip()]
+            except Exception:
+                pass
 
-        merged_map = {}
-        for u in drive_users + supa_users:
-            if u:
-                merged_map[u] = True
+            merged_map = {}
+            for u in drive_users + supa_users:
+                if u:
+                    merged_map[u] = True
 
-        if merged_map:
-            cleaned = list(merged_map.keys())
-            if _CACHED_DRIVE_USERS != cleaned:
-                log(f"[*] Cập nhật danh sách từ Google Drive & Supabase ({len(cleaned)} streamers): {cleaned}")
-            _CACHED_DRIVE_USERS = cleaned
+            if merged_map:
+                cleaned = list(merged_map.keys())
+                if _CACHED_DRIVE_USERS != cleaned:
+                    log(f"[*] Cập nhật danh sách từ Google Drive & Supabase ({len(cleaned)} streamers): {cleaned}")
+                _CACHED_DRIVE_USERS = cleaned
 
-            # Tự động lưu lên Google Drive nếu Supabase có thêm streamer mới
-            if supa_users and (set(supa_users) - set(drive_users)):
-                try:
-                    gdrive_manager.save_streamers_to_drive(cleaned)
-                    log(f"💾 Tự động đồng bộ {len(cleaned)} streamer lên Google Drive streamers.json")
-                except Exception as sync_err:
-                    log(f"[!] Lỗi đồng bộ streamers.json: {sync_err}")
+                # Tự động lưu lên Google Drive nếu Supabase có thêm streamer mới (chỉ khi load từ Drive thành công)
+                if d is not None and supa_users and (set(supa_users) - set(drive_users)):
+                    try:
+                        gdrive_manager.save_streamers_to_drive(cleaned)
+                        log(f"💾 Tự động đồng bộ {len(cleaned)} streamer lên Google Drive streamers.json")
+                    except Exception as sync_err:
+                        log(f"[!] Lỗi đồng bộ streamers.json: {sync_err}")
 
-    if _CACHED_DRIVE_USERS is not None:
-        return _CACHED_DRIVE_USERS
+        if _CACHED_DRIVE_USERS is not None:
+            return list(_CACHED_DRIVE_USERS)
 
-    cfg = load_config()
-    users = cfg.get("monitored_users")
-    if users is not None and isinstance(users, list):
-        return [u.strip().replace("@", "").lower() for u in users if u.strip()]
-    return []
+        cfg = load_config()
+        users = cfg.get("monitored_users")
+        if users is not None and isinstance(users, list):
+            return [u.strip().replace("@", "").lower() for u in users if u.strip()]
+        return []
 
 def discover_new_streamers(current_user):
     """
@@ -169,8 +127,11 @@ def discover_new_streamers(current_user):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
         }, timeout=8)
         if resp.status_code == 200 and len(resp.text) <= 3 * 1024 * 1024:
-            found = set(re.findall(r'"uniqueId":"([a-zA-Z0-9_\.]+)"', resp.text))
-            found.discard(current_user.lower())
+            found = set()
+            pk_matches = re.findall(r'"anchor_info":\{[^}]*"uniqueId":"([a-zA-Z0-9_\.]+)"', resp.text)
+            for m in pk_matches:
+                if m.lower() != current_user.lower():
+                    found.add(m.lower())
             for sys_id in ["tiktok", "live", "admin", "help", "privacy"]:
                 found.discard(sys_id)
             return list(found)
@@ -238,11 +199,11 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                                 added_any = True
                                 log(f"✨ [Auto-Discover] Tự động phát hiện streamer mới từ phiên live: @{nf}")
                         if added_any:
-                            global _CACHED_DRIVE_USERS
-                            _CACHED_DRIVE_USERS = current_list
-                            cfg = load_config()
-                            cfg["monitored_users"] = current_list
-                            save_config(cfg)
+                            with _CONFIG_USERS_LOCK:
+                                _CACHED_DRIVE_USERS = current_list
+                                cfg = load_config()
+                                cfg["monitored_users"] = current_list
+                                save_config(cfg)
                             try:
                                 gdrive_manager.save_streamers_to_drive(current_list)
                             except Exception:
@@ -377,14 +338,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 continue
 
             if stop_event and stop_event.is_set():
-                log(f"⏹️ [@{user}] Phát hiện yêu cầu dừng tiến trình. Hủy phần đang dở.")
-                for seg in part_segments:
-                    if seg and os.path.exists(seg):
-                        try:
-                            os.remove(seg)
-                        except Exception:
-                            pass
-                break
+                log(f"⏹️ [@{user}] Nhận tín hiệu dừng phiên. Đang chốt {len(part_segments)} phân đoạn hiện có để lưu trữ an toàn...")
 
             # Ghép tất cả các đoạn của Phần này lại thành 1 file MP4 duy nhất
             final_rec_file = output_file
@@ -407,7 +361,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             is_valid, v_reason, final_dur = validate_playable_video(final_rec_file, min_duration=5.0, min_size_bytes=250000)
             if not is_valid:
                 log(f"[!] [@{user}] File Phần {part_number} không đạt chuẩn ({v_reason}). Bỏ qua.")
-                if os.path.exists(final_rec_file):
+                if final_rec_file and os.path.exists(final_rec_file):
                     try:
                         os.remove(final_rec_file)
                     except Exception:
@@ -444,38 +398,27 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 # 1. Trích xuất thumbnail từ 50% thời lượng của đoạn này
                 thumb_file = None
                 try:
-                    from api_server import extract_middle_thumbnail
+                    from auto_h264 import extract_middle_thumbnail
                     thumb_file = extract_middle_thumbnail(final_rec_file)
                     if thumb_file and os.path.exists(thumb_file):
                         log(f"[✓] [@{user}] Đã tạo thumbnail Phần {part_number}: {os.path.basename(thumb_file)}")
                 except Exception as th_err:
                     log(f"[!] [@{user}] Lỗi tạo thumbnail: {th_err}")
 
-                # 2. Tự động đồng bộ ngay vào Supabase Storage (ảnh thumbnail) & Database
                 rec_file_name = os.path.basename(final_rec_file)
-                rec_file_size = os.path.getsize(final_rec_file) if os.path.exists(final_rec_file) else 0
-                try:
-                    import supabase_sync
-                    log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
-                    supabase_sync.sync_recording_to_supabase(
-                        user=user,
-                        filename=rec_file_name,
-                        size_bytes=rec_file_size,
-                        thumb_source=thumb_file,
-                        source="cloud_daemon"
-                    )
-                except Exception as sb_err:
-                    log(f"[!] [@{user}] Lỗi đồng bộ Supabase: {sb_err}")
+                rec_file_size = os.path.getsize(final_rec_file) if (final_rec_file and os.path.exists(final_rec_file)) else 0
 
-                # 3. Tải video & thumbnail lên Google Drive
+                # 2. Tải video & thumbnail lên Google Drive trước để lấy drive_file_id
+                drive_file_id = None
                 try:
                     log(f"[*] [@{user}] Đang tải Phần {part_number} ({final_dur:.1f}s) lên Google Drive...")
                     tok = gdrive_manager.get_access_token()
                     if tok:
                         r_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
                         s_id = gdrive_manager.find_or_create_folder(user, parent_id=r_id, access_token=tok)
-                        ok = gdrive_manager.upload_file_to_drive(final_rec_file, s_id, access_token=tok)
-                        if ok:
+                        up_res = gdrive_manager.upload_file_to_drive(final_rec_file, s_id, access_token=tok)
+                        if up_res:
+                            drive_file_id = up_res if isinstance(up_res, str) else None
                             log(f"[✓] [@{user}] Đã lưu video Phần {part_number} lên Google Drive!")
                             try:
                                 os.remove(final_rec_file)
@@ -485,14 +428,35 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                         else:
                             log(f"[!] [@{user}] Không thể upload video lên Drive sau các lần thử. Giữ lại file local.")
 
+                        drive_thumb_id = None
                         if thumb_file and os.path.exists(thumb_file):
-                            gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
-                            try:
-                                os.remove(thumb_file)
-                            except Exception:
-                                pass
+                            t_ok = gdrive_manager.upload_file_to_drive(thumb_file, s_id, access_token=tok)
+                            if t_ok and isinstance(t_ok, str):
+                                drive_thumb_id = t_ok
                 except Exception as up_err:
                     log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
+
+                # 3. Tự động đồng bộ ngay vào Supabase Storage (ảnh thumbnail) & Database kèm drive_file_id
+                try:
+                    import supabase_sync
+                    log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
+                    supabase_sync.sync_recording_to_supabase(
+                        user=user,
+                        filename=rec_file_name,
+                        size_bytes=rec_file_size,
+                        thumb_source=thumb_file,
+                        drive_file_id=drive_file_id,
+                        drive_thumb_id=drive_thumb_id,
+                        source="cloud_daemon"
+                    )
+                except Exception as sb_err:
+                    log(f"[!] [@{user}] Lỗi đồng bộ Supabase: {sb_err}")
+                finally:
+                    if thumb_file and os.path.exists(thumb_file):
+                        try:
+                            os.remove(thumb_file)
+                        except Exception:
+                            pass
 
             part_number += 1
 
@@ -547,6 +511,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             gdrive_manager.set_user_recording_status_drive(user, False)
         except Exception:
             pass
+        gc.collect()
         log(f"⏹️ [@{user}] Đã đóng luồng ghi hình.")
 
 def run_daemon(max_minutes=210, interval=25, auto_discover=True):
@@ -586,12 +551,13 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                 ACTIVE_RECORDERS.pop(u, None)
             active_now = list(ACTIVE_RECORDERS.keys())
 
-        # Gửi Heartbeat lên Google Drive cho tất cả các streamer đang quay thực tế
-        for act_u in active_now:
-            try:
-                gdrive_manager.set_user_recording_status_drive(act_u, True)
-            except Exception:
-                pass
+        # Gửi Heartbeat lên Google Drive cho tất cả các streamer đang quay thực tế (định kỳ mỗi 3 chu kỳ để tiết kiệm quota)
+        if session_count % 3 == 0:
+            for act_u in active_now:
+                try:
+                    gdrive_manager.set_user_recording_status_drive(act_u, True)
+                except Exception:
+                    pass
 
         # Kiểm tra điều kiện luân chuyển phiên mượt mà (Graceful Rotation)
         if elapsed >= max_seconds:
@@ -625,7 +591,20 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
             active_set = set(ACTIVE_RECORDERS.keys())
             slots_available = MAX_CONCURRENT_RECORDERS - len(active_set)
 
-        users_to_check = [u for u in users if u not in active_set]
+        # Tránh ghi đè trùng lặp với Render/local runner nếu đang có heartbeat < 600s trên Drive
+        drive_busy_users = set()
+        try:
+            drive_details = gdrive_manager.load_active_recordings_from_drive(as_details=True) or []
+            now_ts = int(time.time())
+            for it in drive_details:
+                u_name = it.get("username") if isinstance(it, dict) else str(it)
+                up_at = it.get("updated_at", 0) if isinstance(it, dict) else 0
+                if u_name and (now_ts - up_at < 600):
+                    drive_busy_users.add(u_name.strip().replace("@", "").lower())
+        except Exception:
+            pass
+
+        users_to_check = [u for u in users if u not in active_set and u not in drive_busy_users]
 
         if users_to_check and slots_available > 0:
             import concurrent.futures
@@ -640,29 +619,27 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                 check_results = list(executor.map(_check, users_to_check))
 
             for user, (is_live, room_id) in check_results:
+                if not (is_live and room_id):
+                    continue
+
+                stop_ev = threading.Event()
+                t = threading.Thread(
+                    target=streamer_recording_worker,
+                    args=(user, room_id, auto_discover, stop_ev),
+                    daemon=True
+                )
                 with RECORDERS_LOCK:
                     if user in ACTIVE_RECORDERS or len(ACTIVE_RECORDERS) >= MAX_CONCURRENT_RECORDERS:
                         continue
-
-                if is_live and room_id:
-                    log(f"🔴 PHÁT HIỆN LIVESTREAM: @{user} đang trực tiếp (Room ID: {room_id})")
-                    notifier.send_telegram(f"🔴 <b>STREAMER ĐANG LIVE!</b>\n👤 <code>@{user}</code> bắt đầu phát livestream.\nĐang tự động ghi hình đa luồng HD H.264 (< 2 tiếng/phần)...")
-
-                    # Khởi chạy luồng ghi hình riêng biệt (không chặn luồng quét)
-                    stop_ev = threading.Event()
-                    t = threading.Thread(
-                        target=streamer_recording_worker,
-                        args=(user, room_id, auto_discover, stop_ev),
-                        daemon=False
-                    )
-                    with RECORDERS_LOCK:
-                        ACTIVE_RECORDERS[user] = {
-                            "thread": t,
-                            "start_time": time.time(),
-                            "stop_event": stop_ev
-                        }
-                    t.start()
-                    time.sleep(0.5)
+                    ACTIVE_RECORDERS[user] = {
+                        "thread": t,
+                        "start_time": time.time(),
+                        "stop_event": stop_ev
+                    }
+                log(f"🔴 PHÁT HIỆN LIVESTREAM: @{user} đang trực tiếp (Room ID: {room_id})")
+                notifier.send_telegram(f"🔴 <b>STREAMER ĐANG LIVE!</b>\n👤 <code>@{user}</code> bắt đầu phát livestream.\nĐang tự động ghi hình đa luồng HD H.264 (< 2 tiếng/phần)...")
+                t.start()
+                time.sleep(0.5)
 
         # Smart Jitter Delay để tránh bị TikTok chặn tần suất
         jitter = random.uniform(-2.0, 3.0)

@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import random
+import threading
+import atexit
 from datetime import datetime
 from typing import Optional, Tuple, Dict, Any
 from curl_cffi import requests
@@ -43,7 +45,8 @@ DEFAULT_CONFIG = {
     "telegram_chat_id": "",
     "gdrive_enabled": False,
     "gdrive_remote": "gdrive",
-    "gdrive_delete_local": False
+    "gdrive_delete_local": False,
+    "auto_upscale_1080p": False
 }
 
 def load_config():
@@ -57,8 +60,16 @@ def load_config():
     return DEFAULT_CONFIG.copy()
 
 def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=4, ensure_ascii=False)
+    tmp_path = CONFIG_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=4, ensure_ascii=False)
+        os.replace(tmp_path, CONFIG_FILE)
+    except Exception as e:
+        print(f"[!] Lỗi ghi config: {e}")
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
 
 def load_cookies():
     if os.path.exists(COOKIES_FILE):
@@ -76,16 +87,16 @@ def load_cookies():
     return {}
 
 def save_cookies(cookies_dict):
-    with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-        json.dump(cookies_dict, f, indent=4, ensure_ascii=False)
-    # Also sync to _tiktok_recorder/src/cookies.json if it exists
-    alt_path = os.path.join(BASE_DIR, "_tiktok_recorder", "src", "cookies.json")
-    if os.path.exists(os.path.dirname(alt_path)):
-        try:
-            with open(alt_path, "w", encoding="utf-8") as f:
-                json.dump(cookies_dict, f, indent=4, ensure_ascii=False)
-        except Exception:
-            pass
+    tmp_path = COOKIES_FILE + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(cookies_dict, f, indent=4, ensure_ascii=False)
+        os.replace(tmp_path, COOKIES_FILE)
+    except Exception as e:
+        print(f"[!] Lỗi ghi cookies: {e}")
+        if os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
 
 
 def generate_guest_session(proxy: Optional[str] = None) -> requests.Session:
@@ -149,11 +160,16 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
 
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     try:
-        from curl_cffi import requests as c_req
         api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
         for imp in ["safari15_5", "chrome136"]:
+            api_res = None
             try:
-                api_res = c_req.get(api_url, impersonate=imp, timeout=6)
+                req_kwargs = {"impersonate": imp, "timeout": 6}
+                if proxy:
+                    req_kwargs["proxies"] = {"http": proxy, "https": proxy}
+                if cookies:
+                    req_kwargs["cookies"] = cookies
+                api_res = requests.get(api_url, **req_kwargs)
                 if api_res.status_code == 200:
                     api_json = api_res.json()
                     if isinstance(api_json, dict):
@@ -180,6 +196,12 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
                             return details
             except Exception:
                 continue
+            finally:
+                if api_res is not None:
+                    try:
+                        api_res.close()
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -266,7 +288,7 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
                         pass
 
                 # Kiểm tra text đặc trưng nếu streamer đã tắt live
-                m_stat = re.search(r'"uniqueId":"' + re.escape(user) + r'"[^\}]*?"status":\s*(\d+)', res_text)
+                m_stat = re.search(r'"uniqueId":"' + re.escape(user) + r'"[^\}]*?"status":\s*(\d+)', res_text, re.DOTALL)
                 if m_stat and int(m_stat.group(1)) == 4:
                     details["is_live"] = False
                     details["room_id"] = None
@@ -274,7 +296,7 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
 
                 if not details["is_live"]:
                     r_match = re.search(r'"roomId"[:\"]+(\d{15,25})', res_text)
-                    if r_match and ('"status":2' in res_text or 'liveRoomUserInfo' in res_text):
+                    if r_match and re.search(r'"uniqueId":"' + re.escape(user) + r'"[^\}]*?"status":\s*2', res_text, re.DOTALL):
                         details["is_live"] = True
                         details["room_id"] = r_match.group(1)
 
@@ -351,42 +373,71 @@ def get_live_stream_url(room_id, user=None, cookies=None, session=None, proxy=No
 def classify_stream_urls(raw_urls: list) -> list:
     """
     Sắp xếp các link stream theo thứ tự ưu tiên độ phân giải nghiêm ngặt:
-    Tier 1 (1080p Full HD): link có _or4, full_hd1, _uhd, 1080p, 1080, fhd hoặc luồng origin gốc không bị nén hạ cấp.
+    Tier 1 (1080p Full HD & Luồng Gốc Origin): link có _or4, full_hd1, _uhd, 1080p, 1080, fhd hoặc luồng origin gốc.
     Tier 2 (720p HD): _hd, hd1, 720p, 720.
     Tier 3 (540p/SD): _sd, sd1, sd2, 540p, 480p.
     Tier 4 (360p/LD): _ld, 360p.
     Loại bỏ hoàn toàn luồng chỉ có tiếng (only_audio=1, stream_suffix=ao).
+    FLV luôn luôn xếp TRƯỚC HLS (m3u8) để chống hiện tượng HLS demuxer tự động hạ cấp xuống 360p!
     """
     if not raw_urls:
         return []
     clean = [u.replace('&amp;', '&') for u in raw_urls if "only_audio=1" not in u and "stream_suffix=ao" not in u]
-    p1080_explicit, p1080_origin, p720, psd, pld, other = [], [], [], [], [], []
+    p1080_flv, p1080_hls = [], []
+    p720_flv, p720_hls = [], []
+    psd_flv, psd_hls = [], []
+    pld_flv, pld_hls = [], []
+    other_flv, other_hls = [], []
+
     for u in clean:
         u_lower = u.lower()
-        if any(s in u_lower for s in ("_or4", "full_hd1", "_uhd", "1080p", "1080", "fhd", "_fhd")):
-            p1080_explicit.append(u)
-        elif re.search(r'stream-\d+\.(flv|m3u8)', u_lower) or any(s in u_lower for s in ("origin", "_origin")):
-            p1080_origin.append(u)
-        elif any(s in u_lower for s in ("_hd", "hd1", "720p", "720")):
-            p720.append(u)
-        elif any(s in u_lower for s in ("_sd", "sd1", "sd2", "540p", "480p")):
-            psd.append(u)
-        elif any(s in u_lower for s in ("_ld", "360p")):
-            pld.append(u)
+        is_flv = ".flv" in u_lower
+
+        # Kiểm tra hạ cấp rõ rệt trước: nếu có _ld, 360p thì CHẮC CHẮN là LD
+        is_ld = any(s in u_lower for s in ("_ld", "360p", "ld1", "ld2", "stream_suffix=ld"))
+        is_sd = any(s in u_lower for s in ("_sd", "sd1", "sd2", "540p", "480p", "stream_suffix=sd")) and not is_ld
+        is_explicit_1080 = any(s in u_lower for s in ("_or4", "full_hd1", "_uhd", "1080p", "1080", "fhd", "_fhd")) and not (is_ld or is_sd)
+        is_origin = (re.search(r'stream-\d+\.(flv|m3u8)', u_lower) or any(s in u_lower for s in ("origin", "_origin"))) and not (is_ld or is_sd)
+        is_720 = any(s in u_lower for s in ("_hd", "hd1", "720p", "720")) and not (is_ld or is_sd)
+
+        if is_explicit_1080 or is_origin:
+            (p1080_flv if is_flv else p1080_hls).append(u)
+        elif is_720:
+            (p720_flv if is_flv else p720_hls).append(u)
+        elif is_sd:
+            (psd_flv if is_flv else psd_hls).append(u)
+        elif is_ld:
+            (pld_flv if is_flv else pld_hls).append(u)
         else:
-            other.append(u)
-    return p1080_explicit + p1080_origin + p720 + psd + pld + other
+            (other_flv if is_flv else other_hls).append(u)
+
+    # Ưu tiên tuyệt đối:
+    # 1. 1080p/Origin FLV (Chất lượng gốc, 0% CPU, cố định bitrate không bao giờ tụt 360p)
+    # 2. 720p FLV
+    # 3. 1080p/Origin HLS
+    # 4. 720p HLS
+    # 5. SD FLV / HLS
+    # 6. LD FLV / HLS (360p chỉ là đường cùng)
+    return (
+        p1080_flv + p720_flv +
+        p1080_hls + p720_hls +
+        other_flv + other_hls +
+        psd_flv + psd_hls +
+        pld_flv + pld_hls
+    )
 
 def parse_sdk_stream_data(sdk_data_str: str) -> list:
     """
-    Phân tích chuỗi JSON stream_data của TikTok Live SDK và ưu tiên cố định 1080p Full HD:
-    1. 1080p H.264 (Copy luồng nguyên bản 0% CPU, mượt mà chuẩn tương thích)
-    2. 1080p Codec khác (HEVC/ByteVC1)
-    3. 720p H.264
-    4. 720p Codec khác
-    5. SD (540p/480p)
-    6. LD (360p)
-    Không bao giờ để 720p hoặc 360p vượt lên trên 1080p!
+    Phân tích chuỗi JSON stream_data của TikTok Live SDK và ưu tiên tối đa luồng Origin/1080p chuẩn FLV:
+    1. Origin / 1080p H.264 FLV (Tín hiệu gốc từ camera streamer, 100% bit-for-bit, 0% CPU copy, không tụt fps)
+    2. 720p H.264 FLV (Nếu streamer phát live mobile 720p)
+    3. Origin / 1080p FLV Codec khác (HEVC/ByteVC1)
+    4. 720p FLV Codec khác
+    5. Origin / 1080p HLS (m3u8)
+    6. 720p HLS
+    7. SD (540p/480p)
+    8. LD (360p - chỉ là phương án dự phòng cuối cùng)
+    FLV luôn luôn xếp TRƯỚC HLS để triệt tiêu hoàn toàn lỗi adaptive demuxer tụt về 360p!
     """
     candidates = []
     if not sdk_data_str:
@@ -396,11 +447,13 @@ def parse_sdk_stream_data(sdk_data_str: str) -> list:
         if not isinstance(sdk_json, dict):
             return candidates
 
-        tier_1080_h264, tier_1080_other = [], []
-        tier_720_h264, tier_720_other = [], []
-        tier_sd_h264, tier_sd_other = [], []
-        tier_ld_h264, tier_ld_other = [], []
-        tier_other = []
+        flv_top_h264, flv_top_other = [], []
+        flv_720_h264, flv_720_other = [], []
+        hls_top_h264, hls_top_other = [], []
+        hls_720_h264, hls_720_other = [], []
+        flv_sd, hls_sd = [], []
+        flv_ld, hls_ld = [], []
+        flv_other, hls_other = [], []
 
         for key, entry in sdk_json.items():
             if key == "ao":
@@ -416,35 +469,47 @@ def parse_sdk_stream_data(sdk_data_str: str) -> list:
 
             is_h264 = "h264" in p_str or "avc" in p_str
 
-            # Phân loại độ phân giải chính xác
-            is_1080 = any(s in p_str for s in ("1080", "or4", "uhd", "fhd", "origin")) or key in ("origin", "uhd")
-            is_720 = "720" in p_str or key == "hd" or "stream_suffix\":\"hd\"" in p_str
-            is_sd = any(s in p_str for s in ("540", "480", "sd")) or key == "sd"
-            is_ld = "360" in p_str or key == "ld" or "stream_suffix\":\"ld\"" in p_str
+            # Phân loại độ phân giải an toàn (không dùng substring "sd" dễ nhầm với "stream_description")
+            is_ld = key == "ld" or "stream_suffix\":\"ld\"" in p_str or any(s in p_str for s in ("360p", "\"resolution\":\"360", "width\":360", "height\":360"))
+            is_sd = (key == "sd" or "stream_suffix\":\"sd\"" in p_str or any(s in p_str for s in ("540p", "480p", "\"resolution\":\"540", "\"resolution\":\"480"))) and not is_ld
 
-            if is_1080 and not ("640x1280" in p_str or "720" in p_str or is_sd or is_ld):
-                t_flv, t_hls = (tier_1080_h264, tier_1080_h264) if is_h264 else (tier_1080_other, tier_1080_other)
+            # Luồng origin là luồng gốc xuất phát trực tiếp từ thiết bị/camera streamer
+            is_origin = key in ("origin", "uhd") or "stream_suffix\":\"origin\"" in p_str or "stream_suffix\":\"uhd\"" in p_str
+            is_1080 = any(s in p_str for s in ("1080", "or4", "uhd", "fhd")) and not (is_sd or is_ld)
+            is_720 = ("720" in p_str or key == "hd" or "stream_suffix\":\"hd\"" in p_str) and not (is_sd or is_ld or is_origin or is_1080)
+
+            # Phân loại theo tầng chất lượng
+            if is_origin or is_1080:
+                t_flv = flv_top_h264 if is_h264 else flv_top_other
+                t_hls = hls_top_h264 if is_h264 else hls_top_other
             elif is_720:
-                t_flv, t_hls = (tier_720_h264, tier_720_h264) if is_h264 else (tier_720_other, tier_720_other)
+                t_flv = flv_720_h264 if is_h264 else flv_720_other
+                t_hls = hls_720_h264 if is_h264 else hls_720_other
             elif is_sd:
-                t_flv, t_hls = (tier_sd_h264, tier_sd_h264) if is_h264 else (tier_sd_other, tier_sd_other)
+                t_flv = flv_sd
+                t_hls = hls_sd
             elif is_ld:
-                t_flv, t_hls = (tier_ld_h264, tier_ld_h264) if is_h264 else (tier_ld_other, tier_ld_other)
+                t_flv = flv_ld
+                t_hls = hls_ld
             else:
-                t_flv, t_hls = tier_other, tier_other
+                t_flv = flv_other
+                t_hls = hls_other
 
-            # Luôn ưu tiên FLV trước HLS để tránh adaptive switching giật độ phân giải
-            if flv and flv not in t_flv and flv not in candidates:
+            if flv and flv not in t_flv:
                 t_flv.append(flv)
-            if hls and hls not in t_hls and hls not in candidates:
+            if hls and hls not in t_hls:
                 t_hls.append(hls)
 
+        # Trình tự sắp xếp tối ưu nhất:
+        # FLV Top -> FLV 720p -> HLS Top -> HLS 720p -> Other -> SD -> LD (360p)
         ordered = (
-            tier_1080_h264 + tier_1080_other +
-            tier_720_h264 + tier_720_other +
-            tier_sd_h264 + tier_sd_other +
-            tier_ld_h264 + tier_ld_other +
-            tier_other
+            flv_top_h264 + flv_top_other +
+            flv_720_h264 + flv_720_other +
+            hls_top_h264 + hls_top_other +
+            hls_720_h264 + hls_720_other +
+            flv_other + hls_other +
+            flv_sd + hls_sd +
+            flv_ld + hls_ld
         )
         for u in ordered:
             if u not in candidates:
@@ -461,11 +526,16 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     if user:
         try:
-            from curl_cffi import requests as c_req
             api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
+            req_kwargs = {"timeout": 7}
+            if proxy:
+                req_kwargs["proxies"] = {"http": proxy, "https": proxy}
+            if cookies:
+                req_kwargs["cookies"] = cookies
             for imp in ["safari15_5", "chrome136"]:
+                api_res = None
                 try:
-                    api_res = c_req.get(api_url, impersonate=imp, timeout=7)
+                    api_res = requests.get(api_url, impersonate=imp, **req_kwargs)
                     if api_res.status_code == 200:
                         d = api_res.json().get("data", {}).get("liveRoom", {})
                         sd_str = d.get("streamData", {}).get("pull_data", {}).get("stream_data")
@@ -475,6 +545,12 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
                                 return c_urls
                 except Exception:
                     continue
+                finally:
+                    if api_res is not None and hasattr(api_res, "close"):
+                        try:
+                            api_res.close()
+                        except Exception:
+                            pass
         except Exception:
             pass
 
@@ -500,6 +576,7 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
 
         # First attempt: Direct scrape of live page HTML with session cookies (bypasses 18+ restriction)
         if user:
+            page_res = None
             try:
                 live_page_url = f"https://www.tiktok.com/@{user}/live"
                 page_headers = {
@@ -558,6 +635,12 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
                                 return sorted_hls
             except Exception:
                 pass
+            finally:
+                if page_res and hasattr(page_res, "close"):
+                    try:
+                        page_res.close()
+                    except Exception:
+                        pass
 
         candidates = []
         stream_url_obj = {}
@@ -571,53 +654,61 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
                 "Accept": "*/*",
                 "Origin": "https://www.tiktok.com",
             }
-            res = session.get(url, headers=headers, timeout=10)
+            res = None
             try:
-                data = res.json()
-            except Exception:
-                data = {}
+                res = session.get(url, headers=headers, timeout=10)
+                try:
+                    data = res.json()
+                except Exception:
+                    data = {}
 
-            status_code = data.get("status_code", -1) if isinstance(data, dict) else -1
-            if status_code == 4003110:
-                return "AGE_RESTRICTED"
+                status_code = data.get("status_code", -1) if isinstance(data, dict) else -1
+                if status_code == 4003110:
+                    return "AGE_RESTRICTED"
 
-            room_data = data.get("data") if isinstance(data, dict) else {}
-            room_data = room_data if isinstance(room_data, dict) else {}
-            stream_url_obj = room_data.get("stream_url") if isinstance(room_data, dict) else {}
-            stream_url_obj = stream_url_obj if isinstance(stream_url_obj, dict) else {}
+                room_data = data.get("data") if isinstance(data, dict) else {}
+                room_data = room_data if isinstance(room_data, dict) else {}
+                stream_url_obj = room_data.get("stream_url") if isinstance(room_data, dict) else {}
+                stream_url_obj = stream_url_obj if isinstance(stream_url_obj, dict) else {}
 
-            live_sdk = stream_url_obj.get("live_core_sdk_data")
-            live_sdk = live_sdk if isinstance(live_sdk, dict) else {}
-            pull_data = live_sdk.get("pull_data")
-            pull_data = pull_data if isinstance(pull_data, dict) else {}
-            sdk_data_str = pull_data.get("stream_data")
-            if sdk_data_str and isinstance(sdk_data_str, str):
-                candidates.extend(parse_sdk_stream_data(sdk_data_str))
+                live_sdk = stream_url_obj.get("live_core_sdk_data")
+                live_sdk = live_sdk if isinstance(live_sdk, dict) else {}
+                pull_data = live_sdk.get("pull_data")
+                pull_data = pull_data if isinstance(pull_data, dict) else {}
+                sdk_data_str = pull_data.get("stream_data")
+                if sdk_data_str and isinstance(sdk_data_str, str):
+                    candidates.extend(parse_sdk_stream_data(sdk_data_str))
 
-            # Fallback to direct URLs: FULL_HD1 (1080p) phải là ưu tiên số 1!
-            flv_pull = stream_url_obj.get("flv_pull_url") or {}
-            if isinstance(flv_pull, dict):
-                full_hd = flv_pull.get("FULL_HD1")
-                if full_hd:
-                    if full_hd in candidates:
-                        candidates.remove(full_hd)
-                    candidates.insert(0, full_hd)
-                for k in ("HD1", "SD2", "SD1"):
-                    u = flv_pull.get(k)
-                    if u and u not in candidates:
-                        candidates.append(u)
+                # Fallback to direct URLs: FULL_HD1 (1080p) phải là ưu tiên số 1!
+                flv_pull = stream_url_obj.get("flv_pull_url") or {}
+                if isinstance(flv_pull, dict):
+                    full_hd = flv_pull.get("FULL_HD1")
+                    if full_hd:
+                        if full_hd in candidates:
+                            candidates.remove(full_hd)
+                        candidates.insert(0, full_hd)
+                    for k in ("HD1", "SD2", "SD1"):
+                        u = flv_pull.get(k)
+                        if u and u not in candidates:
+                            candidates.append(u)
 
-            hls_pull = stream_url_obj.get("hls_pull_url")
-            if isinstance(hls_pull, str) and hls_pull and hls_pull not in candidates:
-                candidates.append(hls_pull)
-            elif isinstance(hls_pull, dict):
-                hls_fhd = hls_pull.get("FULL_HD1")
-                if hls_fhd and hls_fhd not in candidates:
-                    candidates.append(hls_fhd)
-                for k in ("HD1", "SD2", "SD1"):
-                    u = hls_pull.get(k)
-                    if u and u not in candidates:
-                        candidates.append(u)
+                hls_pull = stream_url_obj.get("hls_pull_url")
+                if isinstance(hls_pull, str) and hls_pull and hls_pull not in candidates:
+                    candidates.append(hls_pull)
+                elif isinstance(hls_pull, dict):
+                    hls_fhd = hls_pull.get("FULL_HD1")
+                    if hls_fhd and hls_fhd not in candidates:
+                        candidates.append(hls_fhd)
+                    for k in ("HD1", "SD2", "SD1"):
+                        u = hls_pull.get(k)
+                        if u and u not in candidates:
+                            candidates.append(u)
+            finally:
+                if res and hasattr(res, "close"):
+                    try:
+                        res.close()
+                    except Exception:
+                        pass
 
         return candidates
     except Exception:
@@ -642,9 +733,13 @@ def _safe_stop_ffmpeg(proc, timeout=8):
         try:
             proc.stdin.write(b"q\n")
             proc.stdin.flush()
-            proc.stdin.close()
         except Exception:
             pass
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception:
+                pass
     try:
         proc.wait(timeout=timeout)
         return
@@ -663,6 +758,20 @@ def _safe_stop_ffmpeg(proc, timeout=8):
         proc.wait(timeout=2)
     except Exception:
         pass
+
+GLOBAL_RECORDING_PROCS = set()
+_GLOBAL_PROCS_LOCK = threading.Lock()
+
+def _cleanup_global_procs():
+    with _GLOBAL_PROCS_LOCK:
+        for p in list(GLOBAL_RECORDING_PROCS):
+            try:
+                _safe_stop_ffmpeg(p, timeout=2)
+            except Exception:
+                pass
+        GLOBAL_RECORDING_PROCS.clear()
+
+atexit.register(_cleanup_global_procs)
 
 def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx", duration=None, stop_event=None, auto_sync_gdrive=True, is_sub_only: bool = False):
     """
@@ -688,6 +797,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
     cmd = [
         FFMPEG_PATH,
         "-y",
+        "-stdin",
         "-rw_timeout", "60000000",
         "-reconnect", "1",
         "-reconnect_at_eof", "1",
@@ -709,7 +819,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         "-sn",
         "-dn",
         "-bsf:a", "aac_adtstoasc",
-        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+        "-movflags", "+faststart",
     ]
     if duration:
         cmd.extend(["-t", str(duration)])
@@ -725,6 +835,8 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
             stdin=subprocess.PIPE,
             creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if sys.platform == "win32" else 0
         )
+        with _GLOBAL_PROCS_LOCK:
+            GLOBAL_RECORDING_PROCS.add(proc)
         
         last_size = 0
         last_growth_time = time.time()
@@ -762,8 +874,8 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
                 _safe_stop_ffmpeg(proc, timeout=8)
                 break
 
-            # Quick Watchdog cho VIP Sub-Only: khi dung lượng không tăng trong >= 6 giây, lập tức chốt file preview nhanh chóng
-            if is_sub_only and size_bytes >= 250 * 1024 and stagnant_seconds >= 6:
+            # Quick Watchdog cho VIP Sub-Only: khi dung lượng không tăng trong >= 14 giây, lập tức chốt file preview nhanh chóng
+            if is_sub_only and size_bytes >= 250 * 1024 and stagnant_seconds >= 14:
                 print(f"\n\n[⚡ VIP Preview] [@{target_user}] Luồng preview Sub-Only dừng truyền tải sau {stagnant_seconds}s ({size_mb:.2f} MB). Đang chốt file preview nhanh chóng...")
                 _safe_stop_ffmpeg(proc, timeout=4)
                 break
@@ -811,7 +923,11 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         print(f"\n[!] Lỗi trong tiến trình ghi hình: {e}")
     finally:
         if proc:
-            _safe_stop_ffmpeg(proc, timeout=6)
+            try:
+                _safe_stop_ffmpeg(proc, timeout=6)
+            finally:
+                with _GLOBAL_PROCS_LOCK:
+                    GLOBAL_RECORDING_PROCS.discard(proc)
 
     if os.path.exists(output_filename):
         from auto_h264 import validate_playable_video
@@ -821,12 +937,13 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
             print(f"\n[✓] Ghi hình thành công! File đạt chuẩn ({dur:.1f}s, {final_size:.2f} MB):")
             print(f"    --> {output_filename}\n")
             
-            # Tự động kiểm tra và chuyển sang H.264 nếu cần thiết
+            # Tự động kiểm tra và chuyển sang H.264 nếu cần thiết, và upscale lên 1080p nếu được yêu cầu
             try:
-                from auto_h264 import ensure_h264
+                from auto_h264 import ensure_h264, upscale_to_1080p_if_needed
                 output_filename = ensure_h264(output_filename)
+                output_filename = upscale_to_1080p_if_needed(output_filename)
             except Exception as e:
-                print(f"[!] Lỗi khi tự động kiểm tra định dạng H.264: {e}")
+                print(f"[!] Lỗi khi tự động kiểm tra định dạng H.264 / upscale: {e}")
 
             # Validate lại sau khi chuyển đổi định dạng
             is_valid_after, reason_after, _ = validate_playable_video(output_filename, min_duration=5.0, min_size_bytes=250000)
@@ -866,5 +983,68 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
     else:
         print("\n[!] Stream ngắt hoặc không nhận được dữ liệu hợp lệ.")
         return None
+
+def concat_mp4_segments(segment_files, output_file):
+    """
+    Ghép nối nhiều phân đoạn MP4 cùng chuẩn H.264/AAC thành 1 file duy nhất bằng FFmpeg concat demuxer (-c copy)
+    hoàn toàn không re-encode, 0% CPU, tốc độ < 1 giây.
+    """
+    if not segment_files:
+        return None
+    valid_files = [f for f in segment_files if f and os.path.exists(f) and os.path.getsize(f) > 50000]
+    if not valid_files:
+        return None
+    if len(valid_files) == 1:
+        if os.path.abspath(valid_files[0]) != os.path.abspath(output_file):
+            try:
+                shutil.copy2(valid_files[0], output_file)
+            except Exception:
+                return valid_files[0]
+        return output_file
+
+    list_txt = output_file + ".concat.txt"
+    try:
+        with open(list_txt, "w", encoding="utf-8") as f:
+            for seg in valid_files:
+                clean_path = os.path.abspath(seg).replace("\\", "/").replace("'", "'\\''")
+                f.write(f"file '{clean_path}'\n")
+
+        cmd = [
+            FFMPEG_PATH,
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_txt,
+            "-c", "copy",
+            "-movflags", "+faststart",
+            output_file
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
+        if res.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 100000:
+            for seg in valid_files:
+                if os.path.abspath(seg) != os.path.abspath(output_file) and os.path.exists(seg):
+                    try:
+                        os.remove(seg)
+                    except Exception:
+                        pass
+            return output_file
+        else:
+            if os.path.exists(output_file):
+                try:
+                    os.remove(output_file)
+                except Exception:
+                    pass
+            largest = max(valid_files, key=lambda f: os.path.getsize(f) if os.path.exists(f) else 0)
+            return largest
+    except Exception as e:
+        print(f"[!] Lỗi khi ghép nối phân đoạn video: {e}")
+        return valid_files[0]
+    finally:
+        if os.path.exists(list_txt):
+            try:
+                os.remove(list_txt)
+            except Exception:
+                pass
+
 
 

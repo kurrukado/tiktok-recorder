@@ -15,6 +15,10 @@ if sys.platform == "win32":
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
+DEFAULT_GDRIVE_CLIENT_ID = ""
+DEFAULT_GDRIVE_CLIENT_SECRET = ""
+DEFAULT_GDRIVE_REFRESH_TOKEN = ""
+
 CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
@@ -35,16 +39,19 @@ def load_config():
 
 def get_access_token(force_refresh=False):
     global _CACHED_ACCESS_TOKEN
-    now = time.time()
     with _TOKEN_LOCK:
-        if not force_refresh and _CACHED_ACCESS_TOKEN["token"] and now < _CACHED_ACCESS_TOKEN["expires_at"]:
-            return _CACHED_ACCESS_TOKEN["token"]
+        now = time.time()
+        # ponytail: Chống stampede khi nhiều thread đồng thời gặp 401 và force_refresh
+        if _CACHED_ACCESS_TOKEN["token"] and now < _CACHED_ACCESS_TOKEN["expires_at"]:
+            if not force_refresh or (_CACHED_ACCESS_TOKEN.get("last_refreshed_at", 0) > now - 10):
+                return _CACHED_ACCESS_TOKEN["token"]
 
         cfg = load_config()
         refresh_token = (
             os.environ.get("GDRIVE_REFRESH_TOKEN")
             or os.environ.get("GOOGLE_DRIVE_REFRESH_TOKEN")
             or cfg.get("gdrive_refresh_token")
+            or DEFAULT_GDRIVE_REFRESH_TOKEN
         )
         if not refresh_token:
             return None
@@ -77,7 +84,22 @@ def get_access_token(force_refresh=False):
                 expires_in = res_data.get("expires_in", 3600)
                 _CACHED_ACCESS_TOKEN["token"] = token
                 _CACHED_ACCESS_TOKEN["expires_at"] = now + max(expires_in - 300, 60)
+                _CACHED_ACCESS_TOKEN["last_refreshed_at"] = now
                 return token
+            elif cfg.get("gdrive_refresh_token") and refresh_token != cfg.get("gdrive_refresh_token"):
+                # Tự động thử lại với refresh_token trong config.json nếu token từ biến môi trường bị lỗi
+                data["refresh_token"] = cfg.get("gdrive_refresh_token")
+                res_retry = requests.post(url, data=data, timeout=15)
+                if res_retry.status_code == 200:
+                    res_data = res_retry.json()
+                    token = res_data.get("access_token")
+                    expires_in = res_data.get("expires_in", 3600)
+                    _CACHED_ACCESS_TOKEN["token"] = token
+                    _CACHED_ACCESS_TOKEN["expires_at"] = now + max(expires_in - 300, 60)
+                    _CACHED_ACCESS_TOKEN["last_refreshed_at"] = now
+                    return token
+                else:
+                    print(f"[!] Lỗi khi lấy Access Token từ Google (kể cả config.json): {res_retry.text}")
             else:
                 print(f"[!] Lỗi khi lấy Access Token từ Google: {res.text}")
         except Exception as e:
@@ -98,7 +120,8 @@ def find_or_create_folder(folder_name, parent_id=None, access_token=None):
     headers = {"Authorization": f"Bearer {access_token}"}
     
     # Check if folder exists
-    q = f"name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    safe_folder_name = folder_name.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name = '{safe_folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id:
         q += f" and '{parent_id}' in parents"
 
@@ -152,15 +175,24 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
     headers = {"Authorization": f"Bearer {access_token}"}
 
     # Check if file already exists in this folder
-    q = f"name = '{file_name}' and '{parent_folder_id}' in parents and trashed = false"
+    safe_file_name = file_name.replace("\\", "\\\\").replace("'", "\\'")
+    q = f"name = '{safe_file_name}' and '{parent_folder_id}' in parents and trashed = false"
     check_url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,size)"
     try:
         c_res = requests.get(check_url, headers=headers, timeout=15)
         if c_res.status_code == 200:
             existing = c_res.json().get("files", [])
             if existing:
-                print(f"  [-] File đã tồn tại trên Drive: {file_name} ({file_size_mb:.2f} MB), bỏ qua.")
-                return True
+                drive_sz = int(existing[0].get("size", 0))
+                if drive_sz == file_size:
+                    print(f"  [-] File đã tồn tại toàn vẹn trên Drive: {file_name} ({file_size_mb:.2f} MB), bỏ qua.")
+                    return existing[0].get("id") or True
+                else:
+                    print(f"  [!] Phát hiện file dở dang trên Drive ({drive_sz} != {file_size} bytes). Đang xóa để tải lại toàn vẹn...")
+                    try:
+                        requests.delete(f"https://www.googleapis.com/drive/v3/files/{existing[0]['id']}", headers=headers, timeout=10)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -215,11 +247,53 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
                 for attempt in range(5):
                     try:
                         put_res = requests.put(upload_url, headers=headers_chunk, data=chunk, timeout=60)
-                        if put_res.status_code in (200, 201, 308):
+                        if put_res.status_code in (200, 201):
+                            chunk_ok = True
+                            uploaded_bytes += chunk_len
+                            break
+                        elif put_res.status_code == 308:
+                            range_hdr = put_res.headers.get("Range")
+                            if range_hdr and "-" in range_hdr:
+                                try:
+                                    last_byte = int(range_hdr.split("-")[-1])
+                                    uploaded_bytes = last_byte + 1
+                                    f.seek(uploaded_bytes)
+                                except Exception:
+                                    uploaded_bytes += chunk_len
+                            else:
+                                uploaded_bytes = 0
+                                f.seek(0)
                             chunk_ok = True
                             break
-                        elif put_res.status_code in (500, 502, 503, 504):
+                        elif put_res.status_code in (400, 416):
+                            try:
+                                q_res = requests.put(
+                                    upload_url,
+                                    headers={"Content-Range": f"bytes */{file_size}"},
+                                    timeout=15
+                                )
+                                if q_res.status_code == 308:
+                                    r_hdr = q_res.headers.get("Range")
+                                    if r_hdr and "-" in r_hdr:
+                                        last_byte = int(r_hdr.split("-")[-1])
+                                        uploaded_bytes = last_byte + 1
+                                    else:
+                                        uploaded_bytes = 0
+                                    f.seek(uploaded_bytes)
+                                    put_res = q_res
+                                    chunk_ok = True
+                                    break
+                                elif q_res.status_code in (200, 201):
+                                    put_res = q_res
+                                    chunk_ok = True
+                                    uploaded_bytes = file_size
+                                    break
+                            except Exception:
+                                pass
                             time.sleep(1.5 * (attempt + 1))
+                            continue
+                        elif put_res.status_code in (429, 500, 502, 503, 504) or (put_res.status_code == 403 and "rateLimit" in put_res.text):
+                            time.sleep(2.0 * (attempt + 1))
                             continue
                         else:
                             print(f"\n  [!] Google Drive trả về mã {put_res.status_code}: {put_res.text}")
@@ -230,8 +304,6 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
                 if not chunk_ok or put_res is None:
                     print(f"\n  [!] Không thể upload chunk {uploaded_bytes}-{end_byte} sau 5 lần thử.")
                     return False
-
-                uploaded_bytes += chunk_len
                 curr_mb = uploaded_bytes / (1024 * 1024)
                 pct = (uploaded_bytes / file_size) * 100
                 speed = curr_mb / (time.time() - start_time + 0.001)
@@ -243,13 +315,37 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
             return False
 
         print(f"\r  [✓] Đã tải lên Drive thành công: {file_name} ({file_size_mb:.2f} MB)                 ")
+        f_id = None
         try:
             res_data = put_res.json()
             f_id = res_data.get("id")
-            if f_id:
-                make_file_public(f_id, access_token=access_token)
         except Exception:
             pass
+
+        if f_id:
+            try:
+                make_file_public(f_id, access_token=access_token)
+            except Exception:
+                pass
+            return f_id
+
+        # Fallback: nếu response không có id, truy vấn lại Drive theo tên file vừa upload
+        try:
+            q_verify = f"name = '{safe_file_name}' and '{parent_folder_id}' in parents and trashed = false"
+            v_url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q_verify)}&fields=files(id)"
+            v_res = requests.get(v_url, headers=headers, timeout=10)
+            if v_res.status_code == 200:
+                v_files = v_res.json().get("files", [])
+                if v_files and v_files[0].get("id"):
+                    v_id = v_files[0].get("id")
+                    try:
+                        make_file_public(v_id, access_token=access_token)
+                    except Exception:
+                        pass
+                    return v_id
+        except Exception:
+            pass
+
         return True
 
     except Exception as e:
@@ -349,19 +445,19 @@ def load_streamers_from_drive(access_token=None):
             headers = {"Authorization": f"Bearer {access_token}"}
             q = f"name = 'streamers.json' and '{root_id}' in parents and trashed = false"
             url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-            res = requests.get(url, headers=headers, timeout=10)
-            if res.status_code == 200:
-                files = res.json().get("files", [])
-                if files:
-                    file_id = files[0]["id"]
-                    down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-                    d_res = requests.get(down_url, headers=headers, timeout=10)
-                    if d_res.status_code == 200:
-                        data = d_res.json()
-                        if isinstance(data, list):
-                            return data
-                        if isinstance(data, dict) and "streamers" in data:
-                            return data["streamers"]
+            with requests.get(url, headers=headers, timeout=10) as res:
+                if res.status_code == 200:
+                    files = res.json().get("files", [])
+                    if files:
+                        file_id = files[0]["id"]
+                        down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+                        with requests.get(down_url, headers=headers, timeout=10) as d_res:
+                            if d_res.status_code == 200:
+                                data = d_res.json()
+                                if isinstance(data, list):
+                                    return data
+                                if isinstance(data, dict) and "streamers" in data:
+                                    return data["streamers"]
         except Exception as e:
             print(f"[!] Lỗi đọc streamers.json từ Drive: {e}")
         return None
@@ -378,34 +474,37 @@ def save_streamers_to_drive(streamers_list, access_token=None):
             headers = {"Authorization": f"Bearer {access_token}"}
             q = f"name = 'streamers.json' and '{root_id}' in parents and trashed = false"
             url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-            res = requests.get(url, headers=headers, timeout=10)
             file_id = None
-            if res.status_code == 200:
-                files = res.json().get("files", [])
-                if files:
-                    file_id = files[0]["id"]
+            with requests.get(url, headers=headers, timeout=10) as res:
+                if res.status_code == 200:
+                    files = res.json().get("files", [])
+                    if files:
+                        file_id = files[0]["id"]
 
             content_bytes = json.dumps(streamers_list, indent=2, ensure_ascii=False).encode("utf-8")
             if file_id:
                 up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
-                up_res = requests.patch(
+                with requests.patch(
                     up_url,
                     headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
                     data=content_bytes,
                     timeout=15
-                )
-                return up_res.status_code == 200
-            else:
-                meta = {
-                    "name": "streamers.json",
-                    "parents": [root_id]
-                }
-                files = {
-                    "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
-                    "file": ("streamers.json", content_bytes, "application/json")
-                }
-                create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-                c_res = requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files, timeout=15)
+                ) as up_res:
+                    if up_res.status_code == 200:
+                        return True
+                    if up_res.status_code != 404:
+                        return False
+
+            meta = {
+                "name": "streamers.json",
+                "parents": [root_id]
+            }
+            files = {
+                "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
+                "file": ("streamers.json", content_bytes, "application/json")
+            }
+            create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+            with requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files, timeout=15) as c_res:
                 return c_res.status_code in [200, 201]
         except Exception as e:
             print(f"[!] Lỗi ghi streamers.json lên Drive: {e}")
@@ -428,35 +527,35 @@ def load_active_recordings_from_drive(access_token=None, as_details=False):
             headers = {"Authorization": f"Bearer {access_token}"}
             q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
             url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-            res = requests.get(url, headers=headers, timeout=8)
-            if res.status_code == 200:
-                files = res.json().get("files", [])
-                if files:
-                    file_id = files[0]["id"]
-                    down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-                    d_res = requests.get(down_url, headers=headers, timeout=8)
-                    if d_res.status_code == 200:
-                        raw_data = d_res.json()
-                        if not isinstance(raw_data, list):
-                            return []
+            with requests.get(url, headers=headers, timeout=8) as res:
+                if res.status_code == 200:
+                    files = res.json().get("files", [])
+                    if files:
+                        file_id = files[0]["id"]
+                        down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+                        with requests.get(down_url, headers=headers, timeout=8) as d_res:
+                            if d_res.status_code == 200:
+                                raw_data = d_res.json()
+                                if not isinstance(raw_data, list):
+                                    return []
 
-                        details = []
-                        now_ts = int(time.time())
-                        for item in raw_data:
-                            if isinstance(item, dict) and "username" in item:
-                                details.append({
-                                    "username": str(item["username"]).strip().replace("@", "").lower(),
-                                    "updated_at": item.get("updated_at", now_ts)
-                                })
-                            elif isinstance(item, str) and item.strip():
-                                details.append({
-                                    "username": item.strip().replace("@", "").lower(),
-                                    "updated_at": now_ts
-                                })
+                                details = []
+                                now_ts = int(time.time())
+                                for item in raw_data:
+                                    if isinstance(item, dict) and "username" in item:
+                                        details.append({
+                                            "username": str(item["username"]).strip().replace("@", "").lower(),
+                                            "updated_at": item.get("updated_at", now_ts)
+                                        })
+                                    elif isinstance(item, str) and item.strip():
+                                        details.append({
+                                            "username": item.strip().replace("@", "").lower(),
+                                            "updated_at": now_ts
+                                        })
 
-                        if as_details:
-                            return details
-                        return [d["username"] for d in details]
+                                if as_details:
+                                    return details
+                                return [d["username"] for d in details]
         except Exception as e:
             print(f"[!] Lỗi đọc active_recordings.json từ Drive: {e}")
         return []
@@ -477,21 +576,21 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
             
             q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
             url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-            res = requests.get(url, headers=headers, timeout=8)
             file_id = None
             current_raw = []
-            if res.status_code == 200:
-                files = res.json().get("files", [])
-                if files:
-                    file_id = files[0]["id"]
-                    try:
-                        d_res = requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=8)
-                        if d_res.status_code == 200:
-                            current_raw = d_res.json()
-                            if not isinstance(current_raw, list):
-                                current_raw = []
-                    except Exception:
-                        pass
+            with requests.get(url, headers=headers, timeout=8) as res:
+                if res.status_code == 200:
+                    files = res.json().get("files", [])
+                    if files:
+                        file_id = files[0]["id"]
+                        try:
+                            with requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=8) as d_res:
+                                if d_res.status_code == 200:
+                                    current_raw = d_res.json()
+                                    if not isinstance(current_raw, list):
+                                        current_raw = []
+                        except Exception:
+                            pass
 
             user = user.strip().replace("@", "").lower()
             now_ts = int(time.time())
@@ -525,7 +624,8 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
             content_bytes = json.dumps(normalized_active, indent=2, ensure_ascii=False).encode("utf-8")
             if file_id:
                 up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
-                requests.patch(up_url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=content_bytes, timeout=10)
+                with requests.patch(up_url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=content_bytes, timeout=10) as patch_res:
+                    pass
             else:
                 meta = {"name": "active_recordings.json", "parents": [root_id]}
                 files_data = {
@@ -533,7 +633,8 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
                     "file": ("active_recordings.json", content_bytes, "application/json")
                 }
                 create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-                requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files_data, timeout=10)
+                with requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files_data, timeout=10) as post_res:
+                    pass
             return True
         except Exception as e:
             print(f"[!] Lỗi cập nhật active_recordings lên Drive: {e}")
@@ -576,7 +677,8 @@ def delete_streamer_folder_drive(user: str, access_token=None):
         deleted_files = 0
         
         # 1. Tìm và xóa vĩnh viễn tất cả thư mục mang tên user bên trong tiktok-record
-        q = f"name = '{user}' and mimeType = 'application/vnd.google-apps.folder' and '{root_id}' in parents and trashed = false"
+        safe_user = user.replace("'", "\\'")
+        q = f"name = '{safe_user}' and mimeType = 'application/vnd.google-apps.folder' and '{root_id}' in parents and trashed = false"
         url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
@@ -590,7 +692,7 @@ def delete_streamer_folder_drive(user: str, access_token=None):
 
         # 2. Xóa các file video/thumbnail độc lập thuộc về user còn sót lại trực tiếp dưới root tiktok-record
         try:
-            q_files = f"'{root_id}' in parents and (name contains '{user}_' or name contains '{user}.') and trashed = false"
+            q_files = f"'{root_id}' in parents and (name starts with '{safe_user}_' or name starts with '{safe_user}.') and trashed = false"
             url_files = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q_files)}&fields=files(id,name)"
             res_files = requests.get(url_files, headers=headers, timeout=10)
             if res_files.status_code == 200:
@@ -610,7 +712,7 @@ def delete_streamer_folder_drive(user: str, access_token=None):
                 s_files = s_res.json().get("files", [])
                 if s_files:
                     s_root_id = s_files[0]["id"]
-                    u_stag_q = f"name = '{user}' and mimeType = 'application/vnd.google-apps.folder' and '{s_root_id}' in parents and trashed = false"
+                    u_stag_q = f"name = '{safe_user}' and mimeType = 'application/vnd.google-apps.folder' and '{s_root_id}' in parents and trashed = false"
                     u_s_res = requests.get(f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(u_stag_q)}&fields=files(id)", headers=headers, timeout=10)
                     if u_s_res.status_code == 200:
                         for sf in u_s_res.json().get("files", []):
@@ -625,6 +727,9 @@ def delete_streamer_folder_drive(user: str, access_token=None):
                 _FOLDER_CACHE.pop((user, root_id), None)
                 _FOLDER_CACHE.pop((user, None), None)
                 _FOLDER_CACHE.pop(("_staging", root_id), None)
+                for k in list(_FOLDER_CACHE.keys()):
+                    if k[0] == user:
+                        _FOLDER_CACHE.pop(k, None)
         except Exception:
             pass
 
@@ -643,17 +748,26 @@ def download_file_from_drive(file_id, dest_path, access_token=None):
         return False
     headers = {"Authorization": f"Bearer {access_token}"}
     url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
+    tmp_dest = dest_path + ".tmp"
     try:
         os.makedirs(os.path.dirname(os.path.abspath(dest_path)), exist_ok=True)
         with requests.get(url, headers=headers, stream=True, timeout=60) as r:
             r.raise_for_status()
-            with open(dest_path, "wb") as f:
+            with open(tmp_dest, "wb") as f:
                 for chunk in r.iter_content(chunk_size=1024 * 1024):
                     if chunk:
                         f.write(chunk)
-        return os.path.exists(dest_path) and os.path.getsize(dest_path) > 0
+        if os.path.exists(tmp_dest) and os.path.getsize(tmp_dest) > 0:
+            os.replace(tmp_dest, dest_path)
+            return True
+        return False
     except Exception as e:
         print(f"[!] Lỗi tải file {file_id} từ Drive: {e}")
+        if os.path.exists(tmp_dest):
+            try:
+                os.remove(tmp_dest)
+            except Exception:
+                pass
         return False
 
 def delete_file_drive(file_id, access_token=None):
@@ -664,8 +778,8 @@ def delete_file_drive(file_id, access_token=None):
         return False
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
-        del_res = requests.delete(f"https://www.googleapis.com/drive/v3/files/{file_id}", headers=headers, timeout=15)
-        return del_res.status_code in [200, 204]
+        with requests.delete(f"https://www.googleapis.com/drive/v3/files/{file_id}", headers=headers, timeout=15) as del_res:
+            return del_res.status_code in [200, 204]
     except Exception as e:
         print(f"[!] Lỗi xóa file {file_id} trên Drive: {e}")
         return False
@@ -686,16 +800,20 @@ def clean_corrupt_files_from_drive(access_token=None, min_size_bytes=250000):
     
     # 1. Tìm tất cả các subfolder streamer
     q_folders = f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-    res_f = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_folders, "fields": "files(id,name)"}, timeout=15)
-    folders = res_f.json().get("files", [])
+    folders = []
+    with requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_folders, "fields": "files(id,name)", "pageSize": 1000}, timeout=15) as res_f:
+        if res_f.status_code == 200:
+            folders = res_f.json().get("files", [])
     
     total_deleted = 0
     for fold in folders:
         f_id = fold["id"]
         f_name = fold["name"]
         q_files = f"'{f_id}' in parents and trashed = false"
-        res_files = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_files, "fields": "files(id,name,mimeType,size)"}, timeout=15)
-        files = res_files.json().get("files", [])
+        files = []
+        with requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_files, "fields": "files(id,name,mimeType,size)", "pageSize": 1000}, timeout=15) as res_files:
+            if res_files.status_code == 200:
+                files = res_files.json().get("files", [])
         
         # Tạo map tên thumbnail -> id
         thumbs = {f["name"]: f["id"] for f in files if f["name"].endswith(".jpg")}
@@ -709,7 +827,8 @@ def clean_corrupt_files_from_drive(access_token=None, min_size_bytes=250000):
                     print(f"  🗑️ [Drive Cleaner] Phát hiện video rác lỗi 0:00s ({sz} bytes): {f_name}/{fname}")
                     try:
                         # Xóa file video trên Drive
-                        requests.delete(f"https://www.googleapis.com/drive/v3/files/{fid}", headers=headers, timeout=15)
+                        with requests.delete(f"https://www.googleapis.com/drive/v3/files/{fid}", headers=headers, timeout=15) as del_mp4:
+                            pass
                         total_deleted += 1
                         time.sleep(0.15)
                         
@@ -717,7 +836,8 @@ def clean_corrupt_files_from_drive(access_token=None, min_size_bytes=250000):
                         base = fname.replace(".mp4", "")
                         thumb_name = base + ".jpg"
                         if thumb_name in thumbs:
-                            requests.delete(f"https://www.googleapis.com/drive/v3/files/{thumbs[thumb_name]}", headers=headers, timeout=15)
+                            with requests.delete(f"https://www.googleapis.com/drive/v3/files/{thumbs[thumb_name]}", headers=headers, timeout=15) as del_thumb:
+                                pass
                             print(f"  🗑️ [Drive Cleaner] Đã dọn kèm thumbnail: {thumb_name}")
                             time.sleep(0.1)
                     except Exception as del_err:

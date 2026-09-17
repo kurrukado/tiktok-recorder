@@ -1,10 +1,7 @@
 import os
 import sys
 import json
-import subprocess
-import shutil
-import urllib.request
-import urllib.parse
+import requests
 
 if sys.platform == "win32":
     try:
@@ -33,11 +30,9 @@ def send_telegram(message):
     cfg = get_notifier_config()
     token = cfg.get("telegram_bot_token") or os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = cfg.get("telegram_chat_id") or os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    enabled = cfg.get("telegram_enabled", False)
+    enabled = cfg.get("telegram_enabled", True) if (token and chat_id) else False
 
-    if not token or not chat_id:
-        return False
-    if not enabled and not cfg.get("telegram_bot_token"):
+    if not token or not chat_id or not enabled:
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -48,11 +43,8 @@ def send_telegram(message):
     }
 
     try:
-        data = urllib.parse.urlencode(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, headers={"User-Agent": "TikTokRecorderBot/1.0"})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            if resp.status == 200:
-                return True
+        r = requests.post(url, json=payload, headers={"User-Agent": "TikTokRecorderBot/1.0"}, timeout=10)
+        return r.status_code == 200
     except Exception as e:
         print(f"[!] Lỗi khi gửi thông báo Telegram: {e}")
     return False
@@ -69,7 +61,8 @@ def sync_to_gdrive(local_path, target_user):
         return None
 
     # Option 1: Direct Google Drive API via gdrive_manager
-    if cfg.get("gdrive_refresh_token"):
+    refresh_tok = cfg.get("gdrive_refresh_token") or os.environ.get("GDRIVE_REFRESH_TOKEN", "").strip()
+    if refresh_tok:
         try:
             import gdrive_manager
             token = gdrive_manager.get_access_token()
@@ -79,35 +72,28 @@ def sync_to_gdrive(local_path, target_user):
                 ok = gdrive_manager.upload_file_to_drive(local_path, sub_id, access_token=token)
                 if ok:
                     send_telegram(f"☁️ <b>Đã đồng bộ Google Drive:</b>\nVideo của <code>@{target_user}</code> đã được tải lên: <code>tiktok-record/{target_user}/</code>")
+                    drive_file_id = ok if isinstance(ok, str) else None
+                    try:
+                        import supabase_sync
+                        supabase_sync.sync_recording_to_supabase(
+                            user=target_user,
+                            filename=os.path.basename(local_path),
+                            size_bytes=os.path.getsize(local_path) if os.path.exists(local_path) else 0,
+                            drive_file_id=drive_file_id,
+                            source="notifier"
+                        )
+                    except Exception as s_err:
+                        print(f"[!] Lỗi sync Supabase từ notifier: {s_err}")
+
+                    if cfg.get("gdrive_delete_local", False) and os.path.exists(local_path):
+                        try:
+                            os.remove(local_path)
+                            print(f"[✓] Đã xóa file local theo cấu hình gdrive_delete_local: {local_path}")
+                        except Exception:
+                            pass
                     return True
         except Exception as e:
             print(f"[!] Lỗi khi upload qua gdrive_manager: {e}")
-
-    # Option 2: Fallback to rclone
-    rclone_bin = shutil.which("rclone")
-    if not rclone_bin:
-        print("[!] Không tìm thấy công cụ rclone trên hệ thống.")
-        return None
-
-    remote_name = cfg.get("gdrive_remote", "gdrive").rstrip(":")
-    remote_dest = f"{remote_name}:tiktok-record/{target_user}/"
-    delete_local = cfg.get("gdrive_delete_local", False)
-
-    action = "move" if delete_local else "copy"
-    print(f"[*] Đang tải video lên Google Drive ({remote_dest})...")
-    
-    cmd = [rclone_bin, action, local_path, remote_dest, "--progress"]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if proc.returncode == 0:
-            print(f"[✓] Đã đồng bộ lên Google Drive thành công: {remote_dest}")
-            send_telegram(f"☁️ <b>Đã đồng bộ Google Drive:</b>\nVideo của <code>@{target_user}</code> đã được tải lên: <code>tiktok-record/{target_user}/</code>")
-            return True
-        else:
-            print(f"[!] Rclone lỗi: {proc.stderr[:200]}")
-    except Exception as e:
-        print(f"[!] Lỗi khi chạy rclone: {e}")
-
     return False
 
 if __name__ == "__main__":

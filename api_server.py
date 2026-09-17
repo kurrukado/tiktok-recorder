@@ -9,6 +9,7 @@ import re
 import requests
 import concurrent.futures
 import gc
+import urllib.parse
 from datetime import datetime
 from typing import List, Optional
 from pydantic import BaseModel
@@ -62,6 +63,11 @@ def shutdown_all_recording_tasks():
                 se = info.get("stop_event")
                 if se:
                     se.set()
+    # Chờ tối đa 6 giây để worker và FFmpeg chốt moov atom an toàn
+    for u, info in active_list:
+        t = info.get("thread") if isinstance(info, dict) else None
+        if t and hasattr(t, "join") and t.is_alive():
+            t.join(timeout=6)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -79,7 +85,7 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -133,70 +139,17 @@ def get_video_duration(filepath):
             dur = round(hours * 3600 + mins * 60 + secs, 2)
             if mtime is not None:
                 with _DURATION_CACHE_LOCK:
+                    if len(_DURATION_CACHE) > 100:
+                        _DURATION_CACHE.pop(next(iter(_DURATION_CACHE)), None)
                     _DURATION_CACHE[filepath] = (mtime, dur)
             return dur
     except Exception:
         pass
     return None
 
-def extract_middle_thumbnail(video_path, output_thumb=None):
-    """
-    Trích xuất khung hình chất lượng cao tại chính giữa video (50% thời lượng).
-    """
-    if not os.path.exists(video_path):
-        return None
+# ponytail: reuse auto_h264.extract_middle_thumbnail
+extract_middle_thumbnail = auto_h264.extract_middle_thumbnail
 
-    if not output_thumb:
-        base, _ = os.path.splitext(video_path)
-        output_thumb = base + ".jpg"
-
-    if os.path.exists(output_thumb) and os.path.getsize(output_thumb) > 1024:
-        return output_thumb
-
-    duration = get_video_duration(video_path)
-    if duration and duration > 2:
-        seek_time = duration / 2.0
-    elif duration and duration > 0.5:
-        seek_time = duration / 2.0
-    else:
-        seek_time = 1.0
-
-    mins, secs = divmod(seek_time, 60)
-    hours, mins = divmod(mins, 60)
-    ts_str = f"{int(hours):02d}:{int(mins):02d}:{secs:06.3f}"
-
-    cmd = [
-        FFMPEG_PATH, "-y",
-        "-ss", ts_str,
-        "-i", video_path,
-        "-vframes", "1",
-        "-q:v", "2",
-        output_thumb
-    ]
-    try:
-        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=12)
-        if proc.returncode == 0 and os.path.exists(output_thumb) and os.path.getsize(output_thumb) > 500:
-            return output_thumb
-    except Exception as e:
-        print(f"[!] Lỗi khi cắt thumbnail: {e}")
-
-    # Dự phòng: Cắt frame ngay đầu video nếu vị trí giữa video không thành công
-    try:
-        cmd_fallback = [
-            FFMPEG_PATH, "-y",
-            "-ss", "00:00:00.500",
-            "-i", video_path,
-            "-vframes", "1",
-            "-q:v", "2",
-            output_thumb
-        ]
-        proc = subprocess.run(cmd_fallback, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
-        if proc.returncode == 0 and os.path.exists(output_thumb) and os.path.getsize(output_thumb) > 500:
-            return output_thumb
-    except Exception:
-        pass
-
-    return None
 
 # ---------------- LIVE STATUS CACHE ----------------
 LIVE_CACHE = {}  # {username: {"is_live": bool, "room_id": str, "is_sub_only": bool, "is_preview": bool, "timestamp": float}}
@@ -205,9 +158,10 @@ LIVE_CACHE_TTL = 60.0  # Cache 60 giây — frontend poll mỗi 25s sẽ dùng c
 def get_user_live_details_cached(user: str) -> dict:
     user = user.strip().replace("@", "").lower()
     now = time.time()
-    cached = LIVE_CACHE.get(user)
-    if cached and (now - cached.get("timestamp", 0) < LIVE_CACHE_TTL) and "is_sub_only" in cached:
-        return cached
+    with LIVE_CACHE_LOCK:
+        cached = LIVE_CACHE.get(user)
+        if cached and (now - cached.get("timestamp", 0) < LIVE_CACHE_TTL) and "is_sub_only" in cached:
+            return cached.copy()
 
     details = {
         "is_live": False,
@@ -231,8 +185,8 @@ def get_user_live_details_cached(user: str) -> dict:
             pass
 
     with LIVE_CACHE_LOCK:
-        LIVE_CACHE[user] = details
-    return details
+        LIVE_CACHE[user] = details.copy()
+    return details.copy()
 
 def get_user_live_status_cached(user: str):
     d = get_user_live_details_cached(user)
@@ -240,28 +194,18 @@ def get_user_live_status_cached(user: str):
 
 def is_local_recorder_running_for_user(user: str) -> bool:
     """
-    Kiểm tra xem có tiến trình ghi hình cục bộ nào (in-memory task hoặc subprocess ffmpeg/python)
+    Kiểm tra xem có tiến trình ghi hình cục bộ nào (in-memory task)
     đang thực sự chạy cho streamer này không.
     """
     user_clean = user.strip().replace("@", "").lower()
     with RECORDING_LOCK:
-        if user_clean in ACTIVE_RECORDING_TASKS:
+        task = ACTIVE_RECORDING_TASKS.get(user_clean)
+        if task:
+            if isinstance(task, dict):
+                t = task.get("thread")
+                if t and hasattr(t, "is_alive") and not t.is_alive():
+                    return False
             return True
-
-    try:
-        import psutil
-        for proc in psutil.process_iter(['name', 'cmdline']):
-            try:
-                p_name = (proc.info.get('name') or '').lower()
-                cmdline = proc.info.get('cmdline') or []
-                cmd_str = " ".join(cmdline).lower()
-                if user_clean in cmd_str:
-                    if "ffmpeg" in p_name or "python" in p_name:
-                        return True
-            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-                continue
-    except Exception:
-        pass
     return False
 
 def clean_zombie_recordings(live_statuses=None):
@@ -398,6 +342,7 @@ def get_users(check_live: bool = True):
 
         # 2. Nguồn dữ liệu số 2: Google Drive
         drive_users = []
+        d_users = None
         try:
             d_users = gdrive_manager.load_streamers_from_drive()
             if d_users is not None and isinstance(d_users, list):
@@ -406,17 +351,18 @@ def get_users(check_live: bool = True):
         except Exception as e:
             print(f"[!] Lỗi nạp streamers từ Drive: {e}")
 
-        # 3. Nguồn dữ liệu số 3: config.json local
-        cfg = load_config()
-        cfg_users = cfg.get("monitored_users", [])
-        if cfg_users:
-            users_list.extend(cfg_users)
+        # 3. Nguồn dữ liệu số 3: config.json local (chỉ dự phòng khởi động khi cả Supabase và Drive đều rỗng/offline)
+        if not users_list:
+            cfg = load_config()
+            cfg_users = cfg.get("monitored_users", [])
+            if cfg_users:
+                users_list.extend(cfg_users)
 
         # Khử trùng lặp và giữ thứ tự chuẩn
         users = list(dict.fromkeys([u.strip().replace("@", "").lower() for u in users_list if u.strip()]))
 
         # Tự động đồng bộ lên Drive nếu Supabase có streamer mới
-        if supa_users and (set(supa_users) - set(drive_users)):
+        if d_users is not None and supa_users and (set(supa_users) - set(drive_users)):
             try:
                 gdrive_manager.save_streamers_to_drive(users)
                 for u in supa_users:
@@ -539,8 +485,8 @@ def get_memory_usage():
 
 @app.post("/api/users")
 def add_user(req: AddUserRequest):
-    user = req.username.strip().replace("@", "").lower()
-    if not user:
+    user = os.path.basename(req.username.strip().replace("@", "").lower())
+    if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
     
     cfg = load_config()
@@ -586,24 +532,24 @@ def add_user(req: AddUserRequest):
 
 @app.delete("/api/users/{username}")
 def delete_user(username: str, delete_files: bool = True):
-    user = username.strip().replace("@", "").lower()
+    user = os.path.basename(username.strip().replace("@", "").lower())
+    if not user or user in (".", ".."):
+        raise HTTPException(status_code=400, detail="Tên streamer không hợp lệ")
     cfg = load_config()
+    cfg_users = cfg.get("monitored_users", [])
+    if user in cfg_users:
+        cfg["monitored_users"] = [u for u in cfg_users if u != user]
+        save_config(cfg)
+
     users = cfg.get("monitored_users", [])
     try:
         drive_users = gdrive_manager.load_streamers_from_drive()
         if drive_users is not None and isinstance(drive_users, list):
-            users = drive_users
-    except Exception:
-        pass
-
-    if user in users:
-        users.remove(user)
-        cfg["monitored_users"] = users
-        save_config(cfg)
-        try:
-            gdrive_manager.save_streamers_to_drive(users)
-        except Exception:
-            pass
+            clean_drive = [u.strip().replace("@", "").lower() for u in drive_users if u.strip() and u.strip().replace("@", "").lower() != user]
+            users = clean_drive
+            gdrive_manager.save_streamers_to_drive(clean_drive)
+    except Exception as d_err:
+        print(f"[API] Lỗi cập nhật streamers.json trên Drive: {d_err}")
 
     # Dừng tiến trình ghi hình nếu đang hoạt động
     with RECORDING_LOCK:
@@ -622,9 +568,7 @@ def delete_user(username: str, delete_files: bool = True):
         if t and hasattr(t, 'join'):
             t.join(timeout=10)
         else:
-            time.sleep(5)
-    else:
-        time.sleep(5)
+            time.sleep(3)
 
     # Xóa thư mục trên Drive cùng toàn bộ dữ liệu bên trong (mặc định luôn xóa sạch)
     gdrive_status = "Đã xóa toàn bộ thư mục và file trên Drive"
@@ -636,9 +580,11 @@ def delete_user(username: str, delete_files: bool = True):
             gdrive_status = f"Lỗi xóa folder Drive: {e}"
 
         local_dir = os.path.join(BASE_DIR, user)
-        if os.path.exists(local_dir):
+        resolved_dir = os.path.abspath(local_dir)
+        base_resolved = os.path.abspath(BASE_DIR)
+        if resolved_dir != base_resolved and resolved_dir.startswith(base_resolved) and os.path.exists(resolved_dir):
             try:
-                shutil.rmtree(local_dir, ignore_errors=True)
+                shutil.rmtree(resolved_dir, ignore_errors=True)
             except Exception:
                 pass
 
@@ -681,10 +627,14 @@ def get_stream_url(username: str):
     if not stream_url:
         raise HTTPException(status_code=500, detail="Không thể trích xuất link stream")
     
+    with RECORDING_LOCK:
+        is_recording = (user in ACTIVE_RECORDING_TASKS)
+
     return {
         "username": user,
         "is_live": True,
-        "status": "recording",
+        "status": "recording" if is_recording else "live",
+        "is_recording": is_recording,
         "room_id": room_id,
         "stream_url": stream_url,
         "format": "flv" if ".flv" in stream_url else "hls_m3u8",
@@ -715,6 +665,7 @@ def test_live_diagnostic(username: str):
             out["check_live_status_error"] = traceback.format_exc()
 
         # Thử nghiệm trực tiếp TikTok Native API
+        r_nat = None
         try:
             from curl_cffi import requests as c_req
             api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
@@ -744,8 +695,15 @@ def test_live_diagnostic(username: str):
                 out["native_api"]["text_preview"] = r_nat.text[:200]
         except Exception as e:
             out["native_api_error"] = traceback.format_exc()
+        finally:
+            if r_nat is not None:
+                try:
+                    r_nat.close()
+                except Exception:
+                    pass
 
         sess = None
+        r = None
         try:
             from curl_cffi import requests as c_req
             sess = c_req.Session(impersonate="chrome136")
@@ -760,6 +718,11 @@ def test_live_diagnostic(username: str):
         except Exception as e:
             out["direct_scrape_error"] = traceback.format_exc()
         finally:
+            if r is not None:
+                try:
+                    r.close()
+                except Exception:
+                    pass
             if sess:
                 try:
                     sess.close()
@@ -770,62 +733,8 @@ def test_live_diagnostic(username: str):
     finally:
         gc.collect()
 
-def concat_mp4_segments(segment_files, output_file):
-    """
-    Ghép nối nhiều phân đoạn MP4 cùng chuẩn H.264/AAC thành 1 file duy nhất bằng FFmpeg concat demuxer (-c copy)
-    hoàn toàn không re-encode, 0% CPU, tốc độ < 1 giây.
-    """
-    if not segment_files:
-        return None
-    valid_files = [f for f in segment_files if f and os.path.exists(f) and os.path.getsize(f) > 50000]
-    if not valid_files:
-        return None
-    if len(valid_files) == 1:
-        if valid_files[0] != output_file:
-            try:
-                shutil.move(valid_files[0], output_file)
-            except Exception:
-                return valid_files[0]
-        return output_file
-
-    list_txt = output_file + ".concat.txt"
-    try:
-        with open(list_txt, "w", encoding="utf-8") as f:
-            for seg in valid_files:
-                clean_path = os.path.abspath(seg).replace("\\", "/")
-                f.write(f"file '{clean_path}'\n")
-
-        cmd = [
-            recorder_core.FFMPEG_PATH,
-            "-y",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", list_txt,
-            "-c", "copy",
-            "-movflags", "+faststart",
-            output_file
-        ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
-        if res.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 100000:
-            for seg in valid_files:
-                if seg != output_file and os.path.exists(seg):
-                    try:
-                        os.remove(seg)
-                    except Exception:
-                        pass
-            return output_file
-        else:
-            largest = max(valid_files, key=lambda f: os.path.getsize(f) if os.path.exists(f) else 0)
-            return largest
-    except Exception as e:
-        print(f"[!] Lỗi khi ghép nối phân đoạn video: {e}")
-        return valid_files[0]
-    finally:
-        if os.path.exists(list_txt):
-            try:
-                os.remove(list_txt)
-            except Exception:
-                pass
+# ponytail: centralized in recorder_core
+concat_mp4_segments = recorder_core.concat_mp4_segments
 
 MAX_CHUNK_SECONDS = 3600  # Đúng 1 tiếng (1h = 3600s), tự động tách video và up lên Cloud
 
@@ -836,6 +745,10 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
     max_vip_attempts = 5
 
     try:
+        with RECORDING_LOCK:
+            if user in ACTIVE_RECORDING_TASKS and isinstance(ACTIVE_RECORDING_TASKS[user], dict):
+                ACTIVE_RECORDING_TASKS[user]["thread"] = threading.current_thread()
+
         # Chỉ chạy local recorder nếu hệ thống có sẵn ffmpeg
         if not shutil.which("ffmpeg") and not (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)):
             return
@@ -995,7 +908,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                     final_rec_file = part_segments[0]
             else:
                 print(f"[🧩] [@{user}] Đang ghép nối {len(part_segments)} phân đoạn thành 1 file MP4 duy nhất cho Phần {part_number} ({accumulated_seconds:.1f}s)...")
-                final_rec_file = concat_mp4_segments(part_segments, output_file)
+                final_rec_file = recorder_core.concat_mp4_segments(part_segments, output_file)
 
             if stop_event and stop_event.is_set():
                 if final_rec_file and os.path.exists(final_rec_file):
@@ -1040,35 +953,47 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 except Exception as sq_err:
                     print(f"[!] [@{user}] Lỗi khi chuyển vào Staging Queue: {sq_err}")
             else:
-                # Video đạt chuẩn >= 50 phút: Đồng bộ Supabase Storage & Database và tải lên Drive chính
+                # Video đạt chuẩn >= 50 phút: Tải lên Drive chính lấy ID và đồng bộ Supabase Storage & Database
                 thumb_f = extract_middle_thumbnail(final_rec_file)
-                try:
-                    import supabase_sync
-                    sz = os.path.getsize(final_rec_file)
-                    supabase_sync.sync_recording_to_supabase(
-                        user=user,
-                        filename=os.path.basename(final_rec_file),
-                        size_bytes=sz,
-                        thumb_source=thumb_f,
-                        source="api_server"
-                    )
-                except Exception as sb_err:
-                    print(f"[!] Lỗi đồng bộ Supabase từ bg_record_worker: {sb_err}")
+                sz = os.path.getsize(final_rec_file) if (final_rec_file and os.path.exists(final_rec_file)) else 0
+                rec_basename = os.path.basename(final_rec_file)
 
-                # Upload Google Drive
+                # 1. Upload Google Drive trước để lấy drive_file_id
+                drive_file_id = None
                 token = gdrive_manager.get_access_token()
                 if token:
                     root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
                     sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
                     ok = gdrive_manager.upload_file_to_drive(final_rec_file, sub_id, access_token=token)
                     if ok:
+                        drive_file_id = ok if isinstance(ok, str) else None
                         try:
                             os.remove(final_rec_file)
                             print(f"[🗑️] [@{user}] Đã xóa video tạm Phần {part_number} sau khi upload Drive thành công.")
                         except Exception:
                             pass
+                    drive_thumb_id = None
                     if thumb_f and os.path.exists(thumb_f):
-                        gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
+                        t_ok = gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
+                        if t_ok and isinstance(t_ok, str):
+                            drive_thumb_id = t_ok
+
+                # 2. Đồng bộ Supabase Storage & Database kèm drive_file_id
+                try:
+                    import supabase_sync
+                    supabase_sync.sync_recording_to_supabase(
+                        user=user,
+                        filename=rec_basename,
+                        size_bytes=sz,
+                        thumb_source=thumb_f,
+                        drive_file_id=drive_file_id,
+                        drive_thumb_id=drive_thumb_id,
+                        source="api_server"
+                    )
+                except Exception as sb_err:
+                    print(f"[!] Lỗi đồng bộ Supabase từ bg_record_worker: {sb_err}")
+                finally:
+                    if thumb_f and os.path.exists(thumb_f):
                         try:
                             os.remove(thumb_f)
                         except Exception:
@@ -1147,21 +1072,44 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     has_ffmpeg = bool(shutil.which("ffmpeg") or (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)))
 
     if is_live:
+        stop_evt = None
+        is_recording = False
         with RECORDING_LOCK:
             if user in ACTIVE_RECORDING_TASKS:
                 return {"message": f"@{user} đang ghi hình rồi", "is_recording": True, "status": "already_recording"}
-        if has_ffmpeg:
-            stop_evt = threading.Event()
-            with RECORDING_LOCK:
+
+        # ponytail: Chống trùng lặp ghi hình giữa Cloud Runner (GitHub Actions) và Render
+        try:
+            drive_details = gdrive_manager.load_active_recordings_from_drive(as_details=True) or []
+            now_ts = int(time.time())
+            for it in drive_details:
+                u_name = it.get("username") if isinstance(it, dict) else str(it)
+                if u_name and u_name.strip().replace("@", "").lower() == user:
+                    up_at = it.get("updated_at", 0) if isinstance(it, dict) else 0
+                    if now_ts - up_at < 600:
+                        return {
+                            "message": f"@{user} đang được Cloud Runner ghi hình (heartbeat {now_ts - up_at}s trước).",
+                            "is_recording": True,
+                            "status": "already_recording",
+                            "source": "cloud_runner"
+                        }
+        except Exception:
+            pass
+
+        with RECORDING_LOCK:
+            if user in ACTIVE_RECORDING_TASKS:
+                return {"message": f"@{user} đang ghi hình rồi", "is_recording": True, "status": "already_recording"}
+            if has_ffmpeg:
+                stop_evt = threading.Event()
                 ACTIVE_RECORDING_TASKS[user] = {"start_time": time.time(), "stop_event": stop_evt}
+                is_recording = True
+
+        if is_recording and stop_evt:
             try:
                 gdrive_manager.set_user_recording_status_drive(user, True)
             except Exception:
                 pass
             bg_tasks.add_task(bg_record_worker, user, req.duration_seconds, stop_evt)
-            is_recording = True
-        else:
-            is_recording = False
 
         msg_prefix = f"@{user} đang phát trực tiếp"
         if is_sub_only:
@@ -1178,6 +1126,9 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
         }
     else:
         with RECORDING_LOCK:
+            task = ACTIVE_RECORDING_TASKS.get(user)
+            if task and isinstance(task, dict) and task.get("stop_event"):
+                task["stop_event"].set()
             ACTIVE_RECORDING_TASKS.pop(user, None)
         try:
             gdrive_manager.set_user_recording_status_drive(user, False)
@@ -1195,12 +1146,22 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
 def stop_record(req: AddUserRequest):
     user = req.username.strip().replace("@", "").lower()
     if not user: raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
+    task_info = None
     with RECORDING_LOCK:
-        task_info = ACTIVE_RECORDING_TASKS.pop(user, None)
+        task_info = ACTIVE_RECORDING_TASKS.get(user)
         if task_info and isinstance(task_info, dict):
             se = task_info.get("stop_event")
             if se:
                 se.set()
+    if task_info and isinstance(task_info, dict):
+        t = task_info.get("thread")
+        if t and hasattr(t, "join") and t.is_alive():
+            t.join(timeout=3)
+        with RECORDING_LOCK:
+            if user in ACTIVE_RECORDING_TASKS:
+                t_check = ACTIVE_RECORDING_TASKS[user].get("thread") if isinstance(ACTIVE_RECORDING_TASKS[user], dict) else None
+                if not (t_check and hasattr(t_check, "is_alive") and t_check.is_alive()):
+                    ACTIVE_RECORDING_TASKS.pop(user, None)
     try:
         gdrive_manager.set_user_recording_status_drive(user, False)
     except Exception:
@@ -1220,7 +1181,7 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
     now = time.time()
     with _RECORDINGS_CACHE_LOCK:
         if not force_refresh and (now - _RECORDINGS_CACHE["timestamp"] < 60) and _RECORDINGS_CACHE["data"]:
-            return _RECORDINGS_CACHE["data"]
+            return list(_RECORDINGS_CACHE["data"])
 
     recordings = []
     try:
@@ -1233,15 +1194,16 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
         headers = {"Authorization": f"Bearer {access_token}"}
         
         q_folders = f"'{root_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
-        res_f = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_folders, "fields": "files(id,name)"}, timeout=10)
-        folders = res_f.json().get("files", [])
+        with requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_folders, "fields": "files(id,name)"}, timeout=10) as res_f:
+            folders = res_f.json().get("files", []) if res_f.status_code == 200 else []
+        folders = [f for f in folders if not f.get("name", "").startswith((".", "_"))]
 
         def _fetch_folder_files(fold):
             uname = fold["name"]
             fid = fold["id"]
             q_files = f"'{fid}' in parents and trashed = false"
-            res_files = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_files, "fields": "files(id,name,mimeType,size,createdTime)"}, timeout=10)
-            files = res_files.json().get("files", [])
+            with requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_files, "fields": "files(id,name,mimeType,size,createdTime)"}, timeout=10) as res_files:
+                files = res_files.json().get("files", []) if res_files.status_code == 200 else []
             thumbs = {f["name"]: f["id"] for f in files if f["name"].endswith(".jpg")}
             folder_recs = []
             for f in files:
@@ -1263,7 +1225,7 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
                     # Loại bỏ triệt để các file rác / lỗi 0:00s dưới 250 KB
                     if sz_bytes < 250 * 1024:
                         continue
-                    cdn_url = f"https://drive.usercontent.google.com/download?id={f['id']}&export=download&authuser=0"
+                    cdn_url = f"https://drive.usercontent.google.com/download?id={f['id']}&export=download&authuser=0&confirm=t"
                     folder_recs.append({
                         "filename": fname,
                         "user": uname,
@@ -1271,7 +1233,7 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
                         "size_mb": round(sz_bytes / (1024 * 1024), 2),
                         "recorded_at": recorded_at,
                         "created_at": f.get("createdTime"),
-                        "thumbnail_url": f"/api/thumbnail/{uname}/{fname}",
+                        "thumbnail_url": f"/api/thumbnail/{uname}/{fname}?redirect=true",
                         "download_url": f"/api/download/{uname}/{fname}",
                         "cdn_download_url": cdn_url,
                         "drive_file_id": f["id"],
@@ -1353,7 +1315,7 @@ def list_recordings():
                         "duration_formatted": dur_fmt,
                         "recorded_at": recorded_at,
                         "created_at": datetime.fromtimestamp(st.st_mtime).isoformat(),
-                        "thumbnail_url": f"/api/thumbnail/{u}/{f}",
+                        "thumbnail_url": f"/api/thumbnail/{u}/{f}?redirect=true",
                         "download_url": f"/api/download/{u}/{f}",
                         "stream_url": f"/api/stream-video/{u}/{f}",
                         "source": "local"
@@ -1372,11 +1334,11 @@ def sync_supabase_endpoint(bg_tasks: BackgroundTasks):
         try:
             import supabase_sync
             recs = list_recordings_from_drive()
-            host_base = os.environ.get("RENDER_EXTERNAL_URL") or os.environ.get("BASE_API_URL", "https://tiktok-api-i0o8.onrender.com")
             for r in recs:
                 u = r["user"]
                 fn = r["filename"]
-                th_url = f"{host_base.rstrip('/')}/api/thumbnail/{u}/{fn}"
+                thumb_id = r.get("drive_thumb_id") or r.get("drive_file_id")
+                th_url = f"https://drive.google.com/thumbnail?id={thumb_id}&sz=w800" if thumb_id else None
                 supabase_sync.sync_recording_to_supabase(
                     user=u,
                     filename=fn,
@@ -1396,7 +1358,7 @@ def sync_supabase_endpoint(bg_tasks: BackgroundTasks):
     return {"status": "started", "message": "Đang đồng bộ toàn bộ video và thumbnail lên Supabase trong nền"}
 
 @app.get("/api/thumbnail/{user}/{filename}")
-def get_thumbnail(user: str, filename: str):
+def get_thumbnail(user: str, filename: str, redirect: bool = False):
     """
     Trả về ảnh xem trước được cắt từ chính giữa video (50% thời lượng).
     Hỗ trợ đọc từ cả ổ đĩa local và Google Drive.
@@ -1434,9 +1396,18 @@ def get_thumbnail(user: str, filename: str):
             safe_name = clean_name.replace("'", "\\'")
             q_thumb = f"name = '{safe_name}.jpg' and '{user_fid}' in parents and trashed = false"
             res_th = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_thumb, "fields": "files(id)"}, timeout=10)
-            th_files = res_th.json().get("files", [])
+            th_files = []
+            try:
+                if res_th.status_code == 200:
+                    th_files = res_th.json().get("files", [])
+            finally:
+                res_th.close()
+
             if th_files:
                 img_id = th_files[0]["id"]
+                if redirect:
+                    gdrive_manager.make_file_public(img_id, access_token=tok)
+                    return RedirectResponse(url=f"https://drive.google.com/thumbnail?id={img_id}&sz=w800", status_code=302)
                 img_res = requests.get(f"https://www.googleapis.com/drive/v3/files/{img_id}?alt=media", headers=headers, timeout=15)
                 try:
                     if img_res.status_code == 200:
@@ -1447,7 +1418,12 @@ def get_thumbnail(user: str, filename: str):
             # Nếu chưa có ảnh .jpg riêng, tìm file .mp4 để lấy thumbnail tích hợp sẵn của Google Drive
             q_vid = f"name = '{safe_name}.mp4' and '{user_fid}' in parents and trashed = false"
             res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,thumbnailLink)"}, timeout=10)
-            vid_files = res_vid.json().get("files", [])
+            vid_files = []
+            try:
+                if res_vid.status_code == 200:
+                    vid_files = res_vid.json().get("files", [])
+            finally:
+                res_vid.close()
             if vid_files:
                 vid_id = vid_files[0]["id"]
                 thumb_link = vid_files[0].get("thumbnailLink")
@@ -1482,13 +1458,13 @@ def download_video(user: str, filename: str):
             headers = {"Authorization": f"Bearer {tok}"}
             safe_name = filename.replace("'", "\\'")
             q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"
-            res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id)"}, timeout=10)
-            vid_files = res_vid.json().get("files", [])
+            with requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id)"}, timeout=10) as res_vid:
+                vid_files = res_vid.json().get("files", []) if res_vid.status_code == 200 else []
             if vid_files:
                 file_id = vid_files[0]["id"]
                 # Cấp quyền đọc công khai để CDN tải mượt mà không cần xác thực
                 gdrive_manager.make_file_public(file_id, access_token=tok)
-                cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
+                cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0&confirm=t"
                 return RedirectResponse(url=cdn_url, status_code=302)
     except Exception as e:
         print(f"[!] Lỗi tìm video trên Google Drive: {e}")
@@ -1502,7 +1478,8 @@ def get_cdn_url(user: str, filename: str, redirect: bool = False):
     - Mặc định trả về JSON chứa link CDN và thông số kỹ thuật.
     - Nếu thêm ?redirect=true: Tự động chuyển hướng tải ngay lập tức.
     """
-    user = user.strip().replace("@", "").lower()
+    user = os.path.basename(user.strip().replace("@", "").lower())
+    filename = os.path.basename(filename.strip())
     try:
         tok = gdrive_manager.get_access_token()
         if tok:
@@ -1511,13 +1488,13 @@ def get_cdn_url(user: str, filename: str, redirect: bool = False):
             headers = {"Authorization": f"Bearer {tok}"}
             safe_name = filename.replace("'", "\\'")
             q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"
-            res_vid = requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,size,createdTime)"}, timeout=10)
-            vid_files = res_vid.json().get("files", [])
+            with requests.get("https://www.googleapis.com/drive/v3/files", headers=headers, params={"q": q_vid, "fields": "files(id,size,createdTime)"}, timeout=10) as res_vid:
+                vid_files = res_vid.json().get("files", []) if res_vid.status_code == 200 else []
             if vid_files:
                 file_id = vid_files[0]["id"]
                 sz_bytes = int(vid_files[0].get("size", 0))
                 gdrive_manager.make_file_public(file_id, access_token=tok)
-                cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
+                cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0&confirm=t"
                 
                 if redirect:
                     return RedirectResponse(url=cdn_url, status_code=302)
@@ -1526,6 +1503,7 @@ def get_cdn_url(user: str, filename: str, redirect: bool = False):
                     "filename": filename,
                     "user": user,
                     "cdn_download_url": cdn_url,
+                    "drive_file_id": file_id,
                     "size_mb": round(sz_bytes / (1024 * 1024), 2),
                     "size_bytes": sz_bytes,
                     "cdn_provider": "Google Cloud Global Edge CDN",
@@ -1539,82 +1517,30 @@ def get_cdn_url(user: str, filename: str, redirect: bool = False):
     raise HTTPException(status_code=404, detail="File video không tồn tại trên CDN Drive")
 
 @app.get("/api/stream-video-id/{file_id}")
-def stream_video_by_id(file_id: str, request: Request, redirect: bool = False):
+def stream_video_by_id(file_id: str, request: Request, redirect: bool = True):
     """
-    Phát trực tiếp video từ Google Drive với hỗ trợ tua timeline tức thì (HTTP 206 Partial Content và Range Request).
-    Nếu truyền ?redirect=true, tự động cấp quyền public và chuyển hướng 302 sang Google Edge CDN (0-byte RAM/Bandwidth).
+    Zero Render Bandwidth (R4): Chuyển hướng trực tiếp 302 sang Google CDN / Drive Preview.
+    Triệt tiêu 100% băng thông trung chuyển (0 bytes) và ngăn ngừa lỗi tràn RAM (> 512MB) trên Render.
     """
     tok = gdrive_manager.get_access_token()
     if not tok:
         raise HTTPException(status_code=500, detail="Không có quyền truy cập Google Drive")
 
-    if redirect:
-        try:
-            gdrive_manager.make_file_public(file_id, access_token=tok)
-            cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
-            return RedirectResponse(url=cdn_url, status_code=302)
-        except Exception as e:
-            print(f"[!] Chuyển hướng CDN không thành công cho file {file_id}: {e}")
-
-    req_headers = {"Authorization": f"Bearer {tok}"}
-    range_header = request.headers.get("range")
-    if range_header:
-        req_headers["Range"] = range_header
-
-    drive_resp = None
     try:
-        drive_resp = requests.get(
-            f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media",
-            headers=req_headers,
-            stream=True,
-            timeout=15
-        )
-
-        if drive_resp.status_code not in (200, 206):
-            sc = drive_resp.status_code
-            drive_resp.close()
-            raise HTTPException(status_code=sc, detail="Không tìm thấy file hoặc lỗi Google Drive")
-
-        resp_headers = {
-            "Accept-Ranges": "bytes",
-            "Content-Type": "video/mp4",
-            "Cache-Control": "public, max-age=3600",
-        }
-        if "Content-Range" in drive_resp.headers:
-            resp_headers["Content-Range"] = drive_resp.headers["Content-Range"]
-        if "Content-Length" in drive_resp.headers:
-            resp_headers["Content-Length"] = drive_resp.headers["Content-Length"]
-        if "Content-Disposition" in drive_resp.headers:
-            resp_headers["Content-Disposition"] = "inline"
-
-        def _stream_iterator():
-            try:
-                for chunk in drive_resp.iter_content(chunk_size=128 * 1024):
-                    yield chunk
-            finally:
-                drive_resp.close()
-
-        return StreamingResponse(
-            _stream_iterator(),
-            status_code=drive_resp.status_code,
-            headers=resp_headers
-        )
-    except HTTPException:
-        raise
+        gdrive_manager.make_file_public(file_id, access_token=tok)
+        cdn_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0&confirm=t"
+        return RedirectResponse(url=cdn_url, status_code=302)
     except Exception as e:
-        if drive_resp:
-            try:
-                drive_resp.close()
-            except Exception:
-                pass
-        print(f"[!] Lỗi stream video ID {file_id}: {e}")
-        raise HTTPException(status_code=500, detail=f"Lỗi khi phát video: {e}")
+        print(f"[!] Chuyển hướng CDN không thành công cho file {file_id}: {e}")
+        preview_url = f"https://drive.google.com/file/d/{file_id}/preview"
+        return RedirectResponse(url=preview_url, status_code=302)
 
 @app.get("/api/stream-video/{user}/{filename}")
-def stream_video(user: str, filename: str, request: Request):
+def stream_video(user: str, filename: str, request: Request, redirect: bool = True):
     """
     Phát trực tiếp video theo username và filename.
-    Hỗ trợ cả file local và file lưu trên Google Drive với timeline scrub (HTTP 206 Partial Content).
+    Hỗ trợ cả file local và file lưu trên Google Drive.
+    Với Google Drive: Zero Render Bandwidth 302 Redirect sang CDN/Preview.
     """
     user = user.strip().replace("@", "").lower()
     user = os.path.basename(user)
@@ -1642,15 +1568,16 @@ def stream_video(user: str, filename: str, request: Request):
             headers = {"Authorization": f"Bearer {tok}"}
             safe_name = filename.replace("'", "\\'")
             q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"
-            res_vid = requests.get(
+            with requests.get(
                 "https://www.googleapis.com/drive/v3/files",
                 headers=headers,
                 params={"q": q_vid, "fields": "files(id)"},
                 timeout=10
-            )
-            vid_files = res_vid.json().get("files", [])
-            if vid_files:
-                return stream_video_by_id(vid_files[0]["id"], request)
+            ) as res_vid:
+                if res_vid.status_code == 200:
+                    vid_files = res_vid.json().get("files", [])
+                    if vid_files:
+                        return stream_video_by_id(vid_files[0]["id"], request, redirect=redirect)
     except Exception as e:
         print(f"[!] Lỗi tìm video stream {user}/{filename}: {e}")
 

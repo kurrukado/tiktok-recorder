@@ -1,4 +1,6 @@
 import unittest
+import json
+import os
 import re
 import warnings
 import inspect
@@ -7,6 +9,7 @@ import ast
 import glob
 import threading
 import time
+import recorder_core
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
@@ -820,24 +823,23 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
 
     def test_streaming_response_socket_closure(self):
         """
-        Adversarial Test: Verify that stream_video_by_id wraps drive_resp in an iterator
-        that ensures drive_resp.close() is called when the client finishes or disconnects.
+        Adversarial Test (Modernized for R4 Zero Render Bandwidth):
+        Verify that stream_video_by_id does NOT proxy binary chunks through Render,
+        but returns a 302 RedirectResponse directly to Google Edge CDN, ensuring 0 transit bytes.
         """
         import api_server
 
-        mock_drive_resp = MagicMock()
-        mock_drive_resp.status_code = 200
-        mock_drive_resp.headers = {"Content-Type": "video/mp4", "Content-Length": "100"}
-        mock_drive_resp.iter_content.return_value = [b"chunk1", b"chunk2"]
-
         with patch("gdrive_manager.get_access_token", return_value="fake_token"), \
-             patch("requests.get", return_value=mock_drive_resp):
+             patch("gdrive_manager.make_file_public") as mock_public:
 
-            client = TestClient(api_server.app)
+            client = TestClient(api_server.app, follow_redirects=False)
             resp = client.get("/api/stream-video-id/file_123")
-            self.assertEqual(resp.status_code, 200)
-            self.assertEqual(resp.content, b"chunk1chunk2")
-            mock_drive_resp.close.assert_called_once()
+            self.assertIn(resp.status_code, (302, 307))
+            self.assertEqual(resp.status_code, 302)
+            expected_location = "https://drive.usercontent.google.com/download?id=file_123&export=download&authuser=0&confirm=t"
+            self.assertEqual(resp.headers.get("location"), expected_location)
+            mock_public.assert_called_once_with("file_123", access_token="fake_token")
+
 
     def test_malformed_intermediate_sdk_data_fallback(self):
         """
@@ -885,24 +887,28 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
 
     def test_streaming_response_error_status_and_exception_cleanup(self):
         """
-        Adversarial Test: Verify stream_video_by_id raises HTTPException and closes
-        drive_resp immediately when Google Drive returns non-200/206 status (e.g. 404),
-        or when an error occurs before StreamingResponse is returned.
+        Adversarial Test (Modernized for R4 Zero Render Bandwidth):
+        Verify stream_video_by_id falls back to 302 redirect to Google Drive preview
+        when CDN direct link generation raises an exception, and returns 500 when
+        Google Drive access token is unavailable.
         """
         import api_server
 
-        # 1. Google Drive returns 404
-        mock_drive_resp = MagicMock()
-        mock_drive_resp.status_code = 404
-        mock_drive_resp.headers = {}
-
+        # 1. Fallback to Drive Preview on make_file_public failure
         with patch("gdrive_manager.get_access_token", return_value="fake_token"), \
-             patch("requests.get", return_value=mock_drive_resp):
+             patch("gdrive_manager.make_file_public", side_effect=Exception("CDN permission error")):
 
-            client = TestClient(api_server.app)
-            resp = client.get("/api/stream-video-id/not_found_123")
-            self.assertEqual(resp.status_code, 404)
-            mock_drive_resp.close.assert_called_once()
+            client = TestClient(api_server.app, follow_redirects=False)
+            resp = client.get("/api/stream-video-id/error_fid_123")
+            self.assertIn(resp.status_code, (302, 307))
+            self.assertEqual(resp.status_code, 302)
+            self.assertEqual(resp.headers.get("location"), "https://drive.google.com/file/d/error_fid_123/preview")
+
+        # 2. Return 500 if no Google Drive access token
+        with patch("gdrive_manager.get_access_token", return_value=None):
+            client = TestClient(api_server.app, follow_redirects=False)
+            resp = client.get("/api/stream-video-id/no_token_fid")
+            self.assertEqual(resp.status_code, 500)
 
     def test_thumbnail_response_socket_closure(self):
         """
@@ -975,5 +981,514 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
             cloud_daemon.streamer_recording_worker("vip_full_user", "111")
             self.assertEqual(len(recorded_parts), 5)
 
+    def test_staging_manifest_network_failure_safety(self):
+        """
+        Unit Test: Verify get_staging_manifest raises IOError on network error / non-200,
+        and add_to_staging_queue aborts without overwriting Drive manifest when manifest read fails.
+        """
+        import staging_queue
+
+        # 1. Verify get_staging_manifest raises IOError on non-200 or network error
+        mock_500_resp = MagicMock(status_code=500, text="Drive API 500 Internal Error")
+        mock_500_resp.__enter__.return_value = mock_500_resp
+        mock_500_resp.__exit__.return_value = False
+
+        with patch("requests.get", return_value=mock_500_resp):
+            with self.assertRaises(IOError):
+                staging_queue.get_staging_manifest("test_user", "staging_fid_123", access_token="fake_token")
+
+        # 2. Verify add_to_staging_queue does NOT call save_staging_manifest when manifest fetch fails
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = True
+
+        with patch("staging_queue._get_user_staging_lock", return_value=mock_lock), \
+             patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("staging_queue.get_or_create_staging_folder", return_value=("user_staging_id", "root_fid")), \
+             patch("gdrive_manager.upload_file_to_drive", return_value="file_new_segment"), \
+             patch("staging_queue.get_staging_manifest", side_effect=IOError("Transient connection reset")), \
+             patch("staging_queue.save_staging_manifest") as mock_save, \
+             patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=500 * 1024):
+
+            res = staging_queue.add_to_staging_queue("test_user", "local_seg.mp4", 120.0, access_token="fake_token")
+            self.assertEqual(res.get("status"), "error")
+            self.assertIn("Transient connection reset", res.get("message", ""))
+            self.assertFalse(mock_save.called, "save_staging_manifest must NOT be called on manifest read failure!")
+
+    def test_staging_unmerged_segment_preservation(self):
+        """
+        Unit Test: Verify package_and_publish_queue preserves local segment files
+        and keeps them in the staging manifest if download or merge fails for those segments.
+        """
+        import staging_queue
+
+        manifest = {
+            "user": "streamer_preserve",
+            "segments": [
+                {"filename": "seg1.mp4", "file_id": "fid_seg_1", "local_path": "local_seg1.mp4", "duration": 60.0},
+                {"filename": "seg2.mp4", "file_id": "fid_seg_2", "local_path": "local_seg2.mp4", "duration": 60.0}
+            ],
+            "manifest_file_id": "mfid_preserve"
+        }
+
+        deleted_files = []
+        def fake_remove(path):
+            deleted_files.append(path)
+
+        def fake_download(fid, dst, access_token=None):
+            return fid == "fid_seg_1"  # seg2 download fails
+
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = True
+
+        with patch("staging_queue._get_user_staging_lock", return_value=mock_lock), \
+             patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("staging_queue.get_or_create_staging_folder", return_value=("user_staging_id", "root_fid")), \
+             patch("staging_queue.get_staging_manifest", return_value=manifest), \
+             patch("staging_queue.save_staging_manifest") as mock_save, \
+             patch("gdrive_manager.download_file_from_drive", side_effect=fake_download), \
+             patch("staging_queue.validate_playable_video", return_value=(True, "ok", 60.0)), \
+             patch("gdrive_manager.find_or_create_folder", return_value="ufid_main"), \
+             patch("gdrive_manager.upload_file_to_drive", return_value="new_main_drive_id"), \
+             patch("gdrive_manager.delete_file_drive"), \
+             patch("supabase_sync.sync_recording_to_supabase", return_value=True), \
+             patch("os.remove", side_effect=fake_remove), \
+             patch("os.path.getsize", return_value=300000), \
+             patch("os.path.exists", side_effect=lambda p: True if p in ["local_seg1.mp4", "local_seg2.mp4", "thumb.jpg"] or p.endswith("_full.mp4") or "seg1.mp4" in p else False), \
+             patch("shutil.copy2"), \
+             patch("shutil.rmtree"):
+
+            res = staging_queue.package_and_publish_queue("streamer_preserve", access_token="fake_token")
+            self.assertTrue(res.get("ok"))
+            # Merged segment local file was cleaned up
+            self.assertIn("local_seg1.mp4", deleted_files)
+            # Unmerged segment local file was preserved
+            self.assertNotIn("local_seg2.mp4", deleted_files, "Unmerged segment local file must NOT be deleted!")
+            # Preserved segment remains in saved manifest
+            self.assertTrue(mock_save.called)
+            saved_segs = mock_save.call_args[0][2].get("segments", [])
+            self.assertEqual(len(saved_segs), 1)
+            self.assertEqual(saved_segs[0].get("file_id"), "fid_seg_2")
+
+    def test_staging_lock_acquisition_timeout(self):
+        """
+        Unit Test: Verify timeout handling in _USER_STAGING_LOCKS prevents indefinite blocking
+        and returns clean error responses for both add_to_staging_queue and package_and_publish_queue.
+        """
+        import staging_queue
+
+        mock_lock = MagicMock()
+        mock_lock.acquire.return_value = False  # Lock acquisition timed out
+
+        with patch("staging_queue._get_user_staging_lock", return_value=mock_lock), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=500 * 1024):
+
+            # 1. add_to_staging_queue timeout
+            res_add = staging_queue.add_to_staging_queue("busy_user", "seg.mp4", 60.0)
+            self.assertEqual(res_add.get("status"), "error")
+            self.assertIn("bận", res_add.get("message", ""))
+            mock_lock.acquire.assert_called_with(timeout=30.0)
+
+            # 2. package_and_publish_queue timeout
+            res_pkg = staging_queue.package_and_publish_queue("busy_user")
+            self.assertFalse(res_pkg.get("ok"))
+            self.assertIn("bận", res_pkg.get("error", ""))
+
+    def test_drive_auto_sync_protection_against_wiping_streamers(self):
+        """
+        Unit Test: Verify that when Drive API fails (load_streamers_from_drive returns None),
+        Drive streamers.json is NOT overwritten, preventing accidental erasure of streamers.
+        Also verify that when Drive loading succeeds, new Supabase streamers are properly synced.
+        """
+        import api_server
+        import cloud_daemon
+
+        # 1. api_server.get_users: d_users is None -> save_streamers_to_drive NOT called
+        with patch("supabase_sync.fetch_streamers_from_supabase", return_value=["supa_streamer_1"]), \
+             patch("gdrive_manager.load_streamers_from_drive", return_value=None), \
+             patch("gdrive_manager.save_streamers_to_drive") as mock_save, \
+             patch("api_server.load_config", return_value={"monitored_users": []}), \
+             patch("gdrive_manager.load_active_recordings_from_drive", return_value=[]):
+
+            users_resp = api_server.get_users(check_live=False)
+            self.assertFalse(mock_save.called, "save_streamers_to_drive must NOT be called when d_users is None!")
+            self.assertIn("supa_streamer_1", [u["username"] for u in users_resp.get("users", [])])
+            self.assertIn("supa_streamer_1", users_resp.get("streamers", []))
+
+        # 2. api_server.get_users: d_users is valid list -> new Supabase streamers synced
+        with patch("supabase_sync.fetch_streamers_from_supabase", return_value=["supa_streamer_1"]), \
+             patch("gdrive_manager.load_streamers_from_drive", return_value=["drive_streamer_1"]), \
+             patch("gdrive_manager.save_streamers_to_drive") as mock_save2, \
+             patch("gdrive_manager.create_streamer_folder_drive"), \
+             patch("api_server.load_config", return_value={"monitored_users": []}), \
+             patch("gdrive_manager.load_active_recordings_from_drive", return_value=[]):
+
+            users_resp2 = api_server.get_users(check_live=False)
+            self.assertTrue(mock_save2.called, "save_streamers_to_drive SHOULD be called when d_users is a valid list!")
+
+        # 3. cloud_daemon.load_monitored_users: d is None -> save_streamers_to_drive NOT called
+        cloud_daemon._CACHED_DRIVE_USERS = None
+        cloud_daemon._LAST_DRIVE_CHECK = 0
+        with patch("gdrive_manager.load_streamers_from_drive", return_value=None), \
+             patch("supabase_sync.fetch_streamers_from_supabase", return_value=["supa_user_cd"]), \
+             patch("gdrive_manager.save_streamers_to_drive") as mock_save_cd, \
+             patch("cloud_daemon.load_config", return_value={"monitored_users": []}):
+
+            cd_users = cloud_daemon.load_monitored_users()
+            self.assertFalse(mock_save_cd.called, "cloud_daemon must NOT wipe streamers when Drive returns None!")
+
+    def test_supabase_sync_retry_loop_on_transient_failures(self):
+        """
+        Unit Test: Verify Supabase sync 3-attempt retry loop with backoff on transient HTTP 500/502 errors
+        for both sync_recording_to_supabase and upload_thumbnail_to_supabase.
+        """
+        import supabase_sync
+
+        resp_500 = MagicMock(status_code=500, text="Internal Server Error")
+        resp_502 = MagicMock(status_code=502, text="Bad Gateway")
+        resp_201 = MagicMock(status_code=201, text="Created")
+        resp_200 = MagicMock(status_code=200, text="OK")
+
+        # 1. sync_recording_to_supabase: Fails twice (500, 502), succeeds on attempt 3 (201)
+        sleep_delays = []
+        with patch("requests.post", side_effect=[resp_500, resp_502, resp_201]) as mock_post, \
+             patch("time.sleep", side_effect=lambda s: sleep_delays.append(s)):
+
+            success = supabase_sync.sync_recording_to_supabase("retry_user", "stream_rec.mp4", size_bytes=500 * 1024)
+            self.assertTrue(success)
+            self.assertEqual(mock_post.call_count, 3)
+            self.assertEqual(sleep_delays, [1.0, 2.0])
+
+        # 2. sync_recording_to_supabase: Fails all 3 attempts -> returns False
+        sleep_delays.clear()
+        with patch("requests.post", side_effect=[resp_500, resp_500, resp_500]) as mock_post2, \
+             patch("time.sleep", side_effect=lambda s: sleep_delays.append(s)):
+
+            failed = supabase_sync.sync_recording_to_supabase("retry_user", "stream_rec.mp4", size_bytes=500 * 1024)
+            self.assertFalse(failed)
+            self.assertEqual(mock_post2.call_count, 3)
+            self.assertEqual(sleep_delays, [1.0, 2.0])
+
+        # 3. upload_thumbnail_to_supabase: Fails on attempt 1 (500), succeeds on attempt 2 (200)
+        sleep_delays.clear()
+        mock_img_resp = MagicMock(status_code=200, content=b"\xff\xd8\xff\xe0" + b"x" * 300)
+        mock_img_resp.__enter__.return_value = mock_img_resp
+        mock_img_resp.__exit__.return_value = False
+
+        with patch("requests.get", return_value=mock_img_resp), \
+             patch("requests.post", side_effect=[resp_500, resp_200]) as mock_post3, \
+             patch("time.sleep", side_effect=lambda s: sleep_delays.append(s)):
+
+            thumb_url = supabase_sync.upload_thumbnail_to_supabase("https://example.com/img.jpg", "retry_user", "stream_rec.mp4")
+            self.assertIsNotNone(thumb_url)
+            self.assertEqual(mock_post3.call_count, 2)
+            self.assertEqual(sleep_delays, [1.0])
+
+    def test_zero_render_bandwidth_stream_redirection(self):
+        """
+        Unit Test (R4 Zero Render Bandwidth): Verify that both stream_video_by_id and stream_video
+        return 302 RedirectResponse directly to Google Edge CDN with 0 transit bytes through Render,
+        and stream_video serves active local recordings via FileResponse when present.
+        """
+        import api_server
+
+        client = TestClient(api_server.app, follow_redirects=False)
+
+        # 1. stream_video_by_id returns 302 to Google Edge CDN
+        with patch("gdrive_manager.get_access_token", return_value="fake_access_token"), \
+             patch("gdrive_manager.make_file_public") as mock_public:
+
+            res_id = client.get("/api/stream-video-id/drive_vid_999")
+            self.assertIn(res_id.status_code, (302, 307))
+            self.assertEqual(res_id.status_code, 302)
+            expected_cdn = "https://drive.usercontent.google.com/download?id=drive_vid_999&export=download&authuser=0&confirm=t"
+            self.assertEqual(res_id.headers.get("location"), expected_cdn)
+            mock_public.assert_called_once_with("drive_vid_999", access_token="fake_access_token")
+
+        # 2. stream_video for Google Drive files: redirects 302 via stream_video_by_id
+        mock_search_res = MagicMock(status_code=200)
+        mock_search_res.json.return_value = {"files": [{"id": "drive_vid_888"}]}
+        mock_search_res.__enter__.return_value = mock_search_res
+        mock_search_res.__exit__.return_value = False
+
+        with patch("os.path.exists", return_value=False), \
+             patch("gdrive_manager.get_access_token", return_value="fake_access_token"), \
+             patch("gdrive_manager.find_or_create_folder", return_value="user_drive_fid"), \
+             patch("requests.get", return_value=mock_search_res), \
+             patch("gdrive_manager.make_file_public") as mock_public2:
+
+            res_vid = client.get("/api/stream-video/streamer_a/recording_1.mp4")
+            self.assertIn(res_vid.status_code, (302, 307))
+            self.assertEqual(res_vid.status_code, 302)
+            expected_cdn_vid = "https://drive.usercontent.google.com/download?id=drive_vid_888&export=download&authuser=0&confirm=t"
+            self.assertEqual(res_vid.headers.get("location"), expected_cdn_vid)
+            mock_public2.assert_called_once_with("drive_vid_888", access_token="fake_access_token")
+
+        # 3. stream_video for local files: serves FileResponse (status 200)
+        with patch("os.path.exists", return_value=True), \
+             patch("api_server.FileResponse") as mock_file_resp:
+
+            mock_file_resp.return_value = MagicMock(status_code=200)
+            res_local = api_server.stream_video("streamer_a", "local_rec.mp4", MagicMock())
+            self.assertEqual(res_local.status_code, 200)
+            mock_file_resp.assert_called_once()
+
+
+class TestQualitySelectionAndMemorySafety(unittest.TestCase):
+    """
+    Test suite verifying:
+    1. Origin/1080p FLV streams are ALWAYS prioritized at index 0 (lossless live camera signal).
+    2. TikTok SDK parsing never confuses "stream_description" with SD or demotes Origin mobile 720p.
+    3. FLV is strictly ordered before HLS to prevent adaptive 360p downscaling.
+    4. auto_h264 libx264 command includes strict memory limits (threads 1, low lookahead) for Render 512MB RAM safety.
+    """
+
+    def test_parse_sdk_stream_data_origin_flv_priority_and_no_360p_downgrade(self):
+        sample_sdk = json.dumps({
+            "data": {
+                "ld": {
+                    "main": {
+                        "flv": "https://pull.tiktokcdn.com/stage/stream-ld.flv",
+                        "hls": "https://pull.tiktokcdn.com/stage/stream-ld.m3u8",
+                        "sdk_params": "{\"vcodec\":\"h264\",\"resolution\":\"360x640\",\"stream_suffix\":\"ld\"}"
+                    }
+                },
+                "sd": {
+                    "main": {
+                        "flv": "https://pull.tiktokcdn.com/stage/stream-sd.flv",
+                        "hls": "https://pull.tiktokcdn.com/stage/stream-sd.m3u8",
+                        "sdk_params": "{\"vcodec\":\"h264\",\"resolution\":\"540x960\",\"stream_description\":\"live_stream\"}"
+                    }
+                },
+                "hd": {
+                    "main": {
+                        "flv": "https://pull.tiktokcdn.com/stage/stream-hd.flv",
+                        "hls": "https://pull.tiktokcdn.com/stage/stream-hd.m3u8",
+                        "sdk_params": "{\"vcodec\":\"h264\",\"resolution\":\"720x1280\",\"stream_suffix\":\"hd\"}"
+                    }
+                },
+                "origin": {
+                    "main": {
+                        "flv": "https://pull.tiktokcdn.com/stage/stream-origin.flv",
+                        "hls": "https://pull.tiktokcdn.com/stage/stream-origin.m3u8",
+                        "sdk_params": "{\"vcodec\":\"h264\",\"resolution\":\"1080x1920\",\"stream_suffix\":\"origin\",\"stream_description\":\"live\"}"
+                    }
+                }
+            }
+        })
+
+        candidates = recorder_core.parse_sdk_stream_data(sample_sdk)
+        self.assertTrue(len(candidates) >= 4)
+        # 1. Luồng đầu tiên (index 0) BẮT BUỘC phải là Origin FLV
+        self.assertEqual(candidates[0], "https://pull.tiktokcdn.com/stage/stream-origin.flv")
+        # 2. Luồng FLV phải luôn đứng trước luồng HLS
+        flv_origin_idx = candidates.index("https://pull.tiktokcdn.com/stage/stream-origin.flv")
+        hls_origin_idx = candidates.index("https://pull.tiktokcdn.com/stage/stream-origin.m3u8")
+        self.assertLess(flv_origin_idx, hls_origin_idx)
+        # 3. Luồng 360p (LD) phải nằm ở vị trí sau cùng
+        flv_ld_idx = candidates.index("https://pull.tiktokcdn.com/stage/stream-ld.flv")
+        self.assertGreater(flv_ld_idx, flv_origin_idx)
+        self.assertEqual(candidates[-2:], [
+            "https://pull.tiktokcdn.com/stage/stream-ld.flv",
+            "https://pull.tiktokcdn.com/stage/stream-ld.m3u8"
+        ])
+
+    def test_parse_sdk_stream_data_mobile_phone_camera_origin(self):
+        """Khi streamer phát từ điện thoại (720x1280 origin), hệ thống phải giữ nguyên luồng origin gốc."""
+        mobile_sdk = json.dumps({
+            "data": {
+                "origin": {
+                    "main": {
+                        "flv": "https://pull.tiktokcdn.com/stage/stream-mobile-origin.flv",
+                        "hls": "https://pull.tiktokcdn.com/stage/stream-mobile-origin.m3u8",
+                        "sdk_params": "{\"vcodec\":\"h264\",\"resolution\":\"720x1280\",\"stream_suffix\":\"origin\",\"stream_description\":\"mobile_live\"}"
+                    }
+                },
+                "ld": {
+                    "main": {
+                        "flv": "https://pull.tiktokcdn.com/stage/stream-mobile-360.flv",
+                        "hls": "https://pull.tiktokcdn.com/stage/stream-mobile-360.m3u8",
+                        "sdk_params": "{\"vcodec\":\"h264\",\"resolution\":\"360x640\",\"stream_suffix\":\"ld\"}"
+                    }
+                }
+            }
+        })
+
+        candidates = recorder_core.parse_sdk_stream_data(mobile_sdk)
+        self.assertEqual(candidates[0], "https://pull.tiktokcdn.com/stage/stream-mobile-origin.flv")
+
+    def test_classify_stream_urls_ordering(self):
+        """Kiểm tra classify_stream_urls xếp FLV và 1080p/origin lên trước, đẩy 360p xuống cuối."""
+        urls = [
+            "https://pull.tiktokcdn.com/stream-1234_ld.flv?auth=1",
+            "https://pull.tiktokcdn.com/stream-1234_hd.flv?auth=1",
+            "https://pull.tiktokcdn.com/stream-1234_origin.m3u8?auth=1",
+            "https://pull.tiktokcdn.com/stream-1234_origin.flv?auth=1",
+            "https://pull.tiktokcdn.com/stream-1234_360p.m3u8?auth=1"
+        ]
+        sorted_urls = recorder_core.classify_stream_urls(urls)
+        # Origin FLV phải ở vị trí số 1
+        self.assertEqual(sorted_urls[0], "https://pull.tiktokcdn.com/stream-1234_origin.flv?auth=1")
+        # HD FLV ở vị trí số 2
+        self.assertEqual(sorted_urls[1], "https://pull.tiktokcdn.com/stream-1234_hd.flv?auth=1")
+        # 360p / LD phải ở cuối
+        self.assertIn("_ld.flv", sorted_urls[-2])
+        self.assertIn("360p.m3u8", sorted_urls[-1])
+
+    def test_auto_h264_libx264_ram_safety_params(self):
+        """Khẳng định lệnh libx264 có các cờ khống chế RAM < 60MB trên Render."""
+        import inspect
+        import auto_h264
+        src = inspect.getsource(auto_h264.ensure_h264)
+        self.assertIn('"-threads", "1"', src)
+        self.assertIn('rc-lookahead=10:ref=1:bframes=0:sync-lookahead=0', src)
+        self.assertIn('"-bufsize", "3000k"', src)
+
+
+
+class TestPonytailQueueAndBackendFixes(unittest.TestCase):
+    """Test suite kiểm chứng toàn bộ các bản vá logic hàng đợi Staging và đồng bộ Runner."""
+
+    def test_manifest_404_patch_fallback_to_create(self):
+        """Kiểm tra save_staging_manifest tự động fallback tạo mới khi patch trả về 404 (file cũ bị xóa)."""
+        import staging_queue
+        manifest_data = {
+            "user": "test_user",
+            "segments": [{"filename": "seg1.mp4", "duration": 60.0}],
+            "manifest_file_id": "deleted_id_404"
+        }
+        resp_404 = MagicMock(status_code=404)
+        resp_201 = MagicMock(status_code=201)
+
+        with patch("requests.patch", return_value=resp_404) as mock_patch, \
+             patch("requests.post", return_value=resp_201) as mock_post:
+            ok = staging_queue.save_staging_manifest("test_user", "staging_folder_id", manifest_data, access_token="token")
+            self.assertTrue(ok)
+            mock_patch.assert_called_once()
+            mock_post.assert_called_once()
+
+    def test_manifest_orphaned_mp4_reconciliation(self):
+        """Kiểm tra get_staging_manifest tự động gom phân đoạn MP4 mồ côi nếu manifest bị mất/desync."""
+        import staging_queue
+        # Giả lập truy vấn manifest trả về rỗng (chưa có file json)
+        res_manifest_empty = MagicMock(status_code=200)
+        res_manifest_empty.json.return_value = {"files": []}
+
+        # Giả lập truy vấn mp4 trong staging_folder trả về 2 file mồ côi
+        res_mp4 = MagicMock(status_code=200)
+        res_mp4.json.return_value = {
+            "files": [
+                {"id": "orphan_1", "name": "orphan_1.mp4", "size": "350000"},
+                {"id": "orphan_2", "name": "orphan_2.mp4", "size": "450000"}
+            ]
+        }
+
+        with patch("requests.get", side_effect=[res_manifest_empty, res_mp4]):
+            data = staging_queue.get_staging_manifest("test_orphan_user", "staging_folder_id", access_token="token")
+            self.assertEqual(len(data.get("segments", [])), 2)
+            self.assertEqual(data["segments"][0]["file_id"], "orphan_1")
+            self.assertEqual(data["segments"][1]["file_id"], "orphan_2")
+
+    def test_concat_mp4_segments_centralization(self):
+        """Kiểm tra concat_mp4_segments trong recorder_core hoạt động đúng và an toàn SameFile."""
+        import recorder_core
+        import cloud_daemon
+        import api_server
+        # Kiểm tra tính đồng nhất của hàm dùng chung
+        self.assertIs(cloud_daemon.concat_mp4_segments, recorder_core.concat_mp4_segments)
+        self.assertIs(api_server.concat_mp4_segments, recorder_core.concat_mp4_segments)
+
+        # Single file copy
+        with patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=100000), \
+             patch("shutil.copy2") as mock_copy:
+            res = recorder_core.concat_mp4_segments(["/path/to/seg1.mp4"], "/path/to/out.mp4")
+            self.assertEqual(res, "/path/to/out.mp4")
+            mock_copy.assert_called_once()
+
+    def test_api_server_duplicate_record_prevention_cloud_heartbeat(self):
+        """Kiểm tra start_record từ chối ghi đè nếu Cloud Runner đang có heartbeat tươi (<600s)."""
+        from fastapi.testclient import TestClient
+        import api_server
+        client = TestClient(api_server.app)
+
+        # Giả lập streamer đang live
+        mock_details = {
+            "is_live": True,
+            "room_id": "999999",
+            "is_sub_only": False,
+            "is_preview": False
+        }
+        # Giả lập Drive có heartbeat của user này cách đây 120s
+        drive_active = [
+            {"username": "cloud_active_user", "updated_at": int(time.time()) - 120}
+        ]
+
+        with patch("api_server.get_user_live_details_cached", return_value=mock_details), \
+             patch("gdrive_manager.load_active_recordings_from_drive", return_value=drive_active):
+            resp = client.post("/api/record/start", json={"username": "cloud_active_user", "duration_seconds": 3600})
+            self.assertEqual(resp.status_code, 200)
+            data = resp.json()
+            self.assertEqual(data.get("status"), "already_recording")
+            self.assertEqual(data.get("source"), "cloud_runner")
+
+
+    def test_get_video_resolution_parsing(self):
+        """Kiểm tra trích xuất chính xác width, height, fps từ ffmpeg output."""
+        import auto_h264
+        fake_stderr = (
+            "Input #0, mov,mp4:\n"
+            "  Stream #0:0[0x1]: Video: h264 (High), yuv420p, 640x1280, 2500 kb/s, 25 fps, 25 tbr\n"
+        )
+        mock_proc = MagicMock(stderr=fake_stderr, returncode=0)
+        with patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=50000), \
+             patch("subprocess.run", return_value=mock_proc):
+            w, h, fps = auto_h264.get_video_resolution("/fake/path.mp4")
+            self.assertEqual(w, 640)
+            self.assertEqual(h, 1280)
+            self.assertEqual(fps, 25.0)
+
+    def test_upscale_to_1080p_bypasses_if_already_1080p(self):
+        """Kiểm tra video đã đạt 1080p (chiều nhỏ >= 1080 hoặc chiều lớn >= 1920) được bỏ qua 100%."""
+        import auto_h264
+        with patch("os.path.exists", return_value=True), \
+             patch("auto_h264.get_video_resolution", return_value=(1080, 1920, 30.0)), \
+             patch("subprocess.run") as mock_run:
+            res = auto_h264.upscale_to_1080p_if_needed("/fake/1080p.mp4", config={"auto_upscale_1080p": True})
+            self.assertEqual(res, "/fake/1080p.mp4")
+            mock_run.assert_not_called()
+
+    def test_upscale_to_1080p_bypasses_if_disabled(self):
+        """Kiểm tra cấu hình auto_upscale_1080p = False thì bỏ qua không re-encode tốn CPU."""
+        import auto_h264
+        with patch("os.path.exists", return_value=True), \
+             patch("auto_h264.get_video_resolution", return_value=(432, 864, 15.0)), \
+             patch("subprocess.run") as mock_run:
+            res = auto_h264.upscale_to_1080p_if_needed("/fake/lowres.mp4", config={"auto_upscale_1080p": False})
+            self.assertEqual(res, "/fake/lowres.mp4")
+            mock_run.assert_not_called()
+
+    def test_upscale_to_1080p_triggers_lanczos_when_enabled(self):
+        """Kiểm tra video < 1080p khi bật config sẽ gọi ffmpeg với bộ lọc Lanczos 1080p."""
+        import auto_h264
+        mock_proc = MagicMock(returncode=0)
+        with patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=500000), \
+             patch("auto_h264.get_video_resolution", side_effect=[(640, 1280, 25.0), (1080, 1920, 25.0)]), \
+             patch("subprocess.run", return_value=mock_proc) as mock_run, \
+             patch("os.replace") as mock_replace:
+            res = auto_h264.upscale_to_1080p_if_needed("/fake/lowres.mp4", config={"auto_upscale_1080p": True})
+            self.assertEqual(res, "/fake/lowres.mp4")
+            self.assertTrue(mock_run.called)
+            called_cmd = mock_run.call_args[0][0]
+            self.assertIn("-vf", called_cmd)
+            self.assertIn("scale=-2:1920:flags=lanczos", called_cmd)
+            self.assertIn("-r", called_cmd)
+            self.assertIn("25.0", called_cmd)
+
 if __name__ == "__main__":
     unittest.main()
+
+
