@@ -41,21 +41,35 @@ def _get_user_staging_lock(user: str) -> threading.RLock:
 def _log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [StagingQueue] {msg}", flush=True)
 
-def get_or_create_staging_folder(user: str, access_token: str = None) -> tuple:
+def get_or_create_staging_folder(user: str, access_token: str = None, create: bool = True) -> tuple:
     """
     Tìm hoặc tạo thư mục tiktok-record/_staging/<user> trên Google Drive.
     Trả về (user_staging_folder_id, root_staging_folder_id).
+    Nếu create=False: chỉ tìm kiếm, không tự tạo folder mới.
     """
     if not access_token:
         access_token = gdrive_manager.get_access_token()
     if not access_token:
+        if not create:
+            return None, None
         raise ValueError("Chưa có Access Token Google Drive!")
 
     user = user.strip().replace("@", "").lower()
-    root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=access_token)
-    staging_root_id = gdrive_manager.find_or_create_folder("_staging", parent_id=root_id, access_token=access_token)
-    user_staging_id = gdrive_manager.find_or_create_folder(user, parent_id=staging_root_id, access_token=access_token)
+    root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=access_token, create=create)
+    if not root_id:
+        return None, None
+    staging_root_id = gdrive_manager.find_or_create_folder("_staging", parent_id=root_id, access_token=access_token, create=create)
+    if not staging_root_id:
+        return None, None
+    user_staging_id = gdrive_manager.find_or_create_folder(user, parent_id=staging_root_id, access_token=access_token, create=create)
     return user_staging_id, staging_root_id
+
+def find_staging_folder(user: str, access_token: str = None) -> tuple:
+    """
+    Tìm thư mục tiktok-record/_staging/<user> trên Google Drive (Chỉ đọc, KHÔNG tự tạo mới).
+    Trả về (user_staging_folder_id, root_staging_folder_id) hoặc (None, None).
+    """
+    return get_or_create_staging_folder(user, access_token=access_token, create=False)
 
 def get_staging_manifest(user: str, user_staging_id: str, access_token: str = None) -> dict:
     """
@@ -284,10 +298,16 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
             return {"ok": False, "error": "Chưa có Access Token Google Drive"}
 
         try:
-            user_staging_id, _ = get_or_create_staging_folder(user, access_token=access_token)
+            user_staging_id, _ = find_staging_folder(user, access_token=access_token)
+            if not user_staging_id:
+                return {"ok": True, "message": "Queue trống, không có phân đoạn nào"}
             manifest = get_staging_manifest(user, user_staging_id, access_token=access_token)
             segments = manifest.get("segments", [])
             if not segments:
+                try:
+                    gdrive_manager.delete_file_drive(user_staging_id, access_token=access_token)
+                except Exception:
+                    pass
                 return {"ok": True, "message": "Queue trống, không có phân đoạn nào"}
 
             merge_dir = os.path.join(BASE_DIR, user, "_staging_merge")
@@ -406,6 +426,10 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                 else:
                     if manifest.get("manifest_file_id"):
                         gdrive_manager.delete_file_drive(manifest["manifest_file_id"], access_token=access_token)
+                    try:
+                        gdrive_manager.delete_file_drive(user_staging_id, access_token=access_token)
+                    except Exception:
+                        pass
 
                 _log(f"✨ [@{user}] Hoàn tất trọn vẹn chu trình Staging Queue -> Video chính thức!")
                 return {

@@ -1388,8 +1388,10 @@ def get_thumbnail(user: str, filename: str, redirect: bool = False):
     try:
         tok = gdrive_manager.get_access_token()
         if tok:
-            root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
-            user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
+            root_id = gdrive_manager.find_folder("tiktok-record", access_token=tok)
+            user_fid = gdrive_manager.find_folder(user, parent_id=root_id, access_token=tok) if root_id else None
+            if not user_fid:
+                raise HTTPException(status_code=404, detail="Thumbnail không tồn tại trên Drive")
             headers = {"Authorization": f"Bearer {tok}"}
             
             # Tìm ảnh .jpg trước
@@ -1453,8 +1455,10 @@ def download_video(user: str, filename: str):
     try:
         tok = gdrive_manager.get_access_token()
         if tok:
-            root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
-            user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
+            root_id = gdrive_manager.find_folder("tiktok-record", access_token=tok)
+            user_fid = gdrive_manager.find_folder(user, parent_id=root_id, access_token=tok) if root_id else None
+            if not user_fid:
+                raise HTTPException(status_code=404, detail="File video không tồn tại")
             headers = {"Authorization": f"Bearer {tok}"}
             safe_name = filename.replace("'", "\\'")
             q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"
@@ -1483,8 +1487,10 @@ def get_cdn_url(user: str, filename: str, redirect: bool = False):
     try:
         tok = gdrive_manager.get_access_token()
         if tok:
-            root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
-            user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
+            root_id = gdrive_manager.find_folder("tiktok-record", access_token=tok)
+            user_fid = gdrive_manager.find_folder(user, parent_id=root_id, access_token=tok) if root_id else None
+            if not user_fid:
+                raise HTTPException(status_code=404, detail=f"Không tìm thấy streamer @{user} trên Google Drive")
             headers = {"Authorization": f"Bearer {tok}"}
             safe_name = filename.replace("'", "\\'")
             q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"
@@ -1563,8 +1569,10 @@ def stream_video(user: str, filename: str, request: Request, redirect: bool = Tr
     try:
         tok = gdrive_manager.get_access_token()
         if tok:
-            root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=tok)
-            user_fid = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=tok)
+            root_id = gdrive_manager.find_folder("tiktok-record", access_token=tok)
+            user_fid = gdrive_manager.find_folder(user, parent_id=root_id, access_token=tok) if root_id else None
+            if not user_fid:
+                raise HTTPException(status_code=404, detail=f"Không tìm thấy video @{user}/{filename}")
             headers = {"Authorization": f"Bearer {tok}"}
             safe_name = filename.replace("'", "\\'")
             q_vid = f"name = '{safe_name}' and '{user_fid}' in parents and trashed = false"

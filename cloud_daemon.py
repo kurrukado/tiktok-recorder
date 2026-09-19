@@ -183,7 +183,10 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
     try:
         while True:
             if stop_event and stop_event.is_set():
-                log(f"⏹️ [@{user}] Dừng luồng theo yêu cầu của hệ thống.")
+                if getattr(stop_event, "user_deleted", False):
+                    log(f"🛑 [@{user}] Streamer đã bị xóa khỏi danh sách theo dõi. Dừng luồng ngay!")
+                else:
+                    log(f"⏹️ [@{user}] Dừng luồng theo yêu cầu của hệ thống.")
                 break
 
             # Tự động tìm kiếm đối thủ PK / Co-hosts nếu bật
@@ -512,17 +515,27 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
         except Exception:
             pass
 
-        # ponytail: Tự động đóng gói và xuất bản Staging Queue ngay khi phiên livestream kết thúc
-        try:
-            import staging_queue
-            tok = gdrive_manager.get_access_token()
-            pkg_res = staging_queue.package_and_publish_queue(user, access_token=tok)
-            if pkg_res.get("ok") and pkg_res.get("filename"):
-                log(f"✨ [@{user}] Tự động đóng gói & xuất bản video từ Staging Queue ngay khi tắt live: {pkg_res.get('filename')} ({pkg_res.get('duration_minutes', 0)}p)!")
-            elif not pkg_res.get("ok"):
-                log(f"[!] [@{user}] Ghi nhận Staging Queue khi kết thúc live: {pkg_res.get('error', '')}")
-        except Exception as flush_err:
-            log(f"[!] [@{user}] Lỗi tự động đóng gói Staging Queue khi kết thúc live: {flush_err}")
+        # ponytail: Chỉ đóng gói và xuất bản Staging Queue nếu luồng không bị hủy do streamer bị xóa
+        is_user_deleted = bool(stop_event and getattr(stop_event, "user_deleted", False))
+        if not is_user_deleted:
+            try:
+                import staging_queue
+                tok = gdrive_manager.get_access_token()
+                pkg_res = staging_queue.package_and_publish_queue(user, access_token=tok)
+                if pkg_res.get("ok") and pkg_res.get("filename"):
+                    log(f"✨ [@{user}] Tự động đóng gói & xuất bản video từ Staging Queue ngay khi tắt live: {pkg_res.get('filename')} ({pkg_res.get('duration_minutes', 0)}p)!")
+                elif not pkg_res.get("ok"):
+                    log(f"[!] [@{user}] Ghi nhận Staging Queue khi kết thúc live: {pkg_res.get('error', '')}")
+            except Exception as flush_err:
+                log(f"[!] [@{user}] Lỗi tự động đóng gói Staging Queue khi kết thúc live: {flush_err}")
+        else:
+            log(f"🗑️ [@{user}] Streamer đã bị xóa: hủy xuất bản Staging Queue và dọn dẹp file tạm.")
+            try:
+                local_u_dir = os.path.join(BASE_DIR, user)
+                if os.path.exists(local_u_dir):
+                    shutil.rmtree(local_u_dir, ignore_errors=True)
+            except Exception:
+                pass
 
         gc.collect()
         log(f"⏹️ [@{user}] Đã đóng luồng ghi hình.")
@@ -586,9 +599,24 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                 break
 
         users = load_monitored_users()
-        session_count += 1
+        users_set = set(users)
+
+        # Ngắt ngay lập tức các luồng ghi hình của streamer đã bị xóa khỏi danh sách theo dõi
         with RECORDERS_LOCK:
+            deleted_active = [u for u in ACTIVE_RECORDERS if u not in users_set]
+            for u in deleted_active:
+                log(f"🛑 [@{u}] Phát hiện streamer đã bị xóa khỏi danh sách theo dõi. Dừng luồng ghi hình ngay!")
+                info = ACTIVE_RECORDERS.get(u)
+                if info and "stop_event" in info and info["stop_event"]:
+                    info["stop_event"].set()
+                try:
+                    gdrive_manager.set_user_recording_status_drive(u, False)
+                except Exception:
+                    pass
+                ACTIVE_RECORDERS.pop(u, None)
             active_now = list(ACTIVE_RECORDERS.keys())
+
+        session_count += 1
         if session_count % 15 == 1:
             log(f"[*] Đang theo dõi {len(users)} streamers. Đang ghi hình song song ({len(active_now)}/{MAX_CONCURRENT_RECORDERS}): {active_now}")
             # Định kỳ kiểm tra và tự động xả các video trong Staging Queue đã quá 24h không live mới

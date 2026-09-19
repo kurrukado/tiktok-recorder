@@ -1498,7 +1498,8 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
         stop_ev = threading.Event()
         stop_ev.set()
 
-        with patch("recorder_core.check_live_details", return_value={"is_live": False, "room_id": None}), \
+        with patch("cloud_daemon.load_monitored_users", return_value=[user]), \
+             patch("recorder_core.check_live_details", return_value={"is_live": False, "room_id": None}), \
              patch("gdrive_manager.set_user_recording_status_drive"), \
              patch("gdrive_manager.create_streamer_folder_drive"), \
              patch("gdrive_manager.get_access_token", return_value="fake_token"), \
@@ -1507,7 +1508,53 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
             mock_pub.assert_called_once_with(user, access_token="fake_token")
             self.assertNotIn(user, cloud_daemon.ACTIVE_RECORDERS)
 
+    def test_find_folder_does_not_create_folder(self):
+        """Kiểm tra find_folder chỉ đọc, không gọi POST để tạo mới khi không tìm thấy folder."""
+        import gdrive_manager
+        with patch("gdrive_manager.get_access_token", return_value="fake_tok"), \
+             patch("requests.get") as mock_get, \
+             patch("requests.post") as mock_post:
+            mock_res = MagicMock(status_code=200)
+            mock_res.json.return_value = {"files": []}
+            mock_get.return_value = mock_res
+
+            fid = gdrive_manager.find_folder("non_existent_folder", access_token="fake_tok")
+            self.assertIsNone(fid)
+            mock_post.assert_not_called()
+
+    def test_package_and_publish_queue_skips_creation_when_staging_empty(self):
+        """Kiểm tra package_and_publish_queue không tạo folder _staging rác nếu queue chưa từng tồn tại."""
+        import staging_queue
+        with patch("gdrive_manager.get_access_token", return_value="fake_tok"), \
+             patch("staging_queue.find_staging_folder", return_value=(None, None)), \
+             patch("staging_queue.get_or_create_staging_folder") as mock_create:
+            res = staging_queue.package_and_publish_queue("unrecorded_user", access_token="fake_tok")
+            self.assertTrue(res.get("ok"))
+            self.assertIn("trống", res.get("message", ""))
+            mock_create.assert_not_called()
+
+    def test_deleted_streamer_worker_skips_staging_publish_on_exit(self):
+        """Kiểm tra worker nếu phát hiện streamer đã bị xóa sẽ hủy đóng gói staging queue."""
+        import cloud_daemon
+        import threading
+
+        user = "deleted_user_xyz"
+        stop_ev = threading.Event()
+        stop_ev.user_deleted = True
+        stop_ev.set()
+
+        with patch("cloud_daemon.load_monitored_users", return_value=["other_streamer"]), \
+             patch("recorder_core.check_live_details", return_value={"is_live": False, "room_id": None}), \
+             patch("gdrive_manager.set_user_recording_status_drive"), \
+             patch("gdrive_manager.create_streamer_folder_drive"), \
+             patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("staging_queue.package_and_publish_queue") as mock_pub, \
+             patch("shutil.rmtree") as mock_rm:
+            cloud_daemon.streamer_recording_worker(user, "room_123", stop_event=stop_ev)
+            mock_pub.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()
+
 
 

@@ -106,7 +106,7 @@ def get_access_token(force_refresh=False):
             print(f"[!] Lỗi kết nối Google OAuth: {e}")
         return None
 
-def find_or_create_folder(folder_name, parent_id=None, access_token=None):
+def find_or_create_folder(folder_name, parent_id=None, access_token=None, create=True):
     cache_key = (folder_name, parent_id)
     with _FOLDER_CACHE_LOCK:
         if cache_key in _FOLDER_CACHE:
@@ -115,27 +115,32 @@ def find_or_create_folder(folder_name, parent_id=None, access_token=None):
     if not access_token:
         access_token = get_access_token()
     if not access_token:
+        if not create:
+            return None
         raise ValueError("Chưa có Access Token Google Drive!")
 
     headers = {"Authorization": f"Bearer {access_token}"}
-    
-    # Check if folder exists
     safe_folder_name = folder_name.replace("\\", "\\\\").replace("'", "\\'")
     q = f"name = '{safe_folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     if parent_id:
         q += f" and '{parent_id}' in parents"
 
     url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-    res = requests.get(url, headers=headers, timeout=15)
-    if res.status_code == 200:
-        files = res.json().get("files", [])
-        if files:
-            fid = files[0]["id"]
-            with _FOLDER_CACHE_LOCK:
-                _FOLDER_CACHE[cache_key] = fid
-            return fid
+    try:
+        with requests.get(url, headers=headers, timeout=10) as res:
+            if res.status_code == 200:
+                files = res.json().get("files", [])
+                if files:
+                    fid = files[0]["id"]
+                    with _FOLDER_CACHE_LOCK:
+                        _FOLDER_CACHE[cache_key] = fid
+                    return fid
+    except Exception:
+        pass
 
-    # Create folder if not found
+    if not create:
+        return None
+
     meta = {
         "name": folder_name,
         "mimeType": "application/vnd.google-apps.folder"
@@ -156,6 +161,13 @@ def find_or_create_folder(folder_name, parent_id=None, access_token=None):
         return fid
     else:
         raise RuntimeError(f"Không thể tạo folder '{folder_name}' trên Drive: {create_res.text}")
+
+def find_folder(folder_name, parent_id=None, access_token=None):
+    """
+    Tra cứu thư mục trên Google Drive (Chỉ đọc, KHÔNG tự động tạo mới).
+    Trả về folder_id nếu tồn tại, None nếu không tìm thấy hoặc lỗi.
+    """
+    return find_or_create_folder(folder_name, parent_id=parent_id, access_token=access_token, create=False)
 
 def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
     if not access_token:
