@@ -1035,6 +1035,21 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             gdrive_manager.set_user_recording_status_drive(user, False)
         except Exception:
             pass
+
+        # ponytail: mirror cloud_daemon finally — flush staging chỉ khi streamer chưa bị xóa
+        is_user_deleted = bool(stop_event and getattr(stop_event, "user_deleted", False))
+        if not is_user_deleted:
+            try:
+                import staging_queue
+                tok = gdrive_manager.get_access_token()
+                pkg_res = staging_queue.package_and_publish_queue(user, access_token=tok)
+                if pkg_res.get("ok") and pkg_res.get("filename"):
+                    print(f"[✨] [@{user}] Tự động đóng gói & xuất bản Staging Queue: {pkg_res.get('filename')}")
+                elif not pkg_res.get("ok") and pkg_res.get("error"):
+                    print(f"[!] [@{user}] Staging Queue khi kết thúc live: {pkg_res.get('error', '')}")
+            except Exception as flush_err:
+                print(f"[!] [@{user}] Lỗi flush Staging Queue: {flush_err}")
+
         gc.collect()
 
 @app.post("/api/record/start")

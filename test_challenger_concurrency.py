@@ -594,6 +594,33 @@ class TestChallengerFixVerifications(unittest.TestCase):
                 res = api_server.start_record(req, bg_tasks)
                 self.assertNotEqual(res.get("source"), "cloud_runner")
 
+    def test_bg_record_worker_flushes_staging_queue_on_normal_exit(self):
+        """Kiểm tra bg_record_worker trong api_server tự động flush staging queue khi kết thúc live, nhưng không flush khi user bị xóa."""
+        import api_server
+        import staging_queue
+        user = "test_bg_flush_user"
+
+        stop_event = threading.Event()
+        stop_event.set()  # Để worker thoát khỏi while loop ngay lập tức
+
+        with patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("gdrive_manager.get_access_token", return_value="fake_tok"), \
+             patch("gdrive_manager.set_user_recording_status_drive"), \
+             patch("staging_queue.package_and_publish_queue", return_value={"ok": True, "filename": "test.mp4"}) as mock_pkg:
+
+            # Trường hợp 1: Dừng bình thường (streamer hết live / stop_record), user chưa bị xóa
+            api_server.bg_record_worker(user, stop_event=stop_event)
+            mock_pkg.assert_called_once_with(user, access_token="fake_tok")
+
+            mock_pkg.reset_mock()
+
+            # Trường hợp 2: Streamer bị xóa (user_deleted = True) -> Không được flush staging
+            stop_event_deleted = threading.Event()
+            stop_event_deleted.user_deleted = True
+            stop_event_deleted.set()
+            api_server.bg_record_worker(user, stop_event=stop_event_deleted)
+            mock_pkg.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
