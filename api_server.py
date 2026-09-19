@@ -230,9 +230,9 @@ def clean_zombie_recordings(live_statuses=None):
             if is_local_recorder_running_for_user(u):
                 continue
 
-            # Heartbeat check: Nếu vừa mới được cập nhật trong 10 phút thì chắc chắn đang chạy trên Cloud Runner
+            # Heartbeat check: Nếu vừa mới được cập nhật trong 3 phút thì chắc chắn đang chạy trên Cloud Runner
             updated_at = item.get("updated_at", 0) if isinstance(item, dict) else 0
-            if updated_at and (now_ts - updated_at) < 600:
+            if updated_at and (now_ts - updated_at) < 180:
                 continue
 
             # Nếu quá 10 phút không có heartbeat, kiểm tra trực tiếp trên TikTok
@@ -507,6 +507,10 @@ def add_user(req: AddUserRequest):
             gdrive_manager.save_streamers_to_drive(users)
         except Exception:
             pass
+        try:
+            supabase_sync.add_streamer_to_supabase(user)
+        except Exception:
+            pass
 
     # TỰ ĐỘNG TẠO THƯ MỤC TRÊN GOOGLE DRIVE
     gdrive_status = "Chưa kết nối Google Drive"
@@ -557,6 +561,7 @@ def delete_user(username: str, delete_files: bool = True):
         if task_info and isinstance(task_info, dict):
             se = task_info.get("stop_event")
             if se:
+                se.user_deleted = True
                 se.set()
     try:
         gdrive_manager.set_user_recording_status_drive(user, False)

@@ -40,6 +40,21 @@ def fetch_streamers_from_supabase() -> list:
         print(f"[SUPABASE-SYNC] [!] Lỗi nạp streamers từ Supabase: {e}")
     return []
 
+def add_streamer_to_supabase(user: str) -> bool:
+    """Thêm streamer vào table 'tiktok_streamers' trên Supabase."""
+    try:
+        user = user.strip().replace("@", "").lower()
+        if not user:
+            return False
+        headers = get_supabase_headers()
+        headers["Prefer"] = "resolution=merge-duplicates"
+        url = f"{SUPABASE_URL}/rest/v1/tiktok_streamers"
+        with requests.post(url, headers=headers, json={"username": user}, timeout=10) as res:
+            return res.status_code in (200, 201, 204)
+    except Exception as e:
+        print(f"[SUPABASE-SYNC] [!] Lỗi thêm streamer vào Supabase: {e}")
+        return False
+
 def clean_filename(filename: str) -> str:
     """Loại bỏ phần mở rộng file để lấy base name sạch sẽ"""
     base = os.path.basename(filename)
@@ -198,7 +213,7 @@ def sync_recording_to_supabase(
                 pass
 
         if not cdn_download_url and drive_file_id:
-            cdn_download_url = f"https://drive.usercontent.google.com/download?id={drive_file_id}&export=download&authuser=0"
+            cdn_download_url = f"https://drive.usercontent.google.com/download?id={drive_file_id}&export=download&authuser=0&confirm=t"
 
         size_mb = round(float(size_bytes) / (1024 * 1024), 2) if size_bytes else 0.0
 

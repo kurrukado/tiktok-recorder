@@ -608,6 +608,7 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                 log(f"🛑 [@{u}] Phát hiện streamer đã bị xóa khỏi danh sách theo dõi. Dừng luồng ghi hình ngay!")
                 info = ACTIVE_RECORDERS.get(u)
                 if info and "stop_event" in info and info["stop_event"]:
+                    info["stop_event"].user_deleted = True
                     info["stop_event"].set()
                 try:
                     gdrive_manager.set_user_recording_status_drive(u, False)
@@ -632,7 +633,7 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
             active_set = set(ACTIVE_RECORDERS.keys())
             slots_available = MAX_CONCURRENT_RECORDERS - len(active_set)
 
-        # Tránh ghi đè trùng lặp với Render/local runner nếu đang có heartbeat < 600s trên Drive
+        # Tránh ghi đè trùng lặp với Render/local runner nếu đang có heartbeat tươi (< 180s) trên Drive
         drive_busy_users = set()
         try:
             drive_details = gdrive_manager.load_active_recordings_from_drive(as_details=True) or []
@@ -640,7 +641,8 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
             for it in drive_details:
                 u_name = it.get("username") if isinstance(it, dict) else str(it)
                 up_at = it.get("updated_at", 0) if isinstance(it, dict) else 0
-                if u_name and (now_ts - up_at < 600):
+                # ponytail: 180s covers >2 heartbeat cycles (~75s), eliminating 10-min blind spot on runner rotation
+                if u_name and (now_ts - up_at < 180):
                     drive_busy_users.add(u_name.strip().replace("@", "").lower())
         except Exception:
             pass

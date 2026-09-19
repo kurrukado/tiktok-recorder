@@ -527,6 +527,44 @@ class TestChallengerFixVerifications(unittest.TestCase):
                 self.assertEqual(len(saved_manifest["segments"]), 1)
                 self.assertEqual(saved_manifest["segments"][0]["filename"], "seg2.mp4")
 
+    def test_evict_folder_cache_on_delete_file_drive(self):
+        """Kiểm tra delete_file_drive tự động dọn dẹp _FOLDER_CACHE để chống trả về folder ID đã bị xóa."""
+        cache_key = ("test_streamer_stg", "root_staging_id")
+        folder_id = "deleted_staging_fid_999"
+        
+        # Đặt trước folder_id vào cache
+        with gdrive_manager._FOLDER_CACHE_LOCK:
+            gdrive_manager._FOLDER_CACHE[cache_key] = folder_id
+
+        # Kiểm tra trước khi xóa: cache có tồn tại
+        self.assertEqual(gdrive_manager._FOLDER_CACHE.get(cache_key), folder_id)
+
+        # Giả lập gọi delete_file_drive
+        with patch("requests.delete") as mock_del:
+            mock_del.return_value.__enter__.return_value.status_code = 204
+            res = gdrive_manager.delete_file_drive(folder_id, access_token="fake_tok")
+            self.assertTrue(res)
+
+        # Sau khi xóa: cache_key phải bị loại bỏ hoàn toàn khỏi _FOLDER_CACHE
+        self.assertNotIn(cache_key, gdrive_manager._FOLDER_CACHE)
+
+    def test_cdn_download_url_has_confirm_t(self):
+        """Kiểm tra get_cdn_download_url luôn chứa tham số &confirm=t để vượt qua cảnh báo virus của Google cho file lớn."""
+        url = gdrive_manager.get_cdn_download_url("sample_file_id_123")
+        self.assertIn("&confirm=t", url)
+        self.assertTrue(url.endswith("&confirm=t"))
+
+    def test_supabase_sync_add_streamer(self):
+        """Kiểm tra add_streamer_to_supabase upsert đúng username và header."""
+        import supabase_sync
+        with patch("requests.post") as mock_post:
+            mock_post.return_value.__enter__.return_value.status_code = 201
+            ok = supabase_sync.add_streamer_to_supabase("@New_Streamer_Test")
+            self.assertTrue(ok)
+            mock_post.assert_called_once()
+            called_json = mock_post.call_args[1]["json"]
+            self.assertEqual(called_json["username"], "new_streamer_test")
+
 
 if __name__ == "__main__":
     unittest.main()

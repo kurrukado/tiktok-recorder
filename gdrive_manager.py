@@ -28,6 +28,18 @@ _FOLDER_CACHE = {}
 _FOLDER_CACHE_LOCK = threading.Lock()
 _DRIVE_STATUS_LOCK = threading.Lock()
 
+def evict_folder_cache(folder_id=None, folder_name=None):
+    """Xóa các mục cache thư mục khỏi _FOLDER_CACHE khi bị xóa hoặc vô hiệu."""
+    with _FOLDER_CACHE_LOCK:
+        if folder_id:
+            keys_to_del = [k for k, v in _FOLDER_CACHE.items() if v == folder_id]
+            for k in keys_to_del:
+                _FOLDER_CACHE.pop(k, None)
+        if folder_name:
+            keys_to_del = [k for k in _FOLDER_CACHE if k[0] == folder_name]
+            for k in keys_to_del:
+                _FOLDER_CACHE.pop(k, None)
+
 def load_config():
     if os.path.exists(CONFIG_FILE):
         try:
@@ -380,7 +392,7 @@ def make_file_public(file_id, access_token=None):
 
 def get_cdn_download_url(file_id):
     """Tạo link CDN tải trực tiếp tốc độ cao tối đa từ máy chủ Edge của Google."""
-    return f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
+    return f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0&confirm=t"
 
 def sync_all_to_gdrive():
     cfg = load_config()
@@ -784,6 +796,7 @@ def download_file_from_drive(file_id, dest_path, access_token=None):
 
 def delete_file_drive(file_id, access_token=None):
     """Xóa một file hoặc thư mục đơn lẻ trên Google Drive."""
+    evict_folder_cache(folder_id=file_id)
     if not access_token:
         access_token = get_access_token()
     if not access_token:
