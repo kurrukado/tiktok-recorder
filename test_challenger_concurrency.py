@@ -565,6 +565,35 @@ class TestChallengerFixVerifications(unittest.TestCase):
             called_json = mock_post.call_args[1]["json"]
             self.assertEqual(called_json["username"], "new_streamer_test")
 
+    def test_start_record_cloud_runner_heartbeat_ttl(self):
+        """Kiểm tra start_record tôn trọng TTL 180s: <180s chặn trùng lặp, >=180s cho phép tiếp quản."""
+        import api_server
+        from unittest.mock import MagicMock
+        user = "test_heartbeat_ttl_user"
+        req = api_server.RecordRequest(username=user)
+        bg_tasks = MagicMock()
+
+        now_ts = int(time.time())
+
+        with patch("api_server.get_user_live_details_cached", return_value={"is_live": True, "room_id": "12345"}), \
+             patch("gdrive_manager.create_streamer_folder_drive"), \
+             patch("gdrive_manager.load_streamers_from_drive", return_value=[user]):
+
+            # Trường hợp 1: Heartbeat tươi (cách đây 100s < 180s) -> Phải chặn trùng lặp
+            fresh_details = [{"username": user, "updated_at": now_ts - 100}]
+            with patch("gdrive_manager.load_active_recordings_from_drive", return_value=fresh_details):
+                res = api_server.start_record(req, bg_tasks)
+                self.assertEqual(res.get("status"), "already_recording")
+                self.assertEqual(res.get("source"), "cloud_runner")
+
+            # Trường hợp 2: Heartbeat cũ (cách đây 200s >= 180s) -> Không bị chặn bởi cloud runner
+            stale_details = [{"username": user, "updated_at": now_ts - 200}]
+            with patch("gdrive_manager.load_active_recordings_from_drive", return_value=stale_details), \
+                 patch("shutil.which", return_value=None), \
+                 patch("api_server.FFMPEG_PATH", None):
+                res = api_server.start_record(req, bg_tasks)
+                self.assertNotEqual(res.get("source"), "cloud_runner")
+
 
 if __name__ == "__main__":
     unittest.main()

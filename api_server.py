@@ -1091,7 +1091,7 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
                 u_name = it.get("username") if isinstance(it, dict) else str(it)
                 if u_name and u_name.strip().replace("@", "").lower() == user:
                     up_at = it.get("updated_at", 0) if isinstance(it, dict) else 0
-                    if now_ts - up_at < 600:
+                    if now_ts - up_at < 180:  # ponytail: TTL đồng bộ với zombie cleaner và cloud_daemon (2+ heartbeat cycles ~75s)
                         return {
                             "message": f"@{user} đang được Cloud Runner ghi hình (heartbeat {now_ts - up_at}s trước).",
                             "is_recording": True,
