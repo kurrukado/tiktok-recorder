@@ -1488,6 +1488,25 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
             self.assertIn("-r", called_cmd)
             self.assertIn("25.0", called_cmd)
 
+    def test_streamer_worker_publishes_staging_queue_on_live_end(self):
+        """Kiểm tra streamer_recording_worker tự động gọi package_and_publish_queue khi streamer tắt live."""
+        import cloud_daemon
+        import staging_queue
+        import threading
+
+        user = "test_auto_pub_user"
+        stop_ev = threading.Event()
+        stop_ev.set()
+
+        with patch("recorder_core.check_live_details", return_value={"is_live": False, "room_id": None}), \
+             patch("gdrive_manager.set_user_recording_status_drive"), \
+             patch("gdrive_manager.create_streamer_folder_drive"), \
+             patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("staging_queue.package_and_publish_queue", return_value={"ok": True, "filename": "pub_full.mp4", "duration_minutes": 15.0}) as mock_pub:
+            cloud_daemon.streamer_recording_worker(user, "room_123", stop_event=stop_ev)
+            mock_pub.assert_called_once_with(user, access_token="fake_token")
+            self.assertNotIn(user, cloud_daemon.ACTIVE_RECORDERS)
+
 if __name__ == "__main__":
     unittest.main()
 

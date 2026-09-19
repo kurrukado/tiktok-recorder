@@ -511,6 +511,19 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             gdrive_manager.set_user_recording_status_drive(user, False)
         except Exception:
             pass
+
+        # ponytail: Tự động đóng gói và xuất bản Staging Queue ngay khi phiên livestream kết thúc
+        try:
+            import staging_queue
+            tok = gdrive_manager.get_access_token()
+            pkg_res = staging_queue.package_and_publish_queue(user, access_token=tok)
+            if pkg_res.get("ok") and pkg_res.get("filename"):
+                log(f"✨ [@{user}] Tự động đóng gói & xuất bản video từ Staging Queue ngay khi tắt live: {pkg_res.get('filename')} ({pkg_res.get('duration_minutes', 0)}p)!")
+            elif not pkg_res.get("ok"):
+                log(f"[!] [@{user}] Ghi nhận Staging Queue khi kết thúc live: {pkg_res.get('error', '')}")
+        except Exception as flush_err:
+            log(f"[!] [@{user}] Lỗi tự động đóng gói Staging Queue khi kết thúc live: {flush_err}")
+
         gc.collect()
         log(f"⏹️ [@{user}] Đã đóng luồng ghi hình.")
 
