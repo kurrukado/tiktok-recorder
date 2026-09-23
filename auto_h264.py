@@ -305,6 +305,8 @@ def ensure_h264(filepath):
         cmd.extend([
             "-sn",
             "-dn",
+            "-bsf:v", "dump_extra=freq=keyframe",
+            "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart",
             temp_out
         ])

@@ -1553,6 +1553,46 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
             cloud_daemon.streamer_recording_worker(user, "room_123", stop_event=stop_ev)
             mock_pub.assert_not_called()
 
+    def test_stream_stabilization_flags_in_ffmpeg_cmds(self):
+        """Kiểm tra các cờ chống xé hình và xám xịt (-bsf:v dump_extra, -avoid_negative_ts, +nobuffer) trong lệnh FFmpeg."""
+        import recorder_core
+        import auto_h264
+
+        captured_record_cmd = []
+        def fake_popen(cmd, **kwargs):
+            captured_record_cmd.extend(cmd)
+            mock_p = MagicMock()
+            mock_p.poll.return_value = 0
+            return mock_p
+
+        with patch("subprocess.Popen", side_effect=fake_popen), \
+             patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=500000), \
+             patch("auto_h264.ensure_h264", side_effect=lambda f: f), \
+             patch("auto_h264.upscale_to_1080p_if_needed", side_effect=lambda f: f), \
+             patch("auto_h264.validate_playable_video", return_value=(True, "OK", 60.0)):
+            recorder_core.record_stream_ffmpeg("http://stream.url/live.flv", output_filename="dummy.mp4", auto_sync_gdrive=False)
+
+        self.assertIn("+nobuffer", " ".join(captured_record_cmd))
+        self.assertIn("-avoid_negative_ts", captured_record_cmd)
+        self.assertIn("make_zero", captured_record_cmd)
+        self.assertIn("dump_extra=freq=keyframe", captured_record_cmd)
+
+        captured_concat_cmd = []
+        def fake_run(cmd, **kwargs):
+            captured_concat_cmd.extend(cmd)
+            return MagicMock(returncode=0)
+
+        with patch("subprocess.run", side_effect=fake_run), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=500000):
+            recorder_core.concat_mp4_segments(["seg1.mp4", "seg2.mp4"], "concat_out.mp4")
+
+        self.assertIn("-avoid_negative_ts", captured_concat_cmd)
+        self.assertIn("make_zero", captured_concat_cmd)
+        self.assertIn("dump_extra=freq=keyframe", captured_concat_cmd)
+
 if __name__ == "__main__":
     unittest.main()
 

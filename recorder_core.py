@@ -804,7 +804,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1",
         "-reconnect_delay_max", "15",
-        "-fflags", "+genpts+discardcorrupt",
+        "-fflags", "+genpts+discardcorrupt+nobuffer",
         "-analyzeduration", "10000000",
         "-probesize", "10000000",
         "-headers", (
@@ -818,7 +818,9 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         "-c:a", "copy",
         "-sn",
         "-dn",
+        "-bsf:v", "dump_extra=freq=keyframe",
         "-bsf:a", "aac_adtstoasc",
+        "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
     ]
     if duration:
@@ -1012,10 +1014,13 @@ def concat_mp4_segments(segment_files, output_file):
         cmd = [
             FFMPEG_PATH,
             "-y",
+            "-fflags", "+genpts+discardcorrupt",
             "-f", "concat",
             "-safe", "0",
             "-i", list_txt,
             "-c", "copy",
+            "-bsf:v", "dump_extra=freq=keyframe",
+            "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart",
             output_file
         ]
