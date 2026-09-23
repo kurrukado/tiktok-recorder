@@ -649,17 +649,19 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
             if file_id:
                 up_url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}?uploadType=media"
                 with requests.patch(up_url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, data=content_bytes, timeout=10) as patch_res:
-                    pass
-            else:
-                meta = {"name": "active_recordings.json", "parents": [root_id]}
-                files_data = {
-                    "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
-                    "file": ("active_recordings.json", content_bytes, "application/json")
-                }
-                create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
-                with requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files_data, timeout=10) as post_res:
-                    pass
-            return True
+                    if patch_res.status_code == 200:
+                        return True
+                    if patch_res.status_code != 404:
+                        return False
+
+            meta = {"name": "active_recordings.json", "parents": [root_id]}
+            files_data = {
+                "data": ("metadata", json.dumps(meta), "application/json; charset=UTF-8"),
+                "file": ("active_recordings.json", content_bytes, "application/json")
+            }
+            create_url = "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart"
+            with requests.post(create_url, headers={"Authorization": f"Bearer {access_token}"}, files=files_data, timeout=10) as post_res:
+                return post_res.status_code in [200, 201]
         except Exception as e:
             print(f"[!] Lỗi cập nhật active_recordings lên Drive: {e}")
             return False

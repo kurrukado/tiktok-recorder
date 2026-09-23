@@ -359,7 +359,7 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                 if len(local_segment_files) == 1:
                     shutil.copy2(local_segment_files[0], final_output_file)
                 else:
-                    from cloud_daemon import concat_mp4_segments
+                    from recorder_core import concat_mp4_segments
                     _log(f"[@{user}] Đang ghép nối lossless {len(local_segment_files)} phân đoạn thành 1 video duy nhất...")
                     concat_res = concat_mp4_segments(local_segment_files, final_output_file)
                     if not concat_res or not os.path.exists(concat_res):

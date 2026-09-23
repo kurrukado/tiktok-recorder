@@ -507,10 +507,11 @@ def add_user(req: AddUserRequest):
             gdrive_manager.save_streamers_to_drive(users)
         except Exception:
             pass
-        try:
-            supabase_sync.add_streamer_to_supabase(user)
-        except Exception:
-            pass
+
+    try:
+        supabase_sync.add_streamer_to_supabase(user)
+    except Exception:
+        pass
 
     # TỰ ĐỘNG TẠO THƯ MỤC TRÊN GOOGLE DRIVE
     gdrive_status = "Chưa kết nối Google Drive"
@@ -1309,6 +1310,8 @@ def list_recordings():
         if os.path.exists(u_dir):
             for f in os.listdir(u_dir):
                 if f.endswith(".mp4") and not f.endswith(".tmp.mp4"):
+                    if f in merged_files:
+                        continue
                     fp = os.path.join(u_dir, f)
                     st = os.stat(fp)
                     # Loại bỏ các file rác / lỗi 0:00s dưới 250 KB
