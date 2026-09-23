@@ -111,6 +111,19 @@ def upload_thumbnail_to_supabase(*args, **kwargs) -> Optional[str]:
             elif os.path.exists(thumb_source) and os.path.getsize(thumb_source) > 200:
                 with open(thumb_source, "rb") as f:
                     img_bytes = f.read()
+            elif thumb_source.startswith("gdrive:"):
+                # ponytail: Tải thumbnail từ Google Drive API chính ngạch qua Access Token (alt=media)
+                drive_id = thumb_source.replace("gdrive:", "").strip()
+                try:
+                    import gdrive_manager
+                    tok = gdrive_manager.get_access_token()
+                    if tok and drive_id:
+                        d_url = f"https://www.googleapis.com/drive/v3/files/{drive_id}?alt=media"
+                        with requests.get(d_url, headers={"Authorization": f"Bearer {tok}"}, timeout=15) as d_res:
+                            if d_res.status_code == 200 and len(d_res.content) > 200:
+                                img_bytes = d_res.content
+                except Exception:
+                    pass
 
         if not img_bytes or len(img_bytes) < 200:
             print(f"[SUPABASE-SYNC] [!] Không thể đọc dữ liệu ảnh thumbnail cho {user}/{filename}")
@@ -188,10 +201,11 @@ def sync_recording_to_supabase(
             uploaded_url = upload_thumbnail_to_supabase(thumb_source, user, fname)
             if uploaded_url:
                 final_thumb_url = uploaded_url
-
-        if not final_thumb_url:
-            base_name = clean_filename(fname)
-            final_thumb_url = f"{SUPABASE_URL}/storage/v1/object/public/{STORAGE_BUCKET}/record-thumbnails/{user}/{base_name}.jpg"
+        elif not final_thumb_url and drive_thumb_id:
+            # ponytail: Nếu chưa có thumbnail nhưng có drive_thumb_id, tải trực tiếp từ Drive lên Supabase Storage
+            uploaded_url = upload_thumbnail_to_supabase(f"gdrive:{drive_thumb_id}", user, fname)
+            if uploaded_url:
+                final_thumb_url = uploaded_url
 
         if not download_url:
             download_url = f"/api/download/{user}/{fname}"

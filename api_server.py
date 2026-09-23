@@ -1358,7 +1358,7 @@ def sync_supabase_endpoint(bg_tasks: BackgroundTasks):
                 u = r["user"]
                 fn = r["filename"]
                 thumb_id = r.get("drive_thumb_id") or r.get("drive_file_id")
-                th_url = f"https://drive.google.com/thumbnail?id={thumb_id}&sz=w800" if thumb_id else None
+                th_url = f"gdrive:{thumb_id}" if thumb_id else None
                 supabase_sync.sync_recording_to_supabase(
                     user=u,
                     filename=fn,
