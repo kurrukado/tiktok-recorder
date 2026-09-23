@@ -1,6 +1,7 @@
-﻿# Private Credentials
+# Private Credentials
 config.json
 cookies.json
+.env
 
 # Large media & binaries
 *.mp4
