@@ -3,7 +3,8 @@ name: Kuru Record Self-Healing Watchdog
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *'
+    # 6 lần/ngày, mỗi 4 tiếng chuẩn giờ Việt Nam (0h, 4h, 8h, 12h, 16h, 20h UTC+7):
+    - cron: '0 1,5,9,13,17,21 * * *'
 
 concurrency:
   group: kuru-record-watchdog

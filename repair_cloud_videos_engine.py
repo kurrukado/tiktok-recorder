@@ -4,6 +4,7 @@ import time
 import requests
 import subprocess
 import json
+from datetime import datetime, timedelta, timezone
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, BASE_DIR)
@@ -254,7 +255,8 @@ def run_repair_engine(priority_only=False, today_only=False):
     targets = []
     if today_only:
         headers = supabase_sync.get_supabase_headers()
-        url = f"{supabase_sync.SUPABASE_URL}/rest/v1/tiktok_recordings?select=id,username,filename,drive_file_id,size_mb&created_at=gte.2026-09-26T00:00:00&order=id.asc"
+        since_time = (datetime.now(timezone.utc) - timedelta(hours=28)).strftime("%Y-%m-%dT%H:%M:%S")
+        url = f"{supabase_sync.SUPABASE_URL}/rest/v1/tiktok_recordings?select=id,username,filename,drive_file_id,size_mb&created_at=gte.{since_time}&order=id.asc"
         r = requests.get(url, headers=headers)
         targets = r.json() if r.status_code == 200 else []
     elif os.path.exists(scan_report_path):
