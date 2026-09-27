@@ -214,18 +214,24 @@ def process_single_repair(rec, access_token=None):
             except: pass
         return False
 
-    # 3. In-Place PATCH to Google Drive
-    print(f"[3/4] Đang ghi đè nội dung sạch lên Google Drive (giữ nguyên file ID: {fid})...")
-    t2 = time.time()
-    patch_ok = patch_file_to_drive(repaired_path, fid, access_token=access_token)
-    if not patch_ok:
-        print(f"  ❌ Ghi đè lên Google Drive thất bại.")
-        if os.path.exists(repaired_path):
-            try: os.remove(repaired_path)
-            except: pass
-        return False
-    patch_time = time.time() - t2
-    print(f"  [✓] Ghi đè Drive thành công ({patch_time:.1f}s)")
+    # 3. In-Place PATCH to Google Drive (Chỉ ghi đè khi cần làm sạch/sửa lỗi bitstream)
+    if repaired_path != temp_raw:
+        print(f"[3/4] Đang ghi đè nội dung sạch lên Google Drive (giữ nguyên file ID: {fid})...")
+        t2 = time.time()
+        patch_ok = patch_file_to_drive(repaired_path, fid, access_token=access_token)
+        if not patch_ok:
+            print(f"  ❌ Ghi đè lên Google Drive thất bại.")
+            if os.path.exists(repaired_path):
+                try: os.remove(repaired_path)
+                except: pass
+            if os.path.exists(temp_raw):
+                try: os.remove(temp_raw)
+                except: pass
+            return False
+        patch_time = time.time() - t2
+        print(f"  [✓] Ghi đè Drive thành công ({patch_time:.1f}s)")
+    else:
+        print(f"[3/4] [✓] File trên Google Drive đã đạt chuẩn toàn vẹn (H.264 + FastStart). Bỏ qua upload Drive.")
 
     # 4. Update Supabase
     print(f"[4/4] Cập nhật metadata & thumbnail Supabase...")
