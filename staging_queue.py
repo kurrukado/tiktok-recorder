@@ -366,6 +366,12 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                         return {"ok": False, "error": "Lỗi ghép nối FFmpeg concat demuxer"}
                     final_output_file = concat_res
 
+                try:
+                    from auto_h264 import ensure_h264
+                    final_output_file = ensure_h264(final_output_file)
+                except Exception as e_err:
+                    _log(f"[!] [@{user}] Lỗi kiểm tra/chuẩn hóa H.264 staging: {e_err}")
+
                 is_valid, v_reason, total_dur = validate_playable_video(final_output_file, min_duration=5.0, min_size_bytes=250000)
                 if not is_valid:
                     if final_output_file and os.path.exists(final_output_file):
@@ -394,10 +400,13 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                     return {"ok": False, "error": "Không thể upload video hoàn chỉnh lên Google Drive chính"}
                 upload_succeeded = True
 
+                drive_thumb_id = None
                 if thumb_f and os.path.exists(thumb_f):
-                    gdrive_manager.upload_file_to_drive(thumb_f, main_user_folder_id, access_token=access_token)
+                    up_t = gdrive_manager.upload_file_to_drive(thumb_f, main_user_folder_id, access_token=access_token)
+                    if up_t and isinstance(up_t, str):
+                        drive_thumb_id = up_t
 
-                # 3. Đồng bộ Supabase kèm drive_file_id
+                # 3. Đồng bộ Supabase kèm drive_file_id & drive_thumb_id
                 sz_bytes = os.path.getsize(final_output_file)
                 fn_basename = os.path.basename(final_output_file)
                 drive_file_id = up_ok if isinstance(up_ok, str) else None
@@ -408,6 +417,7 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                         size_bytes=sz_bytes,
                         thumb_source=thumb_f,
                         drive_file_id=drive_file_id,
+                        drive_thumb_id=drive_thumb_id,
                         source="staging_queue"
                     )
                     _log(f"[✓] [@{user}] Đã đồng bộ video hoàn chỉnh lên Supabase Database & Storage!")

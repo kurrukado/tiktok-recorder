@@ -1,0 +1,63 @@
+name: Kuru Record Self-Healing Watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
+
+concurrency:
+  group: kuru-record-watchdog
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  heal-recordings:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Install Python Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Run Self-Healing Watchdog
+        env:
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: |
+          python -c "
+          import os, json
+          cfg = {}
+          if os.path.exists('config.json'):
+              with open('config.json', 'r', encoding='utf-8') as f:
+                  cfg = json.load(f)
+          if os.environ.get('GOOGLE_CLIENT_ID'):
+              cfg['google_client_id'] = os.environ['GOOGLE_CLIENT_ID']
+          if os.environ.get('GOOGLE_CLIENT_SECRET'):
+              cfg['google_client_secret'] = os.environ['GOOGLE_CLIENT_SECRET']
+          if os.environ.get('GDRIVE_REFRESH_TOKEN'):
+              cfg['gdrive_refresh_token'] = os.environ['GDRIVE_REFRESH_TOKEN']
+              cfg['gdrive_enabled'] = True
+          with open('config.json', 'w', encoding='utf-8') as f:
+              json.dump(cfg, f, indent=4)
+          print('[✓] Cấu hình credentials cho Watchdog hoàn tất.')
+          "
+          python repair_cloud_videos_engine.py --today

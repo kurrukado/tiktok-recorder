@@ -360,6 +360,12 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 log(f"🧩 [@{user}] Đang ghép nối {len(part_segments)} phân đoạn thành 1 file MP4 duy nhất cho Phần {part_number} ({accumulated_seconds:.1f}s)...")
                 final_rec_file = concat_mp4_segments(part_segments, output_file)
 
+            try:
+                from auto_h264 import ensure_h264
+                final_rec_file = ensure_h264(final_rec_file)
+            except Exception as e_err:
+                log(f"[!] [@{user}] Lỗi kiểm tra/chuẩn hóa H.264: {e_err}")
+
             # Đảm bảo file hợp lệ trước khi đẩy lên Cloud
             is_valid, v_reason, final_dur = validate_playable_video(final_rec_file, min_duration=5.0, min_size_bytes=250000)
             if not is_valid:

@@ -1,29 +1,44 @@
-# Private Credentials
+# Private Credentials & Sensitive Tokens
 config.json
 cookies.json
 .env
+*.pem
+*.key
+credentials.json
+token.json
+cloud_repair_progress.json
 
-# Large media & binaries
+# Large media & video files
 *.mp4
 *.mkv
 *.flv
 *.ts
 *.part
-*.exe
-ffmpeg.exe
-
-# Cache & system
-__pycache__/
-*.pyc
-*.log
-.tempmediaStorage/
+*.avi
+*.mov
+*.webm
+*.jpg
+*.jpeg
 *.png
 
-# Subfolders
+# Binaries & Executables
+*.exe
+ffmpeg.exe
+ffprobe.exe
+
+# Python Cache & Environment
+__pycache__/
+*.py[cod]
+*$py.class
+*.log
+venv/
+.venv/
+env/
+.env*/
+
+# Subfolders & Staging
+.tempmediaStorage/
 _tiktok_recorder/
 github_recorder/
 gradio_space/
 huggingface_space/
-islizanx/
-itsme_kate0110/
-urielhui38/

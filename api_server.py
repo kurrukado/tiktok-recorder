@@ -168,6 +168,8 @@ def get_user_live_details_cached(user: str) -> dict:
         "room_id": None,
         "is_sub_only": False,
         "is_preview": False,
+        "avatar_thumb": None,
+        "nickname": None,
         "timestamp": now
     }
     try:
@@ -176,6 +178,8 @@ def get_user_live_details_cached(user: str) -> dict:
         details["room_id"] = raw.get("room_id")
         details["is_sub_only"] = raw.get("is_sub_only", False)
         details["is_preview"] = raw.get("is_preview", False)
+        details["avatar_thumb"] = raw.get("avatar_thumb")
+        details["nickname"] = raw.get("nickname")
     except Exception:
         try:
             is_live, room_id = recorder_core.check_user_live(user)
@@ -409,6 +413,8 @@ def get_users(check_live: bool = True):
             room_id = det.get("room_id")
             is_sub_only = det.get("is_sub_only", False)
             is_preview = det.get("is_preview", False)
+            avatar_thumb = det.get("avatar_thumb")
+            nickname = det.get("nickname")
             is_recording = (u in active_users)
             if is_recording:
                 status_str = "recording"
@@ -419,6 +425,8 @@ def get_users(check_live: bool = True):
                 status_str = "offline"
             result.append({
                 "username": u,
+                "nickname": nickname,
+                "avatar_thumb": avatar_thumb,
                 "is_live": is_live,
                 "room_id": room_id,
                 "is_recording": is_recording,
@@ -915,6 +923,12 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             else:
                 print(f"[🧩] [@{user}] Đang ghép nối {len(part_segments)} phân đoạn thành 1 file MP4 duy nhất cho Phần {part_number} ({accumulated_seconds:.1f}s)...")
                 final_rec_file = recorder_core.concat_mp4_segments(part_segments, output_file)
+
+            try:
+                from auto_h264 import ensure_h264
+                final_rec_file = ensure_h264(final_rec_file)
+            except Exception as e_err:
+                print(f"[!] [@{user}] Lỗi kiểm tra/chuẩn hóa H.264: {e_err}")
 
             if stop_event and stop_event.is_set():
                 if final_rec_file and os.path.exists(final_rec_file):

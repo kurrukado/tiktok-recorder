@@ -1238,13 +1238,13 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
 class TestQualitySelectionAndMemorySafety(unittest.TestCase):
     """
     Test suite verifying:
-    1. Origin/1080p FLV streams are ALWAYS prioritized at index 0 (lossless live camera signal).
+    1. Origin/1080p HLS H.264 streams are prioritized at index 0 to avoid FLV AVCC corruption.
     2. TikTok SDK parsing never confuses "stream_description" with SD or demotes Origin mobile 720p.
-    3. FLV is strictly ordered before HLS to prevent adaptive 360p downscaling.
+    3. HLS is ordered before same-tier FLV, with FLV retained as fallback.
     4. auto_h264 libx264 command includes strict memory limits (threads 1, low lookahead) for Render 512MB RAM safety.
     """
 
-    def test_parse_sdk_stream_data_origin_flv_priority_and_no_360p_downgrade(self):
+    def test_parse_sdk_stream_data_hls_priority_and_no_360p_downgrade(self):
         sample_sdk = json.dumps({
             "data": {
                 "ld": {
@@ -1280,18 +1280,18 @@ class TestQualitySelectionAndMemorySafety(unittest.TestCase):
 
         candidates = recorder_core.parse_sdk_stream_data(sample_sdk)
         self.assertTrue(len(candidates) >= 4)
-        # 1. Luồng đầu tiên (index 0) BẮT BUỘC phải là Origin FLV
-        self.assertEqual(candidates[0], "https://pull.tiktokcdn.com/stage/stream-origin.flv")
-        # 2. Luồng FLV phải luôn đứng trước luồng HLS
+        # 1. Luồng đầu tiên (index 0) BẮT BUỘC phải là Origin HLS H.264.
+        self.assertEqual(candidates[0], "https://pull.tiktokcdn.com/stage/stream-origin.m3u8")
+        # 2. HLS phải đứng trước FLV cùng quality tier.
         flv_origin_idx = candidates.index("https://pull.tiktokcdn.com/stage/stream-origin.flv")
         hls_origin_idx = candidates.index("https://pull.tiktokcdn.com/stage/stream-origin.m3u8")
-        self.assertLess(flv_origin_idx, hls_origin_idx)
+        self.assertLess(hls_origin_idx, flv_origin_idx)
         # 3. Luồng 360p (LD) phải nằm ở vị trí sau cùng
         flv_ld_idx = candidates.index("https://pull.tiktokcdn.com/stage/stream-ld.flv")
         self.assertGreater(flv_ld_idx, flv_origin_idx)
         self.assertEqual(candidates[-2:], [
-            "https://pull.tiktokcdn.com/stage/stream-ld.flv",
-            "https://pull.tiktokcdn.com/stage/stream-ld.m3u8"
+            "https://pull.tiktokcdn.com/stage/stream-ld.m3u8",
+            "https://pull.tiktokcdn.com/stage/stream-ld.flv"
         ])
 
     def test_parse_sdk_stream_data_mobile_phone_camera_origin(self):
@@ -1316,10 +1316,10 @@ class TestQualitySelectionAndMemorySafety(unittest.TestCase):
         })
 
         candidates = recorder_core.parse_sdk_stream_data(mobile_sdk)
-        self.assertEqual(candidates[0], "https://pull.tiktokcdn.com/stage/stream-mobile-origin.flv")
+        self.assertEqual(candidates[0], "https://pull.tiktokcdn.com/stage/stream-mobile-origin.m3u8")
 
     def test_classify_stream_urls_ordering(self):
-        """Kiểm tra classify_stream_urls xếp FLV và 1080p/origin lên trước, đẩy 360p xuống cuối."""
+        """Kiểm tra classify_stream_urls xếp HLS 1080p/origin lên trước, đẩy 360p xuống cuối."""
         urls = [
             "https://pull.tiktokcdn.com/stream-1234_ld.flv?auth=1",
             "https://pull.tiktokcdn.com/stream-1234_hd.flv?auth=1",
@@ -1328,13 +1328,12 @@ class TestQualitySelectionAndMemorySafety(unittest.TestCase):
             "https://pull.tiktokcdn.com/stream-1234_360p.m3u8?auth=1"
         ]
         sorted_urls = recorder_core.classify_stream_urls(urls)
-        # Origin FLV phải ở vị trí số 1
-        self.assertEqual(sorted_urls[0], "https://pull.tiktokcdn.com/stream-1234_origin.flv?auth=1")
-        # HD FLV ở vị trí số 2
-        self.assertEqual(sorted_urls[1], "https://pull.tiktokcdn.com/stream-1234_hd.flv?auth=1")
+        # Origin HLS phải ở vị trí số 1, trước Origin FLV cùng quality tier.
+        self.assertEqual(sorted_urls[0], "https://pull.tiktokcdn.com/stream-1234_origin.m3u8?auth=1")
+        self.assertEqual(sorted_urls[1], "https://pull.tiktokcdn.com/stream-1234_origin.flv?auth=1")
         # 360p / LD phải ở cuối
-        self.assertIn("_ld.flv", sorted_urls[-2])
-        self.assertIn("360p.m3u8", sorted_urls[-1])
+        self.assertIn("360p.m3u8", sorted_urls[-2])
+        self.assertIn("_ld.flv", sorted_urls[-1])
 
     def test_auto_h264_libx264_ram_safety_params(self):
         """Khẳng định lệnh libx264 có các cờ khống chế RAM < 60MB trên Render."""
@@ -1577,7 +1576,7 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
         self.assertIn("+nobuffer", " ".join(captured_record_cmd))
         self.assertIn("-avoid_negative_ts", captured_record_cmd)
         self.assertIn("make_zero", captured_record_cmd)
-        self.assertIn("dump_extra=freq=keyframe", captured_record_cmd)
+        self.assertIn("+faststart", captured_record_cmd)
 
         captured_concat_cmd = []
         def fake_run(cmd, **kwargs):
@@ -1591,10 +1590,9 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
 
         self.assertIn("-avoid_negative_ts", captured_concat_cmd)
         self.assertIn("make_zero", captured_concat_cmd)
-        self.assertIn("dump_extra=freq=keyframe", captured_concat_cmd)
+        self.assertIn("+faststart", captured_concat_cmd)
 
 if __name__ == "__main__":
     unittest.main()
-
 
 

@@ -153,7 +153,9 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
         "is_sub_only": False,
         "is_preview": False,
         "paid_type": None,
-        "preview_duration": None
+        "preview_duration": None,
+        "avatar_thumb": None,
+        "nickname": None,
     }
     if not user:
         return details
@@ -181,6 +183,10 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
                         user_data = user_data if isinstance(user_data, dict) else {}
                         status = live_room.get("status")
                         room_id = user_data.get("roomId") or live_room.get("roomId")
+
+                        if isinstance(user_data, dict):
+                            details["avatar_thumb"] = user_data.get("avatarThumb") or user_data.get("avatarMedium") or user_data.get("avatarLarger")
+                            details["nickname"] = user_data.get("nickname")
 
                         if live_room.get("liveSubOnly") or live_room.get("subOnly"):
                             details["is_sub_only"] = True
@@ -237,6 +243,9 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
                             live_user_info = live_user_info.get("liveRoomUserInfo", {}) if isinstance(live_user_info, dict) else {}
                             room_info = live_user_info.get("liveRoom", {}) if isinstance(live_user_info, dict) else {}
                             user_info = live_user_info.get("user", {}) if isinstance(live_user_info, dict) else {}
+                            if isinstance(user_info, dict):
+                                details["avatar_thumb"] = user_info.get("avatarThumb") or user_info.get("avatarMedium") or user_info.get("avatarLarger")
+                                details["nickname"] = user_info.get("nickname")
                             status = room_info.get("status") if isinstance(room_info, dict) else None
                             room_id = (room_info.get("roomId") or user_info.get("roomId")) if (isinstance(room_info, dict) and isinstance(user_info, dict)) else None
 
@@ -378,7 +387,8 @@ def classify_stream_urls(raw_urls: list) -> list:
     Tier 3 (540p/SD): _sd, sd1, sd2, 540p, 480p.
     Tier 4 (360p/LD): _ld, 360p.
     Loại bỏ hoàn toàn luồng chỉ có tiếng (only_audio=1, stream_suffix=ao).
-    FLV luôn luôn xếp TRƯỚC HLS (m3u8) để chống hiện tượng HLS demuxer tự động hạ cấp xuống 360p!
+    HLS H.264 được ưu tiên trước FLV cùng chất lượng để tránh AVC sequence header
+    của FLV làm hỏng bitstream MP4 khi ghi copy. FLV vẫn là phương án dự phòng.
     """
     if not raw_urls:
         return []
@@ -411,33 +421,20 @@ def classify_stream_urls(raw_urls: list) -> list:
         else:
             (other_flv if is_flv else other_hls).append(u)
 
-    # Ưu tiên tuyệt đối:
-    # 1. 1080p/Origin FLV (Chất lượng gốc, 0% CPU, cố định bitrate không bao giờ tụt 360p)
-    # 2. 720p FLV
-    # 3. 1080p/Origin HLS
-    # 4. 720p HLS
-    # 5. SD FLV / HLS
-    # 6. LD FLV / HLS (360p chỉ là đường cùng)
+    # Ưu tiên HLS trước FLV cùng quality tier để tránh FLV AVCC/NAL corruption.
     return (
-        p1080_flv + p720_flv +
-        p1080_hls + p720_hls +
-        other_flv + other_hls +
-        psd_flv + psd_hls +
-        pld_flv + pld_hls
+        p1080_hls + p1080_flv +
+        p720_hls + p720_flv +
+        other_hls + other_flv +
+        psd_hls + psd_flv +
+        pld_hls + pld_flv
     )
 
 def parse_sdk_stream_data(sdk_data_str: str) -> list:
     """
-    Phân tích chuỗi JSON stream_data của TikTok Live SDK và ưu tiên tối đa luồng Origin/1080p chuẩn FLV:
-    1. Origin / 1080p H.264 FLV (Tín hiệu gốc từ camera streamer, 100% bit-for-bit, 0% CPU copy, không tụt fps)
-    2. 720p H.264 FLV (Nếu streamer phát live mobile 720p)
-    3. Origin / 1080p FLV Codec khác (HEVC/ByteVC1)
-    4. 720p FLV Codec khác
-    5. Origin / 1080p HLS (m3u8)
-    6. 720p HLS
-    7. SD (540p/480p)
-    8. LD (360p - chỉ là phương án dự phòng cuối cùng)
-    FLV luôn luôn xếp TRƯỚC HLS để triệt tiêu hoàn toàn lỗi adaptive demuxer tụt về 360p!
+    Phân tích chuỗi JSON stream_data của TikTok Live SDK, ưu tiên HLS H.264
+    cùng chất lượng trước FLV để tránh FLV AVC sequence header làm hỏng MP4.
+    FLV và codec khác vẫn là phương án dự phòng khi HLS không khả dụng.
     """
     candidates = []
     if not sdk_data_str:
@@ -500,16 +497,15 @@ def parse_sdk_stream_data(sdk_data_str: str) -> list:
             if hls and hls not in t_hls:
                 t_hls.append(hls)
 
-        # Trình tự sắp xếp tối ưu nhất:
-        # FLV Top -> FLV 720p -> HLS Top -> HLS 720p -> Other -> SD -> LD (360p)
+        # HLS H.264 giữ bitstream Annex-B sạch; FLV chỉ dùng khi HLS cùng tier thiếu.
         ordered = (
-            flv_top_h264 + flv_top_other +
-            flv_720_h264 + flv_720_other +
-            hls_top_h264 + hls_top_other +
-            hls_720_h264 + hls_720_other +
-            flv_other + hls_other +
-            flv_sd + hls_sd +
-            flv_ld + hls_ld
+            hls_top_h264 + flv_top_h264 +
+            hls_720_h264 + flv_720_h264 +
+            hls_top_other + flv_top_other +
+            hls_720_other + flv_720_other +
+            hls_other + flv_other +
+            hls_sd + flv_sd +
+            hls_ld + flv_ld
         )
         for u in ordered:
             if u not in candidates:
@@ -679,30 +675,22 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
                 if sdk_data_str and isinstance(sdk_data_str, str):
                     candidates.extend(parse_sdk_stream_data(sdk_data_str))
 
-                # Fallback to direct URLs: FULL_HD1 (1080p) phải là ưu tiên số 1!
+                # Fallback direct URLs (chỉ bổ sung vào danh sách dự phòng, không ghi đè vị trí số 1 của parse_sdk_stream_data)
                 flv_pull = stream_url_obj.get("flv_pull_url") or {}
                 if isinstance(flv_pull, dict):
-                    full_hd = flv_pull.get("FULL_HD1")
-                    if full_hd:
-                        if full_hd in candidates:
-                            candidates.remove(full_hd)
-                        candidates.insert(0, full_hd)
-                    for k in ("HD1", "SD2", "SD1"):
+                    for k in ("FULL_HD1", "HD1", "SD2", "SD1"):
                         u = flv_pull.get(k)
                         if u and u not in candidates:
                             candidates.append(u)
 
                 hls_pull = stream_url_obj.get("hls_pull_url")
-                if isinstance(hls_pull, str) and hls_pull and hls_pull not in candidates:
-                    candidates.append(hls_pull)
-                elif isinstance(hls_pull, dict):
-                    hls_fhd = hls_pull.get("FULL_HD1")
-                    if hls_fhd and hls_fhd not in candidates:
-                        candidates.append(hls_fhd)
-                    for k in ("HD1", "SD2", "SD1"):
+                if isinstance(hls_pull, dict):
+                    for k in ("FULL_HD1", "HD1", "SD2", "SD1"):
                         u = hls_pull.get(k)
                         if u and u not in candidates:
                             candidates.append(u)
+                elif isinstance(hls_pull, str) and hls_pull and hls_pull not in candidates:
+                    candidates.append(hls_pull)
             finally:
                 if res and hasattr(res, "close"):
                     try:
@@ -804,6 +792,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         "-reconnect_streamed", "1",
         "-reconnect_on_network_error", "1",
         "-reconnect_delay_max", "15",
+        "-correct_ts_overflow", "1",
         "-fflags", "+genpts+discardcorrupt+nobuffer",
         "-analyzeduration", "10000000",
         "-probesize", "10000000",
@@ -818,8 +807,8 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         "-c:a", "copy",
         "-sn",
         "-dn",
-        "-bsf:v", "dump_extra=freq=keyframe",
         "-bsf:a", "aac_adtstoasc",
+        "-max_interleave_delta", "0",
         "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
     ]
@@ -1019,7 +1008,6 @@ def concat_mp4_segments(segment_files, output_file):
             "-safe", "0",
             "-i", list_txt,
             "-c", "copy",
-            "-bsf:v", "dump_extra=freq=keyframe",
             "-avoid_negative_ts", "make_zero",
             "-movflags", "+faststart",
             output_file
@@ -1032,6 +1020,11 @@ def concat_mp4_segments(segment_files, output_file):
                         os.remove(seg)
                     except Exception:
                         pass
+            try:
+                from auto_h264 import ensure_h264
+                output_file = ensure_h264(output_file)
+            except Exception:
+                pass
             return output_file
         else:
             if os.path.exists(output_file):

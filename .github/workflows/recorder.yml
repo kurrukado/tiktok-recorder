@@ -1,25 +1,22 @@
 name: TikTok 24-7 Auto Recorder
 
 on:
-  push:
-    branches:
-      - main
-  schedule:
-    - cron: '0 */3 * * *'
   workflow_dispatch:
+  schedule:
+    - cron: '*/50 * * * *'
 
 concurrency:
   group: tiktok-recorder-runner
   cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
   actions: write
 
 jobs:
   run-recorder:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 65
 
     steps:
       - name: Checkout Code
@@ -85,14 +82,59 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -u cloud_daemon.py --duration-minutes 230 --interval 20
+          python -u cloud_daemon.py --duration-minutes 46 --interval 20
 
-      - name: Trigger Next Run (Continuous 24-7 Loop)
+      - name: Trigger Next Run (Continuous 24-7 Relay)
         if: always()
+        timeout-minutes: 5
+        env:
+          WORKFLOW_TOKEN: ${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name || 'main' }}
+        shell: bash
         run: |
-          TOKEN="${{ secrets.WORKFLOW_PAT || secrets.GH_PAT || secrets.GITHUB_TOKEN }}"
-          curl -X POST \
-            -H "Accept: application/vnd.github+v3+json" \
-            -H "Authorization: Bearer $TOKEN" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/recorder.yml/dispatches \
-            -d '{"ref":"main"}' || true
+          set -Eeuo pipefail
+
+          if [ -z "${WORKFLOW_TOKEN:-}" ]; then
+            echo "::notice::Không có Personal Access Token (WORKFLOW_PAT/GH_PAT). Cron schedule sẽ tự động kích hoạt phiên kế tiếp sau mỗi 50 phút."
+            exit 0
+          fi
+
+          API_URL="https://api.github.com/repos/${REPO}/actions/workflows/recorder.yml/dispatches"
+          PAYLOAD=$(printf '{"ref":"%s"}' "$REF")
+
+          echo "Đang chuyển tiếp sang phiên kế tiếp qua GitHub Actions API: $API_URL (branch: $REF)..."
+
+          response_file=$(mktemp)
+          trap 'rm -f "$response_file"' EXIT
+
+          http_code=$(
+            curl \
+              --silent \
+              --show-error \
+              --location \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --retry 3 \
+              --retry-delay 5 \
+              --retry-max-time 90 \
+              --request POST \
+              --header "Accept: application/vnd.github+v3+json" \
+              --header "Authorization: Bearer ${WORKFLOW_TOKEN}" \
+              --header "Content-Type: application/json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --data "$PAYLOAD" \
+              --output "$response_file" \
+              --write-out '%{http_code}' \
+              "$API_URL"
+          ) || {
+            echo "::notice::Chuyển tiếp API không khả dụng, cron schedule sẽ kích hoạt phiên kế tiếp."
+            exit 0
+          }
+
+          echo "GitHub API Response Code: $http_code"
+          if [ "$http_code" -ge 200 ] && [ "$http_code" -lt 300 ]; then
+            echo "::notice::[✓] Đã kích hoạt lượt ghi hình tiếp theo thành công (HTTP $http_code)!"
+          else
+            echo "::notice::GitHub API trả về mã $http_code. Cron schedule (mỗi 50 phút) sẽ tự động tiếp quản phiên mới."
+          fi
