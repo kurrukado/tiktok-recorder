@@ -98,6 +98,42 @@ def save_cookies(cookies_dict):
             try: os.remove(tmp_path)
             except: pass
 
+def generate_guest_session(proxy: Optional[str] = None) -> requests.Session:
+    """
+    Tạo phiên khách vô danh mới với browser fingerprint ngẫu nhiên để lấy cookie khách sạch sẽ,
+    vượt qua cơ chế giới hạn IP/phiên của TikTok khi xem luồng preview Sub-Only.
+    """
+    impersonates = ["chrome136", "chrome131", "chrome124", "safari17_0", "edge101"]
+    chosen_browser = random.choice(impersonates)
+    session_kwargs = {"impersonate": chosen_browser}
+    if proxy:
+        session_kwargs["proxies"] = {"http": proxy, "https": proxy}
+    session = requests.Session(**session_kwargs)
+    try:
+        chrome_vers = ["126.0.6478.127", "128.0.6613.85", "131.0.6778.86", "133.0.6943.53", "136.0.7024.12"]
+        ver = random.choice(chrome_vers)
+
+        tt_chain_token = "".join(random.choices("0123456789abcdef", k=32))
+        session.cookies.set("tt_chain_token", tt_chain_token, domain=".tiktok.com")
+        session.cookies.set("odin_tt", "".join(random.choices("0123456789abcdef", k=64)), domain=".tiktok.com")
+        session.cookies.set("msToken", "".join(random.choices("0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_", k=128)), domain=".tiktok.com")
+
+        session.headers.update({
+            "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{ver} Safari/537.36",
+            "Accept-Language": random.choice(["vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7", "en-US,en;q=0.9", "ja-JP,ja;q=0.8"]),
+            "Referer": "https://www.tiktok.com/",
+            "Accept": "*/*",
+            "Sec-Ch-Ua-Mobile": "?0",
+            "Sec-Ch-Ua-Platform": '"Windows"',
+        })
+        return session
+    except Exception:
+        try:
+            session.close()
+        except Exception:
+            pass
+        raise
+
 def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optional[str] = None) -> dict:
     """
     Trích xuất thông tin chi tiết phiên live:
@@ -330,6 +366,15 @@ def check_live_status(user: str) -> Tuple[bool, Optional[str]]:
     """
     det = check_live_details(user)
     return det["is_live"], det["room_id"]
+
+def get_live_stream_url(room_id, user=None, cookies=None, session=None, proxy=None):
+    try:
+        urls = get_stream_urls(room_id, user, cookies=cookies, session=session, proxy=proxy)
+        if isinstance(urls, list) and urls:
+            return urls[0]
+        return None
+    except Exception:
+        return None
 
 
 def classify_stream_urls(raw_urls: list) -> list:

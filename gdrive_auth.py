@@ -89,6 +89,10 @@ def start_oauth_flow(client_id=None, client_secret=None, redirect_uri=REDIRECT_U
     client_id = client_id or default_id
     client_secret = client_secret or default_secret
 
+    if not client_id or not client_secret:
+        print("[!] Lỗi: Client ID hoặc Client Secret trống! Vui lòng cấu hình google_client_id/google_client_secret trong config.json.")
+        return None, None
+
     auth_url = get_authorization_url(client_id, redirect_uri)
     print("\n" + "=" * 65)
     print("      LIÊN KẾT TÀI KHOẢN GOOGLE DRIVE ĐỂ TỰ ĐỘNG LƯU VIDEO")
@@ -105,8 +109,11 @@ def start_oauth_flow(client_id=None, client_secret=None, redirect_uri=REDIRECT_U
         pass
 
     server = HTTPServer(("0.0.0.0", 8080), OAuthHandler)
-    while not AUTH_CODE:
-        server.handle_request()
+    try:
+        while not AUTH_CODE:
+            server.handle_request()
+    finally:
+        server.server_close()
 
     print("\n[+] Đã nhận mã ủy quyền! Đang lấy Refresh Token...")
     tokens = exchange_code_for_tokens(AUTH_CODE, client_id, client_secret, redirect_uri)
@@ -126,12 +133,7 @@ def start_oauth_flow(client_id=None, client_secret=None, redirect_uri=REDIRECT_U
         with open(CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, indent=4, ensure_ascii=False)
 
-        hf_cfg = os.path.join(BASE_DIR, "huggingface_space", "config.json")
-        if os.path.exists(os.path.dirname(hf_cfg)):
-            with open(hf_cfg, "w", encoding="utf-8") as f:
-                json.dump(cfg, f, indent=4, ensure_ascii=False)
-
-        print("[✓] Đã lưu thông tin cấu hình vào config.json và huggingface_space/config.json!")
+        print("[✓] Đã lưu thông tin cấu hình vào config.json!")
         return access_token, refresh_token
     else:
         print(f"[!] Không nhận được refresh_token: {tokens}")

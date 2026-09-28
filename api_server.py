@@ -1,5 +1,6 @@
 import os
 import sys
+import pathlib
 import json
 import time
 import shutil
@@ -9,13 +10,12 @@ import re
 import requests
 import concurrent.futures
 import gc
-import urllib.parse
 from datetime import datetime
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Query, Header, Request
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response, RedirectResponse
+from fastapi.responses import FileResponse, Response, RedirectResponse
 
 if sys.platform == "win32":
     try:
@@ -41,7 +41,6 @@ else:
 import recorder_core
 import auto_h264
 import gdrive_manager
-import notifier
 import supabase_sync
 from contextlib import asynccontextmanager
 
@@ -337,7 +336,6 @@ def get_users(check_live: bool = True):
         # 1. Nguồn dữ liệu số 1: Supabase Database (đồng bộ tức thì từ Web)
         supa_users = []
         try:
-            import supabase_sync
             supa_users = supabase_sync.fetch_streamers_from_supabase()
             if supa_users:
                 users_list.extend(supa_users)
@@ -924,11 +922,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 print(f"[🧩] [@{user}] Đang ghép nối {len(part_segments)} phân đoạn thành 1 file MP4 duy nhất cho Phần {part_number} ({accumulated_seconds:.1f}s)...")
                 final_rec_file = recorder_core.concat_mp4_segments(part_segments, output_file)
 
-            try:
-                from auto_h264 import ensure_h264
-                final_rec_file = ensure_h264(final_rec_file)
-            except Exception as e_err:
-                print(f"[!] [@{user}] Lỗi kiểm tra/chuẩn hóa H.264: {e_err}")
+            # ponytail: ensure_h264 already called inside concat_mp4_segments
 
             if stop_event and stop_event.is_set():
                 if final_rec_file and os.path.exists(final_rec_file):

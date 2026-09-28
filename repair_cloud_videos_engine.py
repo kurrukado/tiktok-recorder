@@ -275,8 +275,7 @@ def run_repair_engine(priority_only=False, today_only=False):
             standard_items = []
             for item in data.get("needs_repair", []):
                 reasons = item.get("reasons", [])
-                user = item.get("user", "")
-                if "NAL_UNIT_SIZE_ERROR" in reasons or user in ("urielhui38", "linh.khanh5351", "nicaswrld", "wyhnnhu_03", "kieu86953", "islizanx", "triuthnga770"):
+                if "NAL_UNIT_SIZE_ERROR" in reasons:
                     priority_items.append(item)
                 else:
                     standard_items.append(item)

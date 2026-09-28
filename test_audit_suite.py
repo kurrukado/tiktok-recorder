@@ -1576,7 +1576,7 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
         self.assertIn("+nobuffer", " ".join(captured_record_cmd))
         self.assertIn("-avoid_negative_ts", captured_record_cmd)
         self.assertIn("make_zero", captured_record_cmd)
-        self.assertIn("+faststart", captured_record_cmd)
+        self.assertNotIn("+faststart", captured_record_cmd)  # F1 fix: +faststart moved to post-processing to avoid corruption
 
         captured_concat_cmd = []
         def fake_run(cmd, **kwargs):

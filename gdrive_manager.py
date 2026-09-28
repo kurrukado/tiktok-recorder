@@ -15,10 +15,6 @@ if sys.platform == "win32":
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 
-DEFAULT_GDRIVE_CLIENT_ID = ""
-DEFAULT_GDRIVE_CLIENT_SECRET = ""
-DEFAULT_GDRIVE_REFRESH_TOKEN = ""
-
 CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
 CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
 
@@ -63,7 +59,6 @@ def get_access_token(force_refresh=False):
             os.environ.get("GDRIVE_REFRESH_TOKEN")
             or os.environ.get("GOOGLE_DRIVE_REFRESH_TOKEN")
             or cfg.get("gdrive_refresh_token")
-            or DEFAULT_GDRIVE_REFRESH_TOKEN
         )
         if not refresh_token:
             return None
