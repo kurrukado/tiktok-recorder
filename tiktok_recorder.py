@@ -12,7 +12,7 @@ if sys.platform == "win32":
 
 from recorder_core import (
     load_config,
-    save_config,
+    save_config_fields,
     load_cookies,
     save_cookies,
     check_live_status,
@@ -177,6 +177,9 @@ def set_cookie_interactive():
 
 def set_vps_cloud_interactive():
     cfg = load_config()
+    # Chỉ ghi các key THAY ĐỔI (xem save_config_fields): lưu cả bản đọc lúc đầu sẽ
+    # đè mất monitored_users mà api_server thêm trong lúc người dùng đang thao tác.
+    updates = {}
     print("\n" + "=" * 65)
     print("   CÀI ĐẶT THÔNG BÁO TELEGRAM & GOOGLE DRIVE (CHO VPS / MÁY TÍNH)")
     print("=" * 65)
@@ -186,6 +189,7 @@ def set_vps_cloud_interactive():
     new_token = input("   Nhập Token mới (hoặc Enter để giữ nguyên): ").strip()
     if new_token:
         cfg["telegram_bot_token"] = new_token
+        updates["telegram_bot_token"] = new_token
 
     print("\n2. Telegram Chat ID (ID người nhận tin nhắn):")
     curr_chat = cfg.get("telegram_chat_id", "")
@@ -193,10 +197,12 @@ def set_vps_cloud_interactive():
     new_chat = input("   Nhập Chat ID mới (hoặc Enter để giữ nguyên): ").strip()
     if new_chat:
         cfg["telegram_chat_id"] = new_chat
+        updates["telegram_chat_id"] = new_chat
 
     if cfg.get("telegram_bot_token") and cfg.get("telegram_chat_id"):
         cfg["telegram_enabled"] = True
-        save_config(cfg)
+        updates["telegram_enabled"] = True
+        save_config_fields(updates)
         test = input("\nBạn có muốn gửi tin nhắn thử nghiệm tới Telegram không? (y/n): ").strip().lower()
         if test == "y":
             from notifier import send_telegram
@@ -211,10 +217,12 @@ def set_vps_cloud_interactive():
     toggle = input("   Bật tự động đẩy video lên Google Drive sau khi quay? (y/n/Enter giữ nguyên): ").strip().lower()
     if toggle == "y":
         cfg["gdrive_enabled"] = True
+        updates["gdrive_enabled"] = True
     elif toggle == "n":
         cfg["gdrive_enabled"] = False
+        updates["gdrive_enabled"] = False
 
-    save_config(cfg)
+    save_config_fields(updates)
     print("[✓] Đã lưu cấu hình thông báo và đám mây!")
 
 def main_menu():
@@ -268,15 +276,18 @@ def main_menu():
             convert_all_videos_in_folder(BASE_DIR)
             input("\nNhấn Enter để quay lại menu chính...")
         elif choice == "7":
+            updates = {}
             new_u = input(f"Nhập username TikTok mới (hiện tại: {target_user}): ").strip().replace("@", "")
             if new_u:
                 target_user = new_u
                 cfg["target_user"] = target_user
+                updates["target_user"] = target_user
             new_int = input(f"Nhập khoảng cách quét lại tính bằng giây (hiện tại: {interval}s): ").strip()
             if new_int.isdigit() and int(new_int) >= 5:
                 interval = int(new_int)
                 cfg["check_interval_seconds"] = interval
-            save_config(cfg)
+                updates["check_interval_seconds"] = interval
+            save_config_fields(updates)
             print("[✓] Đã cập nhật cấu hình!")
             time.sleep(1)
         elif choice == "8":

@@ -16,6 +16,8 @@ from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, RedirectResponse
+from config_lock import config_transaction
+
 
 if sys.platform == "win32":
     try:
@@ -91,7 +93,7 @@ app.add_middleware(
 
 # load -> mutate -> save trên config.json phải nguyên tử: 2 request chồng lấp
 # (thêm 1 streamer / xóa 1 streamer / start_record tự thêm user) sẽ làm mất 1 trong 2 thay đổi.
-_CONFIG_LOCK = threading.Lock()
+# config_transaction() cũng khóa liên tiến trình với cloud_daemon / tiktok_recorder.
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -505,7 +507,7 @@ def add_user(req: AddUserRequest):
     if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
     
-    with _CONFIG_LOCK:
+    with config_transaction():
         cfg = load_config()
         users = cfg.get("monitored_users", [])
         try:
@@ -557,7 +559,7 @@ def delete_user(username: str, delete_files: bool = True):
     user = os.path.basename(username.strip().replace("@", "").lower())
     if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên streamer không hợp lệ")
-    with _CONFIG_LOCK:
+    with config_transaction():
         cfg = load_config()
         cfg_users = cfg.get("monitored_users", [])
         if user in cfg_users:
@@ -1183,7 +1185,7 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     if not user: raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
     
     # Đảm bảo streamer có trong danh sách theo dõi
-    with _CONFIG_LOCK:
+    with config_transaction():
         cfg = load_config()
         users = cfg.get("monitored_users", [])
         try:

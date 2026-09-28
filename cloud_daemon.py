@@ -10,6 +10,8 @@ import subprocess
 import shutil
 import gc
 from datetime import datetime
+from config_lock import config_transaction
+
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -38,7 +40,9 @@ def load_config():
 _CONFIG_USERS_LOCK = threading.RLock()
 
 def save_config(cfg):
-    with _CONFIG_USERS_LOCK:
+    # config_transaction(): khóa liên tiến trình với api_server / tiktok_recorder
+    # cùng đọc-sửa-ghi config.json (chỉ khóa thread trong process này là chưa đủ).
+    with config_transaction():
         tmp_path = CONFIG_FILE + ".tmp"
         try:
             with open(tmp_path, "w", encoding="utf-8") as f:
@@ -228,12 +232,13 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                             with _CONFIG_USERS_LOCK:
                                 # Gộp cả monitored_users trong config.json: chỉ dùng cache sẽ
                                 # "cắt" mất các streamer chỉ có trong config rồi lưu lại bản thiếu.
-                                cfg = load_config()
-                                cfg_users = [u.strip().replace("@", "").lower() for u in cfg.get("monitored_users", []) if u and u.strip()]
-                                current_list = list(dict.fromkeys(cfg_users + current_list))
-                                _CACHED_DRIVE_USERS = current_list
-                                cfg["monitored_users"] = current_list
-                                save_config(cfg)
+                                with config_transaction():
+                                    cfg = load_config()
+                                    cfg_users = [u.strip().replace("@", "").lower() for u in cfg.get("monitored_users", []) if u and u.strip()]
+                                    current_list = list(dict.fromkeys(cfg_users + current_list))
+                                    _CACHED_DRIVE_USERS = current_list
+                                    cfg["monitored_users"] = current_list
+                                    save_config(cfg)
                             try:
                                 gdrive_manager.save_streamers_to_drive(current_list)
                             except Exception:
@@ -487,18 +492,24 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     log(f"[!] [@{user}] Lỗi khi tải lên Google Drive: {up_err}")
 
                 # 3. Tự động đồng bộ ngay vào Supabase Storage (ảnh thumbnail) & Database kèm drive_file_id
+                # CHỈ khi video đã thực sự tồn tại trên Google Drive: bản ghi thiếu drive_file_id
+                # là "link chết" (file local sẽ bị runner ephemeral xóa sau mỗi lần chạy).
                 try:
                     import supabase_sync
-                    log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
-                    supabase_sync.sync_recording_to_supabase(
-                        user=user,
-                        filename=rec_file_name,
-                        size_bytes=rec_file_size,
-                        thumb_source=thumb_file,
-                        drive_file_id=drive_file_id,
-                        drive_thumb_id=drive_thumb_id,
-                        source="cloud_daemon"
-                    )
+                    if not drive_file_id:
+                        log(f"⚠️ [@{user}] Upload lên Drive thất bại -> KHÔNG tạo bản ghi Supabase cho "
+                            f"{rec_file_name} (tránh link chết). File local được GIỮ lại.")
+                    else:
+                        log(f"⚡ [@{user}] Tự động đồng bộ thumbnail & metadata Phần {part_number} lên Supabase...")
+                        supabase_sync.sync_recording_to_supabase(
+                            user=user,
+                            filename=rec_file_name,
+                            size_bytes=rec_file_size,
+                            thumb_source=thumb_file,
+                            drive_file_id=drive_file_id,
+                            drive_thumb_id=drive_thumb_id,
+                            source="cloud_daemon"
+                        )
                 except Exception as sb_err:
                     log(f"[!] [@{user}] Lỗi đồng bộ Supabase: {sb_err}")
                 finally:

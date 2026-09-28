@@ -6,6 +6,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from config_lock import config_transaction
 
 if sys.platform == "win32":
     try:
@@ -159,16 +160,33 @@ def start_oauth_flow(client_id=None, client_secret=None, redirect_uri=REDIRECT_U
 
     if refresh_token:
         print("[✓] Đã lấy Refresh Token thành công!")
-        cfg = {}
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                cfg = json.load(f)
-        cfg["gdrive_refresh_token"] = refresh_token
-        cfg["google_client_id"] = client_id
-        cfg["google_client_secret"] = client_secret
-        cfg["gdrive_enabled"] = True
-        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=4, ensure_ascii=False)
+        # Đọc-sửa-ghi phải dưới khóa liên tiến trình + ghi atomic (tmp + replace):
+        # ghi thẳng vào config.json có thể để lại file JSON cụt nếu bị ngắt giữa chừng.
+        with config_transaction():
+            cfg = {}
+            if os.path.exists(CONFIG_FILE):
+                try:
+                    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                        cfg = json.load(f)
+                except Exception as e:
+                    print(f"[!] config.json không đọc được ({e}) -> bắt đầu với cấu hình rỗng.")
+                    cfg = {}
+            cfg["gdrive_refresh_token"] = refresh_token
+            cfg["google_client_id"] = client_id
+            cfg["google_client_secret"] = client_secret
+            cfg["gdrive_enabled"] = True
+            tmp_path = CONFIG_FILE + ".tmp"
+            try:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(cfg, f, indent=4, ensure_ascii=False)
+                os.replace(tmp_path, CONFIG_FILE)
+            except Exception as e:
+                print(f"[!] Không ghi được config.json: {e}")
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except Exception:
+                        pass
 
         print("[✓] Đã lưu thông tin cấu hình vào config.json!")
         return access_token, refresh_token

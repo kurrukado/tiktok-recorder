@@ -1,5 +1,7 @@
 # Private Credentials & Sensitive Tokens
 config.json
+config.json.tmp
+config.lock
 cookies.json
 .env
 *.pem

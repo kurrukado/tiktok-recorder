@@ -1592,6 +1592,130 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
         self.assertIn("make_zero", captured_concat_cmd)
         self.assertIn("+faststart", captured_concat_cmd)
 
+class TestBatch5ConfigLockAndSupabaseGuards(unittest.TestCase):
+    """Batch5: khóa liên tiến trình cho config.json + không tạo bản ghi Supabase khi thiếu Drive file."""
+
+    def test_config_lock_second_acquire_times_out(self):
+        """
+        Adversarial Test: file lock liên tiến trình phải CHẶN fd thứ 2 cùng giữ
+        config.lock (nếu không thì 2 process vẫn ghi đè config.json của nhau).
+        """
+        import config_lock
+
+        fd1, locked1 = config_lock._acquire_file_lock(1.0)
+        self.assertTrue(locked1, "Không giữ được config.lock lần đầu")
+        try:
+            t0 = time.time()
+            fd2, locked2 = config_lock._acquire_file_lock(0.5)
+            waited = time.time() - t0
+            self.assertFalse(locked2, "config.lock phải bị giữ độc quyền")
+            self.assertGreaterEqual(waited, 0.35, "Phải chờ hết timeout chứ không được trả về ngay")
+            if fd2 is not None:
+                os.close(fd2)
+        finally:
+            config_lock._release_file_lock(fd1)
+
+        # Sau khi nhả khóa thì lock phải lấy lại được (không bị treo/vẫn giữ)
+        fd3, locked3 = config_lock._acquire_file_lock(1.0)
+        self.assertTrue(locked3)
+        config_lock._release_file_lock(fd3)
+
+    def test_config_transaction_is_reentrant(self):
+        """
+        config_transaction() lồng nhau trong CÙNG thread (save_config gọi bên trong
+        một transaction) không được tự tước khóa -> nếu có sẽ treo chờ timeout 10s.
+        """
+        import config_lock
+        t0 = time.time()
+        with config_lock.config_transaction(timeout=3):
+            with config_lock.config_transaction(timeout=3):
+                with config_lock.config_transaction(timeout=3):
+                    pass
+        self.assertLess(time.time() - t0, 2.0, "Không được treo ở lần vào khóa lồng nhau")
+
+    def test_save_config_fields_does_not_clobber_concurrent_writes(self):
+        """
+        save_config_fields() chỉ ghi key được chỉ định: CLI đọc config lúc bắt đầu,
+        người dùng thao tác vài phút, trong lúc đó api_server thêm streamer ->
+        lưu lại bản đọc lúc đầu sẽ XOÁ mất monitored_users của process khác.
+        """
+        import recorder_core
+        import tempfile
+
+        tmp_cfg = os.path.join(tempfile.gettempdir(), "test_batch5_config.json")
+        try:
+            with open(tmp_cfg, "w", encoding="utf-8") as f:
+                json.dump({"monitored_users": ["streamer_added_by_api"],
+                           "check_interval_seconds": 20}, f, ensure_ascii=False)
+
+            with patch.object(recorder_core, "CONFIG_FILE", tmp_cfg):
+                # Người dùng chỉ đổi target_user
+                recorder_core.save_config_fields({"target_user": "new_target"})
+                with open(tmp_cfg, encoding="utf-8") as f:
+                    saved = json.load(f)
+                self.assertEqual(saved.get("target_user"), "new_target")
+                # monitored_users do process khác ghi PHẢI được giữ nguyên
+                self.assertEqual(saved.get("monitored_users"), ["streamer_added_by_api"])
+
+                # Ghi rỗng không được động tới file
+                recorder_core.save_config_fields({})
+                with open(tmp_cfg, encoding="utf-8") as f:
+                    saved2 = json.load(f)
+                self.assertEqual(saved2.get("monitored_users"), ["streamer_added_by_api"])
+        finally:
+            if os.path.exists(tmp_cfg):
+                try:
+                    os.remove(tmp_cfg)
+                except OSError:
+                    pass
+
+    def test_cloud_daemon_no_supabase_row_without_drive_file(self):
+        """
+        Upload Google Drive thất bại -> cloud_daemon KHÔNG được tạo bản ghi Supabase
+        (bản ghi không có drive_file_id là link chết trên website) nhưng vẫn upload
+        bình thường khi Drive OK (đối chứng).
+        """
+        import cloud_daemon
+
+        def fake_record(url, output_filename=None, **kwargs):
+            return output_filename
+
+        live_calls = {"n": 0}
+        def fake_live(u):
+            live_calls["n"] += 1
+            return {"is_live": live_calls["n"] == 1, "room_id": "111"}
+
+        with patch("recorder_core.get_live_stream_url", return_value="http://pull.flv/stream.flv"), \
+             patch("recorder_core.record_stream_ffmpeg", side_effect=fake_record), \
+             patch("auto_h264.validate_playable_video", return_value=(True, "ok", 3600.0)), \
+             patch("recorder_core.check_live_details", side_effect=fake_live), \
+             patch("gdrive_manager.get_access_token", return_value="fake_tok"), \
+             patch("gdrive_manager.find_or_create_folder", return_value="fake_fid"), \
+             patch("gdrive_manager.create_streamer_folder_drive"), \
+             patch("gdrive_manager.set_user_recording_status_drive"), \
+             patch("auto_h264.extract_middle_thumbnail", return_value=None), \
+             patch("staging_queue.package_and_publish_queue", return_value={"ok": True}), \
+             patch("supabase_sync.sync_recording_to_supabase", return_value=True) as mock_sync, \
+             patch("gdrive_manager.upload_file_to_drive", return_value=False) as mock_upload, \
+             patch("os.makedirs"), \
+             patch("os.path.exists", return_value=True), \
+             patch("os.path.getsize", return_value=500000), \
+             patch("os.remove"), \
+             patch("shutil.move"), \
+             patch("time.sleep"):
+            # 1. Drive upload THẤT BẠI -> không sync
+            cloud_daemon.streamer_recording_worker("phantom_upload_user", "111", auto_discover=False)
+            mock_sync.assert_not_called()
+
+            # 2. Drive upload THÀNH CÔNG -> phải sync kèm drive_file_id (đối chứng)
+            mock_upload.return_value = "drive_file_id_ok"
+            mock_sync.reset_mock()
+            live_calls["n"] = 0
+            cloud_daemon.streamer_recording_worker("phantom_upload_user", "111", auto_discover=False)
+            mock_sync.assert_called_once()
+            self.assertEqual(mock_sync.call_args[1].get("drive_file_id"), "drive_file_id_ok")
+
+
 if __name__ == "__main__":
     unittest.main()
 

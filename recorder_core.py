@@ -60,16 +60,34 @@ def load_config():
     return DEFAULT_CONFIG.copy()
 
 def save_config(cfg):
-    tmp_path = CONFIG_FILE + ".tmp"
-    try:
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=4, ensure_ascii=False)
-        os.replace(tmp_path, CONFIG_FILE)
-    except Exception as e:
-        print(f"[!] Lỗi ghi config: {e}")
-        if os.path.exists(tmp_path):
-            try: os.remove(tmp_path)
-            except: pass
+    # Khóa liên tiến trình (api_server / cloud_daemon / tiktok_recorder cùng ghi file này)
+    from config_lock import config_transaction
+    with config_transaction():
+        tmp_path = CONFIG_FILE + ".tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, indent=4, ensure_ascii=False)
+            os.replace(tmp_path, CONFIG_FILE)
+        except Exception as e:
+            print(f"[!] Lỗi ghi config: {e}")
+            if os.path.exists(tmp_path):
+                try: os.remove(tmp_path)
+                except: pass
+
+def save_config_fields(updates):
+    """
+    Ghi MỘT SỐ key thay đổi, không ghi đè cả file.
+    Dùng cho các màn hình CLI đọc config lúc bắt đầu (có thể ngồi vài phút ở menu)
+    rồi lưu lại: nếu lưu cả bản đọc lúc đầu sẽ xoá mất streamer mà api_server
+    vừa thêm vào monitored_users trong lúc người dùng đang thao tác.
+    """
+    if not updates:
+        return
+    from config_lock import config_transaction
+    with config_transaction():
+        cfg = load_config()
+        cfg.update(updates)
+        save_config(cfg)
 
 def load_cookies():
     if os.path.exists(COOKIES_FILE):
