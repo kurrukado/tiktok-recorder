@@ -1409,7 +1409,7 @@ def get_thumbnail(user: str, filename: str, redirect: bool = False):
     thumb_path = os.path.join(BASE_DIR, user, clean_name + ".jpg")
 
     resolved = os.path.abspath(video_path)
-    if not resolved.startswith(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
+    if not pathlib.Path(resolved).is_relative_to(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
 
     # 1. Nếu thumbnail đã có sẵn dưới máy local
     if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 500:
@@ -1465,6 +1465,7 @@ def get_thumbnail(user: str, filename: str, redirect: bool = False):
                 res_vid.close()
             if vid_files:
                 vid_id = vid_files[0]["id"]
+                gdrive_manager.make_file_public(vid_id, access_token=tok)
                 thumb_link = vid_files[0].get("thumbnailLink")
                 if thumb_link:
                     return RedirectResponse(url=thumb_link, status_code=302)
@@ -1484,9 +1485,9 @@ def download_video(user: str, filename: str):
     filename = os.path.basename(filename)
     fp = os.path.join(BASE_DIR, user, filename)
     resolved = os.path.abspath(fp)
-    if not resolved.startswith(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
+    if not pathlib.Path(resolved).is_relative_to(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
     if os.path.exists(fp):
-        return FileResponse(path=fp, media_type="video/mp4", filename=filename)
+        return FileResponse(path=fp, media_type="video/mp4", filename=filename, headers={"Accept-Ranges": "bytes"})
     
     # Tìm kiếm trên Google Drive và chuyển hướng trực tiếp đến CDN tải tốc độ cao
     try:

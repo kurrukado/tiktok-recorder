@@ -423,10 +423,7 @@ def sync_all_to_gdrive():
         pass
     cfg = load_config()
     users_set.update(cfg.get("monitored_users", []))
-    for item in os.listdir(BASE_DIR):
-        item_path = os.path.join(BASE_DIR, item)
-        if os.path.isdir(item_path) and not item.startswith((".", "_")):
-            users_set.add(item)
+    # ponytail: removed os.listdir scan that added project folders as streamers
     users = list(users_set)
     total_uploaded = 0
     total_files = 0
