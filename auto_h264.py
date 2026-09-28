@@ -227,7 +227,7 @@ def upscale_to_1080p_if_needed(filepath, config=None):
         cmd.extend(["-r", str(fps)])
 
     if encoder == "h264_nvenc":
-        cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "22", "-pix_fmt", "yuv420p"])
+        cmd.extend(["-c:v", "h264_nvenc", "-preset", "p4", "-rc:v", "vbr", "-cq", "22", "-pix_fmt", "yuv420p"])
     elif encoder == "libx264":
         cmd.extend([
             "-c:v", "libx264",
@@ -270,10 +270,18 @@ def has_faststart(filepath):
     try:
         with open(filepath, "rb") as f:
             header = f.read(128 * 1024)
-            moov_pos = header.find(b"moov")
-            mdat_pos = header.find(b"mdat")
-            if moov_pos != -1 and (mdat_pos == -1 or moov_pos < mdat_pos):
-                return True
+            # Parse MP4 atom headers: [4-byte size][4-byte type]
+            pos = 0
+            while pos + 8 <= len(header):
+                box_size = int.from_bytes(header[pos:pos+4], "big")
+                box_type = header[pos+4:pos+8]
+                if box_type == b"moov":
+                    return True
+                if box_type == b"mdat":
+                    return False
+                if box_size < 8:
+                    break
+                pos += box_size
     except Exception:
         pass
     return False
@@ -855,7 +863,7 @@ def _extract_raw_keyframe_thumb(video_path, output_thumb):
                             "-i", raw_tmp,
                             "-vframes", "1",
                             "-strict", "unofficial",
-                            "-vf", "format=yuvj420p",
+                            "-vf", "format=yuv420p",
                             "-q:v", "2",
                             output_thumb
                         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)

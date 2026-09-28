@@ -27,7 +27,6 @@ TARGET_QUEUE_SECONDS = 3000       # 50 phút (~1 tiếng chênh lệch 10p)
 MAX_IDLE_SECONDS = 3600           # 1 tiếng không live mới thì tự động xả queue
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-_STAGING_LOCK = threading.RLock()
 _USER_STAGING_LOCKS = {}
 _USER_LOCKS_MUTEX = threading.Lock()
 
@@ -224,7 +223,7 @@ def add_to_staging_queue(user: str, local_file_path: str, duration_seconds: floa
         file_id = ok if isinstance(ok, str) else None
         if not file_id:
             headers = {"Authorization": f"Bearer {access_token}"}
-            safe_name = filename.replace("'", "\'")
+            safe_name = filename.replace("'", "\\'")
             q_file = f"name = '{safe_name}' and '{user_staging_id}' in parents and trashed = false"
             url_f = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q_file)}&fields=files(id,size)"
             f_res = None

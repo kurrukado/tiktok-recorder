@@ -2,7 +2,6 @@ import sys
 import os
 import time
 import requests
-import subprocess
 import json
 from datetime import datetime, timedelta, timezone
 
@@ -14,6 +13,7 @@ import supabase_sync
 import auto_h264
 
 PROGRESS_FILE = os.path.join(BASE_DIR, "cloud_repair_progress.json")
+SCAN_REPORT_PATH = os.path.join(BASE_DIR, "scan_report.json")
 
 def load_progress():
     if os.path.exists(PROGRESS_FILE):
@@ -268,8 +268,8 @@ def run_repair_engine(priority_only=False, today_only=False):
         url = f"{supabase_sync.SUPABASE_URL}/rest/v1/tiktok_recordings?select=id,username,filename,drive_file_id,size_mb&created_at=gte.{since_time}&order=id.asc"
         r = requests.get(url, headers=headers)
         targets = r.json() if r.status_code == 200 else []
-    elif os.path.exists(scan_report_path):
-        with open(scan_report_path, "r", encoding="utf-8") as f:
+    elif os.path.exists(SCAN_REPORT_PATH):
+        with open(SCAN_REPORT_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
             priority_items = []
             standard_items = []
@@ -287,7 +287,7 @@ def run_repair_engine(priority_only=False, today_only=False):
         headers = supabase_sync.get_supabase_headers()
         url = f"{supabase_sync.SUPABASE_URL}/rest/v1/tiktok_recordings?select=id,username,filename,drive_file_id,size_mb&order=id.desc"
         r = requests.get(url, headers=headers)
-        targets = r.json()
+        targets = r.json() if r.status_code == 200 else []
 
     # Filter out already repaired
     queue = []

@@ -16,11 +16,10 @@ from recorder_core import (
     load_cookies,
     save_cookies,
     check_live_status,
+    check_live_details,
     get_stream_urls,
     record_stream_ffmpeg,
     BASE_DIR,
-    COOKIES_FILE,
-    CONFIG_FILE
 )
 try:
     from download_archives import download_all_archives
@@ -51,7 +50,8 @@ def run_auto_mode(target_user, interval):
     while True:
         timestamp = time.strftime("%H:%M:%S")
         try:
-            is_live, room_id = check_live_status(target_user)
+            live_info = check_live_details(target_user)
+            is_live, room_id = live_info["is_live"], live_info["room_id"]
             if is_live and room_id:
                 print(f"\n[{timestamp}] 🔴 PHÁT HIỆN @{target_user} ĐANG PHÁT TRỰC TIẾP!")
                 print(f"[{timestamp}] ID Phòng: {room_id}")
@@ -81,7 +81,7 @@ def run_auto_mode(target_user, interval):
                 if isinstance(stream_res, list) and stream_res:
                     stream_url = stream_res[0]
                     print(f"[{timestamp}] [✓] Đã lấy được link stream chất lượng cao nhất.")
-                    record_stream_ffmpeg(stream_url=stream_url, target_user=target_user)
+                    record_stream_ffmpeg(stream_url=stream_url, target_user=target_user, is_sub_only=live_info.get("is_sub_only", False))
                     print(f"\n[{time.strftime('%H:%M:%S')}] Phiên live đã kết thúc hoặc bị ngắt. Tiếp tục chờ phiên live mới...")
                 else:
                     print(f"[{timestamp}] Không tìm thấy link luồng stream hợp lệ. Thử lại sau {interval}s...")
