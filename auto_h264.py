@@ -480,7 +480,6 @@ def sanitize_mp4_bitstream(input_path, output_path=None):
         cmd = [
             FFMPEG_PATH, "-y",
             "-fflags", "+genpts",
-            "-r", "25",
             "-i", raw_h264,
             "-i", input_path,
             "-map", "0:v:0",

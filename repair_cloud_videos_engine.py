@@ -197,6 +197,8 @@ def process_single_repair(rec, access_token=None):
     # 2. Transcode / Sanitize
     print(f"[2/4] Đang chuẩn hóa bitstream & H.264 qua GPU NVENC...")
     t1 = time.time()
+    pre_mtime = os.path.getmtime(temp_raw)
+    pre_size = os.path.getsize(temp_raw)
     repaired_path = auto_h264.ensure_h264(temp_raw)
     trans_time = time.time() - t1
     repaired_size_mb = os.path.getsize(repaired_path) / (1024 * 1024)
@@ -215,7 +217,8 @@ def process_single_repair(rec, access_token=None):
         return False
 
     # 3. In-Place PATCH to Google Drive (Chỉ ghi đè khi cần làm sạch/sửa lỗi bitstream)
-    if repaired_path != temp_raw:
+    file_changed = os.path.getmtime(repaired_path) != pre_mtime or os.path.getsize(repaired_path) != pre_size
+    if file_changed:
         print(f"[3/4] Đang ghi đè nội dung sạch lên Google Drive (giữ nguyên file ID: {fid})...")
         t2 = time.time()
         patch_ok = patch_file_to_drive(repaired_path, fid, access_token=access_token)

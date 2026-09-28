@@ -807,10 +807,8 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         "-c:a", "copy",
         "-sn",
         "-dn",
-        "-bsf:a", "aac_adtstoasc",
         "-max_interleave_delta", "0",
         "-avoid_negative_ts", "make_zero",
-        "-movflags", "+faststart",
     ]
     if duration:
         cmd.extend(["-t", str(duration)])
@@ -1014,12 +1012,7 @@ def concat_mp4_segments(segment_files, output_file):
         ]
         res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=180)
         if res.returncode == 0 and os.path.exists(output_file) and os.path.getsize(output_file) > 100000:
-            for seg in valid_files:
-                if os.path.abspath(seg) != os.path.abspath(output_file) and os.path.exists(seg):
-                    try:
-                        os.remove(seg)
-                    except Exception:
-                        pass
+            # ponytail: segments NOT deleted here — caller deletes after cloud upload confirms
             try:
                 from auto_h264 import ensure_h264
                 output_file = ensure_h264(output_file)
