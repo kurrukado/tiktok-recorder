@@ -237,14 +237,25 @@ def sync_recording_to_supabase(
             "size_bytes": int(size_bytes),
             "size_mb": size_mb,
             "recorded_at": recorded_at,
-            "created_at": created_at or datetime.now(timezone.utc).isoformat(),
-            "thumbnail_url": final_thumb_url,
+            # Dùng recorded_at (rút từ tên file -> CỐN ĐỊNH giữa các lần re-sync) thay vì
+            # thời điểm sync: nếu gửi datetime.now(), mỗi lần re-sync sẽ ghi đè
+            # created_at của bản ghi gốc bằng thời điểm đồng bộ.
+            "created_at": created_at or recorded_at,
             "download_url": download_url,
-            "cdn_download_url": cdn_download_url,
-            "drive_file_id": drive_file_id,
-            "drive_thumb_id": drive_thumb_id,
             "source": source
         }
+        # Chỉ gửi các cột nullable khi CÓ GIÁ TRỊ.
+        # Với Prefer: resolution=merge-duplicates, cột không có trong payload sẽ GIỮ NGUYÊN giá trị cũ;
+        # gửi null sẽ ghi đè đè lên thumbnail_url / drive_file_id đã lưu tốt từ lần sync trước
+        # (đặc biệt nguy hiểm khi re-sync và upload thumbnail tạm thời thất bại do rate limit).
+        for key, val in (
+            ("thumbnail_url", final_thumb_url),
+            ("cdn_download_url", cdn_download_url),
+            ("drive_file_id", drive_file_id),
+            ("drive_thumb_id", drive_thumb_id),
+        ):
+            if val:
+                row_data[key] = val
 
         rest_url = f"{SUPABASE_URL}/rest/v1/tiktok_recordings?on_conflict=filename"
         headers = {

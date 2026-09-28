@@ -89,9 +89,11 @@ def patch_file_to_drive(file_path, file_id, access_token=None):
 
         chunk_size = 8 * 1024 * 1024  # 8MB chunk
         uploaded_bytes = 0
+        stalled_rounds = 0
 
         with open(file_path, "rb") as f:
             while uploaded_bytes < file_size:
+                before_bytes = uploaded_bytes
                 chunk = f.read(chunk_size)
                 if not chunk:
                     break
@@ -136,6 +138,17 @@ def patch_file_to_drive(file_path, file_id, access_token=None):
 
                 if not chunk_ok or put_res is None:
                     return False
+
+                # Server 308 liên tục mà KHÔNG nhận thêm byte nào -> vòng lặp vô tận
+                # (re-send cùng chunk, không sleep, không giới hạn) làm treo cả watchdog.
+                if uploaded_bytes <= before_bytes:
+                    stalled_rounds += 1
+                    if stalled_rounds >= 5:
+                        print(f"  [!] Upload đình chỉ: không tiến thêm byte nào sau {stalled_rounds} vòng. Dừng.")
+                        return False
+                    time.sleep(1.0)
+                else:
+                    stalled_rounds = 0
 
         return put_res is not None and put_res.status_code in (200, 201)
     except Exception as e:
@@ -200,6 +213,13 @@ def process_single_repair(rec, access_token=None):
     pre_mtime = os.path.getmtime(temp_raw)
     pre_size = os.path.getsize(temp_raw)
     repaired_path = auto_h264.ensure_h264(temp_raw)
+    if not repaired_path or not os.path.exists(repaired_path):
+        # ensure_h264 trả về file gốc nếu không thể ghi đè -> luôn phải tồn tại
+        print("  ❌ Không có file kết quả sau khi chuẩn hóa. Hủy patch Drive.")
+        if os.path.exists(temp_raw):
+            try: os.remove(temp_raw)
+            except: pass
+        return False
     trans_time = time.time() - t1
     repaired_size_mb = os.path.getsize(repaired_path) / (1024 * 1024)
     has_fs = auto_h264.has_faststart(repaired_path)
@@ -260,14 +280,27 @@ def run_repair_engine(priority_only=False, today_only=False):
 
     progress = load_progress()
     repaired_set = set(progress.get("repaired_ids", []))
+    failed_map = progress.get("failed_ids", {}) or {}
+    MAX_RETRY_ATTEMPTS = 3
+
+    def _attempts_of(rec_id):
+        prev = failed_map.get(str(rec_id))
+        if isinstance(prev, dict):
+            return int(prev.get("attempts", 0) or 0)
+        return 1 if prev else 0
 
     targets = []
     if today_only:
         headers = supabase_sync.get_supabase_headers()
         since_time = (datetime.now(timezone.utc) - timedelta(hours=28)).strftime("%Y-%m-%dT%H:%M:%S")
         url = f"{supabase_sync.SUPABASE_URL}/rest/v1/tiktok_recordings?select=id,username,filename,drive_file_id,size_mb&created_at=gte.{since_time}&order=id.asc"
-        r = requests.get(url, headers=headers)
-        targets = r.json() if r.status_code == 200 else []
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            data = r.json() if r.status_code == 200 else []
+            targets = data if isinstance(data, list) else []
+        except Exception as q_err:
+            print(f"[!] Không tải được danh sách cần sửa: {q_err}")
+            targets = []
     elif os.path.exists(SCAN_REPORT_PATH):
         with open(SCAN_REPORT_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -285,22 +318,38 @@ def run_repair_engine(priority_only=False, today_only=False):
         # Fallback query Supabase
         headers = supabase_sync.get_supabase_headers()
         url = f"{supabase_sync.SUPABASE_URL}/rest/v1/tiktok_recordings?select=id,username,filename,drive_file_id,size_mb&order=id.desc"
-        r = requests.get(url, headers=headers)
-        targets = r.json() if r.status_code == 200 else []
+        try:
+            r = requests.get(url, headers=headers, timeout=30)
+            data = r.json() if r.status_code == 200 else []
+            targets = data if isinstance(data, list) else []
+        except Exception as q_err:
+            print(f"[!] Không tải được danh sách video từ Supabase: {q_err}")
+            targets = []
 
-    # Filter out already repaired
+    # Filter out already repaired / đã lỗi quá nhiều lần
     queue = []
+    skipped_permanent = 0
     for t in targets:
         rec_id = t["id"]
         if rec_id in repaired_set:
+            continue
+        attempts = _attempts_of(rec_id)
+        if attempts >= MAX_RETRY_ATTEMPTS:
+            # failed_ids từng được ghi nhưng KHÔNG BAO GIỜ được đọc -> mỗi lần chạy
+            # watchdog lại tải + transcode lại cùng 1 file hỏng vô hạn lần.
+            skipped_permanent += 1
             continue
         queue.append({
             "id": rec_id,
             "username": t.get("user") or t.get("username"),
             "filename": t["filename"],
             "drive_file_id": t["drive_file_id"],
-            "size_mb": t.get("size_mb", 0)
+            "size_mb": t.get("size_mb", 0),
+            "_attempts": attempts
         })
+
+    if skipped_permanent:
+        print(f"[*] Bỏ qua {skipped_permanent} video đã thất bại >= {MAX_RETRY_ATTEMPTS} lần (không thử lại vô hạn).")
 
     print(f"[*] Tìm thấy {len(queue)} video cần xử lý sửa đổi trên Drive.")
     if not queue:
@@ -324,7 +373,11 @@ def run_repair_engine(priority_only=False, today_only=False):
             save_progress(progress)
         else:
             fail_count += 1
-            progress["failed_ids"][str(rec["id"])] = "Failed during repair"
+            progress["failed_ids"][str(rec["id"])] = {
+                "reason": "Failed during repair",
+                "attempts": int(rec.get("_attempts", 0) or 0) + 1,
+                "last_attempt": int(time.time())
+            }
             save_progress(progress)
 
     print("\n" + "=" * 65)

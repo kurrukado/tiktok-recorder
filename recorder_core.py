@@ -367,6 +367,14 @@ def check_live_status(user: str) -> Tuple[bool, Optional[str]]:
     det = check_live_details(user)
     return det["is_live"], det["room_id"]
 
+def check_user_live(user: str) -> Tuple[bool, Optional[str]]:
+    """
+    Alias tương thích của check_live_status.
+    cloud_daemon._check() và api_server fallback đều gọi tên này; nếu không tồn tại,
+    AttributeError bị nuốt trong except -> daemon LUÔN trả về (False, None) và không bao giờ bắt đầu ghi hình.
+    """
+    return check_live_status(user)
+
 def get_live_stream_url(room_id, user=None, cookies=None, session=None, proxy=None):
     try:
         urls = get_stream_urls(room_id, user, cookies=cookies, session=session, proxy=proxy)
@@ -890,12 +898,19 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
             max_stagnant = 30 if size_bytes < 250 * 1024 else 90
             if stagnant_seconds >= max_stagnant:
                 offline_confirmed = False
-                if target_user:
+                # Rate-limit chung với nhánh kiểm tra phía trên: trước đây nhánh này gọi
+                # check_live_status 1 lần/giây -> 2 HTTP request mỗi giây, và một lỗi mạng
+                # tạm thời (except) bị coi là "đã xuống live" -> chốt segment -> video con
+                # < 250KB bị xóa -> 4 lần liên tiếp là chấm dứt cả phiên ghi hình.
+                if target_user and (now - last_live_check_time) >= 10:
+                    last_live_check_time = now
                     try:
                         st_check, _ = check_live_status(target_user)
                         offline_confirmed = not st_check
                     except Exception:
-                        offline_confirmed = True
+                        # Lỗi kiểm tra = "không rõ", KHÔNG phải "đã offline"
+                        print(f"\n[!] [@{target_user}] Không kiểm tra được trạng thái live (lỗi mạng tạm thời). Không chốt phân đoạn vì lý do này.")
+                        offline_confirmed = False
                 if offline_confirmed or stagnant_seconds >= 120:
                     print(f"\n\n[!] [@{target_user}] Tín hiệu live ngắt quãng {stagnant_seconds}s. Tự động chốt phân đoạn...")
                     _safe_stop_ffmpeg(proc, timeout=6)
@@ -985,7 +1000,9 @@ def concat_mp4_segments(segment_files, output_file):
         if os.path.abspath(valid_files[0]) != os.path.abspath(output_file):
             try:
                 shutil.copy2(valid_files[0], output_file)
-            except Exception:
+            except Exception as copy_err:
+                # Nội dung vẫn đầy đủ (chỉ có 1 phân đoạn) -> dùng chính nó, nhưng phải báo rõ
+                print(f"[!] Không sao chép được phân đoạn duy nhất sang {os.path.basename(output_file)} ({copy_err}). Dùng trực tiếp phân đoạn gốc.")
                 return valid_files[0]
         return output_file
 
@@ -1023,11 +1040,14 @@ def concat_mp4_segments(segment_files, output_file):
                     os.remove(output_file)
                 except Exception:
                     pass
-            largest = max(valid_files, key=lambda f: os.path.getsize(f) if os.path.exists(f) else 0)
-            return largest
+            # KHÔNG trả về một phân đoạn đơn lẻ: caller sẽ tưởng đó là file đã ghép,
+            # xuất bản 1 đoạn và xóa toàn bộ các đoạn còn lại => mất dữ liệu.
+            print(f"[!] Ghép nối thất bại (returncode={res.returncode}) cho {os.path.basename(output_file)}. "
+                  f"Giữ {len(valid_files)} phân đoạn gốc để xử lý ở lần thử sau.")
+            return None
     except Exception as e:
-        print(f"[!] Lỗi khi ghép nối phân đoạn video: {e}")
-        return valid_files[0]
+        print(f"[!] Lỗi khi ghép nối phân đoạn video: {e}. Trả về None để caller GIỮ các phân đoạn.")
+        return None
     finally:
         if os.path.exists(list_txt):
             try:

@@ -15,7 +15,7 @@ from typing import Optional
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, Response, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, RedirectResponse
 
 if sys.platform == "win32":
     try:
@@ -88,6 +88,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# load -> mutate -> save trên config.json phải nguyên tử: 2 request chồng lấp
+# (thêm 1 streamer / xóa 1 streamer / start_record tự thêm user) sẽ làm mất 1 trong 2 thay đổi.
+_CONFIG_LOCK = threading.Lock()
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -171,6 +175,7 @@ def get_user_live_details_cached(user: str) -> dict:
         "nickname": None,
         "timestamp": now
     }
+    probe_ok = False
     try:
         raw = recorder_core.check_live_details(user)
         details["is_live"] = raw.get("is_live", False)
@@ -179,16 +184,21 @@ def get_user_live_details_cached(user: str) -> dict:
         details["is_preview"] = raw.get("is_preview", False)
         details["avatar_thumb"] = raw.get("avatar_thumb")
         details["nickname"] = raw.get("nickname")
-    except Exception:
+        probe_ok = True
+    except Exception as probe_err:
+        # Chỉ ghi cache khi probe THẬT SỰ trả lời được. Một lỗi mạng tạm thời
+        # mà vẫn lưu is_live=False vào cache 60s sẽ làm /api/record từ chối khởi động ghi hình.
         try:
             is_live, room_id = recorder_core.check_user_live(user)
             details["is_live"] = is_live
             details["room_id"] = room_id
-        except Exception:
-            pass
+            probe_ok = True
+        except Exception as fb_err:
+            print(f"[!] [LiveCache] Không kiểm tra được trạng thái live của @{user}: {probe_err} / {fb_err}")
 
-    with LIVE_CACHE_LOCK:
-        LIVE_CACHE[user] = details.copy()
+    if probe_ok:
+        with LIVE_CACHE_LOCK:
+            LIVE_CACHE[user] = details.copy()
     return details.copy()
 
 def get_user_live_status_cached(user: str):
@@ -495,24 +505,25 @@ def add_user(req: AddUserRequest):
     if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
     
-    cfg = load_config()
-    users = cfg.get("monitored_users", [])
-    try:
-        drive_users = gdrive_manager.load_streamers_from_drive()
-        if drive_users is not None and isinstance(drive_users, list):
-            users = drive_users
-    except Exception:
-        pass
-
-    already_in = (user in users)
-    if not already_in:
-        users.append(user)
-        cfg["monitored_users"] = users
-        save_config(cfg)
+    with _CONFIG_LOCK:
+        cfg = load_config()
+        users = cfg.get("monitored_users", [])
         try:
-            gdrive_manager.save_streamers_to_drive(users)
+            drive_users = gdrive_manager.load_streamers_from_drive()
+            if drive_users is not None and isinstance(drive_users, list):
+                users = drive_users
         except Exception:
             pass
+
+        already_in = (user in users)
+        if not already_in:
+            users.append(user)
+            cfg["monitored_users"] = users
+            save_config(cfg)
+            try:
+                gdrive_manager.save_streamers_to_drive(users)
+            except Exception:
+                pass
 
     try:
         supabase_sync.add_streamer_to_supabase(user)
@@ -546,21 +557,22 @@ def delete_user(username: str, delete_files: bool = True):
     user = os.path.basename(username.strip().replace("@", "").lower())
     if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên streamer không hợp lệ")
-    cfg = load_config()
-    cfg_users = cfg.get("monitored_users", [])
-    if user in cfg_users:
-        cfg["monitored_users"] = [u for u in cfg_users if u != user]
-        save_config(cfg)
+    with _CONFIG_LOCK:
+        cfg = load_config()
+        cfg_users = cfg.get("monitored_users", [])
+        if user in cfg_users:
+            cfg["monitored_users"] = [u for u in cfg_users if u != user]
+            save_config(cfg)
 
-    users = cfg.get("monitored_users", [])
-    try:
-        drive_users = gdrive_manager.load_streamers_from_drive()
-        if drive_users is not None and isinstance(drive_users, list):
-            clean_drive = [u.strip().replace("@", "").lower() for u in drive_users if u.strip() and u.strip().replace("@", "").lower() != user]
-            users = clean_drive
-            gdrive_manager.save_streamers_to_drive(clean_drive)
-    except Exception as d_err:
-        print(f"[API] Lỗi cập nhật streamers.json trên Drive: {d_err}")
+        users = cfg.get("monitored_users", [])
+        try:
+            drive_users = gdrive_manager.load_streamers_from_drive()
+            if drive_users is not None and isinstance(drive_users, list):
+                clean_drive = [u.strip().replace("@", "").lower() for u in drive_users if u.strip() and u.strip().replace("@", "").lower() != user]
+                users = clean_drive
+                gdrive_manager.save_streamers_to_drive(clean_drive)
+        except Exception as d_err:
+            print(f"[API] Lỗi cập nhật streamers.json trên Drive: {d_err}")
 
     # Dừng tiến trình ghi hình nếu đang hoạt động
     with RECORDING_LOCK:
@@ -584,33 +596,48 @@ def delete_user(username: str, delete_files: bool = True):
 
     # Xóa thư mục trên Drive cùng toàn bộ dữ liệu bên trong (mặc định luôn xóa sạch)
     gdrive_status = "Đã xóa toàn bộ thư mục và file trên Drive"
+    drive_delete_ok = True
     if delete_files:
         try:
-            ok, msg = gdrive_manager.delete_streamer_folder_drive(user)
-            gdrive_status = msg
+            drive_delete_ok, gdrive_status = gdrive_manager.delete_streamer_folder_drive(user)
         except Exception as e:
+            drive_delete_ok = False
             gdrive_status = f"Lỗi xóa folder Drive: {e}"
 
-        local_dir = os.path.join(BASE_DIR, user)
-        resolved_dir = os.path.abspath(local_dir)
-        base_resolved = os.path.abspath(BASE_DIR)
-        if resolved_dir != base_resolved and resolved_dir.startswith(base_resolved) and os.path.exists(resolved_dir):
+        if not drive_delete_ok:
+            # Drive CHƯA xác nhận đã xóa -> GIỮ file local và bản ghi Supabase.
+            # Xóa local lúc này sẽ mất vĩnh viễn bản sao duy nhất trong khi video vẫn còn trên Drive.
+            print(f"[API] Không xóa được dữ liệu Drive của {user}: {gdrive_status}. GIỮ file local & Supabase.")
+        else:
+            worker_alive = False
+            if task_info and isinstance(task_info, dict):
+                t = task_info.get("thread")
+                worker_alive = bool(t and hasattr(t, "is_alive") and t.is_alive())
+            if worker_alive:
+                # Worker vẫn còn chạy (đang validate/upload) -> không được rmtree giữa chừng.
+                gdrive_status += " (Worker still running: GIỮ thư mục local cho tới khi luồng kết thúc)"
+                print(f"[API] Luồng ghi hình của {user} vẫn đang chạy sau 10s. KHÔNG xóa thư mục local.")
+            else:
+                local_dir = os.path.join(BASE_DIR, user)
+                resolved_dir = os.path.abspath(local_dir)
+                base_resolved = os.path.abspath(BASE_DIR)
+                if resolved_dir != base_resolved and resolved_dir.startswith(base_resolved) and os.path.exists(resolved_dir):
+                    try:
+                        shutil.rmtree(resolved_dir, ignore_errors=True)
+                    except Exception:
+                        pass
+
+            # Xóa dữ liệu Supabase (bảng recordings, streamers và thumbnail Storage)
             try:
-                shutil.rmtree(resolved_dir, ignore_errors=True)
-            except Exception:
-                pass
+                supabase_sync.delete_streamer_data_supabase(user)
+            except Exception as sb_err:
+                print(f"[API] Lỗi xóa dữ liệu Supabase của {user}: {sb_err}")
 
-        # Xóa dữ liệu Supabase (bảng recordings, streamers và thumbnail Storage)
-        try:
-            supabase_sync.delete_streamer_data_supabase(user)
-        except Exception as sb_err:
-            print(f"[API] Lỗi xóa dữ liệu Supabase của {user}: {sb_err}")
-
-        # Invalidate và dọn dẹp cache danh sách video trong RAM của API server
-        global _RECORDINGS_CACHE
-        with _RECORDINGS_CACHE_LOCK:
-            _RECORDINGS_CACHE["timestamp"] = 0
-            _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if (v.get("user") != user and v.get("username") != user)]
+            # Invalidate và dọn dẹp cache danh sách video trong RAM của API server
+            global _RECORDINGS_CACHE
+            with _RECORDINGS_CACHE_LOCK:
+                _RECORDINGS_CACHE["timestamp"] = 0
+                _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if (v.get("user") != user and v.get("username") != user)]
 
     with LIVE_CACHE_LOCK:
         LIVE_CACHE.pop(user, None)
@@ -755,11 +782,17 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
     consecutive_failures = 0
     max_consecutive_failures = 4
     max_vip_attempts = 5
+    # Một lần check live lỗi/False KHÔNG được kết thúc phiên: cần N lần liên tiếp.
+    consecutive_offline_checks = 0
+    worker_started_at = time.time()
+    last_heartbeat_at = 0.0
 
+    my_task_entry = None
     try:
         with RECORDING_LOCK:
             if user in ACTIVE_RECORDING_TASKS and isinstance(ACTIVE_RECORDING_TASKS[user], dict):
                 ACTIVE_RECORDING_TASKS[user]["thread"] = threading.current_thread()
+                my_task_entry = ACTIVE_RECORDING_TASKS[user]
 
         # Chỉ chạy local recorder nếu hệ thống có sẵn ffmpeg
         if not shutil.which("ffmpeg") and not (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)):
@@ -770,14 +803,35 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 print(f"[⏹️] [@{user}] Nhận tín hiệu dừng từ người dùng.")
                 break
 
+            # Gia hạn heartbeat ghi hình: start_record chỉ ghi 1 lần, sau 180s TTL hết hạn
+            # thì Cloud Runner (GitHub Actions) tưởng user trống và ghi hình TRÙNG LẶP.
+            if time.time() - last_heartbeat_at >= 60:
+                last_heartbeat_at = time.time()
+                try:
+                    gdrive_manager.set_user_recording_status_drive(user, True)
+                except Exception:
+                    pass
+
+            # duration_seconds từ API: phải thực thi, nếu không client yêu cầu 5 phút
+            # sẽ ghi cho tới khi streamer tắt live.
+            if duration and (time.time() - worker_started_at) >= duration:
+                print(f"[⏱️] [@{user}] Đã đạt thời lượng yêu cầu ({duration}s). Kết thúc phiên ghi hình.")
+                break
+
             live_details = get_user_live_details_cached(user)
             is_live = live_details.get("is_live", False)
             room_id = live_details.get("room_id")
             is_sub_only = live_details.get("is_sub_only", False)
 
             if not is_live or not room_id:
-                print(f"[🏁] [@{user}] Streamer hiện không live. Dừng ghi hình.")
-                break
+                consecutive_offline_checks += 1
+                if consecutive_offline_checks >= 3:
+                    print(f"[🏁] [@{user}] Xác nhận {consecutive_offline_checks} lần liên tiếp streamer không live. Dừng ghi hình.")
+                    break
+                print(f"[⏳] [@{user}] Chưa thấy live (lần {consecutive_offline_checks}/3) — có thể lỗi mạng tạm thời. Chờ 10s rồi kiểm tra lại...")
+                time.sleep(10)
+                continue
+            consecutive_offline_checks = 0
 
             now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             part_suffix = f"_part{part_number}" if part_number > 1 else ""
@@ -794,6 +848,10 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                     break
 
                 target_duration = (300 - int(accumulated_seconds)) if is_sub_only else (MAX_CHUNK_SECONDS - int(accumulated_seconds))
+                if duration:
+                    # Không bao giờ ghi vượt quá thời lượng client yêu cầu
+                    remaining_req = duration - int(time.time() - worker_started_at)
+                    target_duration = min(target_duration, remaining_req)
                 if target_duration <= 30:
                     break
 
@@ -894,16 +952,20 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 time.sleep(5)
                 continue
 
-            # Nếu nhận tín hiệu dừng / xóa streamer, hủy bỏ toàn bộ phân đoạn tạm và kết thúc ngay
+            # Nhận tín hiệu dừng: CHỈ hủy phân đoạn khi streamer BỊ XÓA (user_deleted).
+            # Dừng bình thường (stop API / shutdown server / SIGTERM) phải CHỐT và TẢI LÊN
+            # phần đã ghi — nếu không mỗi lần stop/restart sẽ mất tới ~1 tiếng footage.
             if stop_event and stop_event.is_set():
-                print(f"[⏹️] [@{user}] Phát hiện yêu cầu dừng/xóa streamer. Hủy toàn bộ phân đoạn tạm dở.")
-                for seg in part_segments:
-                    if seg and os.path.exists(seg):
-                        try:
-                            os.remove(seg)
-                        except Exception:
-                            pass
-                break
+                if getattr(stop_event, "user_deleted", False):
+                    print(f"[🗑️] [@{user}] Streamer bị xóa. Hủy toàn bộ phân đoạn tạm dở.")
+                    for seg in part_segments:
+                        if seg and os.path.exists(seg):
+                            try:
+                                os.remove(seg)
+                            except Exception:
+                                pass
+                    break
+                print(f"[⏹️] [@{user}] Nhận yêu cầu dừng. Chốt {len(part_segments)} phân đoạn hiện có để lưu trữ an toàn...")
 
             # Ghép tất cả các đoạn thành 1 file MP4 duy nhất
             final_rec_file = output_file
@@ -921,10 +983,24 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             else:
                 print(f"[🧩] [@{user}] Đang ghép nối {len(part_segments)} phân đoạn thành 1 file MP4 duy nhất cho Phần {part_number} ({accumulated_seconds:.1f}s)...")
                 final_rec_file = recorder_core.concat_mp4_segments(part_segments, output_file)
+                if not final_rec_file or not os.path.exists(final_rec_file):
+                    # concat trả về None khi FFmpeg lỗi: thử lại 1 lần trước khi bỏ cuộc
+                    print(f"[!] [@{user}] Ghép nối lần 1 thất bại. Thử lại...")
+                    final_rec_file = recorder_core.concat_mp4_segments(part_segments, output_file)
+                if not final_rec_file or not os.path.exists(final_rec_file):
+                    # KHÔNG dùng 1 phân đoạn thay cho file ghép: sẽ xuất bản sai và xóa mất dữ liệu.
+                    print(f"[!] [@{user}] Không ghép được Phần {part_number}. GIỮ nguyên {len(part_segments)} phân đoạn trên đĩa để xử lý ở lần sau.")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        break
+                    time.sleep(5)
+                    continue
 
             # ponytail: ensure_h264 already called inside concat_mp4_segments
 
-            if stop_event and stop_event.is_set():
+            # Streamer bị xóa giữa chừng -> hủy kết quả đã ghép. Dừng bình thường thì
+            # GIỮ file để tiếp tục validate + upload ở phía dưới.
+            if stop_event and stop_event.is_set() and getattr(stop_event, "user_deleted", False):
                 if final_rec_file and os.path.exists(final_rec_file):
                     try:
                         os.remove(final_rec_file)
@@ -974,23 +1050,28 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
 
                 # 1. Upload Google Drive trước để lấy drive_file_id
                 drive_file_id = None
-                token = gdrive_manager.get_access_token()
-                if token:
-                    root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
-                    sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
-                    ok = gdrive_manager.upload_file_to_drive(final_rec_file, sub_id, access_token=token)
-                    if ok:
-                        drive_file_id = ok if isinstance(ok, str) else None
-                        try:
-                            os.remove(final_rec_file)
-                            print(f"[🗑️] [@{user}] Đã xóa video tạm Phần {part_number} sau khi upload Drive thành công.")
-                        except Exception:
-                            pass
-                    drive_thumb_id = None
-                    if thumb_f and os.path.exists(thumb_f):
-                        t_ok = gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
-                        if t_ok and isinstance(t_ok, str):
-                            drive_thumb_id = t_ok
+                drive_thumb_id = None
+                try:
+                    token = gdrive_manager.get_access_token()
+                    if token:
+                        root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
+                        sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
+                        ok = gdrive_manager.upload_file_to_drive(final_rec_file, sub_id, access_token=token)
+                        if ok:
+                            drive_file_id = ok if isinstance(ok, str) else None
+                            try:
+                                os.remove(final_rec_file)
+                                print(f"[🗑️] [@{user}] Đã xóa video tạm Phần {part_number} sau khi upload Drive thành công.")
+                            except Exception:
+                                pass
+                        if thumb_f and os.path.exists(thumb_f):
+                            t_ok = gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
+                            if t_ok and isinstance(t_ok, str):
+                                drive_thumb_id = t_ok
+                except Exception as gdrive_err:
+                    # KHÔNG để lỗi Drive làm sập toàn bộ worker: vẫn đồng bộ Supabase với file local còn lại
+                    print(f"[!] [@{user}] Lỗi tải lên Google Drive ở Phần {part_number}: {gdrive_err}")
+
 
                 # 2. Đồng bộ Supabase Storage & Database kèm drive_file_id
                 try:
@@ -1013,6 +1094,19 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                         except Exception:
                             pass
 
+            # Dọn phân đoạn gốc: nội dung đã nằm trong final_rec_file (đã ghép/đã bàn giao).
+            # Không xóa ở đây thì mỗi phần sẽ còn 2 bản sao -> đầy ổ cứng và
+            # /api/recordings liệt kê trùng lặp cùng footage.
+            for seg in part_segments:
+                if not seg or not os.path.exists(seg):
+                    continue
+                if final_rec_file and os.path.abspath(seg) == os.path.abspath(final_rec_file):
+                    continue
+                try:
+                    os.remove(seg)
+                except Exception:
+                    pass
+
             part_number += 1
 
             if is_sub_only and part_number > max_vip_attempts:
@@ -1026,24 +1120,45 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             time.sleep(3)
             curr_det = recorder_core.check_live_details(user)
             if not curr_det.get("is_live"):
-                time.sleep(4)
+                # Khoảng cách 12s (trước đây 4s) để phân biệt lỗi mạng tạm thời với thật sự xuống live
+                time.sleep(12)
                 curr_det = recorder_core.check_live_details(user)
 
             if not curr_det.get("is_live"):
-                print(f"[🏁] [@{user}] Streamer đã xuống live sau {part_number - 1} phần.")
+                consecutive_offline_checks += 1
+                if consecutive_offline_checks < 3:
+                    print(f"[⏳] [@{user}] Chưa xác nhận streamer xuống live (lần {consecutive_offline_checks}/3). Kiểm tra lại...")
+                    continue
+                print(f"[🏁] [@{user}] Xác nhận {consecutive_offline_checks} lần liên tiếp — streamer đã xuống live sau {part_number - 1} phần.")
                 break
             else:
+                consecutive_offline_checks = 0
                 print(f"[⏩] [@{user}] Streamer VẪN ĐANG LIVE! Tự động ghi hình nối tiếp Phần {part_number} (1 tiếng tiếp theo)...")
 
     except Exception as e:
         print(f"[!] Lỗi ghi hình worker: {e}")
     finally:
+        still_our_registration = False
         with RECORDING_LOCK:
-            ACTIVE_RECORDING_TASKS.pop(user, None)
-        try:
-            gdrive_manager.set_user_recording_status_drive(user, False)
-        except Exception:
-            pass
+            cur = ACTIVE_RECORDING_TASKS.get(user)
+            if my_task_entry is not None and cur is my_task_entry:
+                ACTIVE_RECORDING_TASKS.pop(user, None)
+                still_our_registration = True
+            elif cur is None:
+                # Đã bị gỡ (ví dụ delete_user) -> không còn gì để dọn
+                pass
+            else:
+                # Một phiên ghi hình MỚI đã được đăng ký cho cùng user trong lúc mình finalize
+                # (delete -> add -> start) -> KHÔNG được gỡ đăng ký của phiên mới.
+                print(f"⚠️ [@{user}] Đã có phiên ghi hình mới được đăng ký; phiên cũ không đụng vào registry.")
+
+        # Chỉ tắt heartbeat khi mình vẫn là phiên đang đăng ký: nếu phiên mới đã đăng ký,
+        # việc ghi False sẽ làm Cloud Runner tưởng streamer trống -> ghi hình TRÙNG LẶP.
+        if still_our_registration:
+            try:
+                gdrive_manager.set_user_recording_status_drive(user, False)
+            except Exception:
+                pass
 
         # ponytail: mirror cloud_daemon finally — flush staging chỉ khi streamer chưa bị xóa
         is_user_deleted = bool(stop_event and getattr(stop_event, "user_deleted", False))
@@ -1068,22 +1183,23 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
     if not user: raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
     
     # Đảm bảo streamer có trong danh sách theo dõi
-    cfg = load_config()
-    users = cfg.get("monitored_users", [])
-    try:
-        drive_users = gdrive_manager.load_streamers_from_drive()
-        if drive_users is not None and isinstance(drive_users, list):
-            users = drive_users
-    except Exception:
-        pass
-    if user not in users:
-        users.append(user)
-        cfg["monitored_users"] = users
-        save_config(cfg)
+    with _CONFIG_LOCK:
+        cfg = load_config()
+        users = cfg.get("monitored_users", [])
         try:
-            gdrive_manager.save_streamers_to_drive(users)
+            drive_users = gdrive_manager.load_streamers_from_drive()
+            if drive_users is not None and isinstance(drive_users, list):
+                users = drive_users
         except Exception:
             pass
+        if user not in users:
+            users.append(user)
+            cfg["monitored_users"] = users
+            save_config(cfg)
+            try:
+                gdrive_manager.save_streamers_to_drive(users)
+            except Exception:
+                pass
 
     # Tạo folder trên Google Drive
     try:
@@ -1140,6 +1256,19 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
                 pass
             bg_tasks.add_task(bg_record_worker, user, req.duration_seconds, stop_evt)
 
+        if not has_ffmpeg:
+            # KHÔNG được trả HTTP 200 "Hệ thống đang ghi hình" khi không có worker nào chạy:
+            # client sẽ tưởng đã ghi và không bao giờ thử lại.
+            return JSONResponse(status_code=503, content={
+                "message": f"@{user} đang live NHƯNG hệ thống không tìm thấy ffmpeg. Không thể ghi hình.",
+                "status": "no_recorder",
+                "is_live": True,
+                "is_recording": False,
+                "username": user,
+                "room_id": room_id
+            })
+
+
         msg_prefix = f"@{user} đang phát trực tiếp"
         if is_sub_only:
             msg_prefix += " (🔒 VIP Sub-Only)"
@@ -1154,11 +1283,24 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
             "is_preview": is_preview
         }
     else:
+        # KHÔNG được dừng recording đang chạy chỉ vì một lần check live thất bại/cached:
+        # transient network error sẽ giết ffmpeg giữa chừng -> video bị gián đoạn.
+        with RECORDING_LOCK:
+            task = ACTIVE_RECORDING_TASKS.get(user)
+        if task and isinstance(task, dict) and is_local_recorder_running_for_user(user):
+            return {
+                "message": f"@{user} đang được ghi hình. Trạng thái live trả về ngoại tuyến (có thể do cache/lỗi mạng tạm thời) nên bot GIỮ NGUYÊN phiên ghi hiện tại.",
+                "status": "recording",
+                "is_live": False,
+                "is_recording": True,
+                "username": user
+            }
         with RECORDING_LOCK:
             task = ACTIVE_RECORDING_TASKS.get(user)
             if task and isinstance(task, dict) and task.get("stop_event"):
                 task["stop_event"].set()
             ACTIVE_RECORDING_TASKS.pop(user, None)
+
         try:
             gdrive_manager.set_user_recording_status_drive(user, False)
         except Exception:
@@ -1238,6 +1380,9 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
             for f in files:
                 fname = f["name"]
                 if fname.endswith(".mp4"):
+                    # Không liệt kê phân đoạn phụ (đã được ghép vào file _full/part hoàn chỉnh)
+                    if re.search(r"_seg\d+\.mp4$", fname):
+                        continue
                     base_name = fname.replace(".mp4", "")
                     thumb_name = base_name + ".jpg"
                     thumb_id = thumbs.get(thumb_name)
@@ -1321,6 +1466,12 @@ def list_recordings():
                     if f in merged_files:
                         continue
                     fp = os.path.join(u_dir, f)
+                    if os.path.isdir(fp):
+                        continue
+                    # Ẩn phân đoạn phụ (_seg1, _seg2...): chúng là MỘT PHẦN của file đã ghép,
+                    # hiển thị ra sẽ làm trùng lặp cùng footage và làm đầy danh sách.
+                    if re.search(r"_seg\d+\.mp4$", f):
+                        continue
                     st = os.stat(fp)
                     # Loại bỏ các file rác / lỗi 0:00s dưới 250 KB
                     if st.st_size < 250 * 1024:
@@ -1477,10 +1628,13 @@ def download_video(user: str, filename: str):
     user = user.strip().replace("@", "").lower()
     user = os.path.basename(user)
     filename = os.path.basename(filename)
+    if not user or user in (".", "..") or filename in ("", ".", ".."):
+        raise HTTPException(status_code=400, detail="Đường dẫn không hợp lệ")
     fp = os.path.join(BASE_DIR, user, filename)
     resolved = os.path.abspath(fp)
     if not pathlib.Path(resolved).is_relative_to(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
-    if os.path.exists(fp):
+    # exists + không phải thư mục: filename=".." trỏ tới THƯ MỤC -> FileResponse sẽ ném 500
+    if os.path.exists(fp) and not os.path.isdir(fp):
         return FileResponse(path=fp, media_type="video/mp4", filename=filename, headers={"Accept-Ranges": "bytes"})
     
     # Tìm kiếm trên Google Drive và chuyển hướng trực tiếp đến CDN tải tốc độ cao
@@ -1583,13 +1737,15 @@ def stream_video(user: str, filename: str, request: Request, redirect: bool = Tr
     user = user.strip().replace("@", "").lower()
     user = os.path.basename(user)
     filename = os.path.basename(filename)
+    if not user or user in (".", "..") or filename in ("", ".", ".."):
+        raise HTTPException(status_code=400, detail="Đường dẫn không hợp lệ")
     local_path = os.path.join(BASE_DIR, user, filename)
 
     resolved = os.path.abspath(local_path)
-    if not resolved.startswith(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
+    if not pathlib.Path(resolved).is_relative_to(os.path.abspath(BASE_DIR)): raise HTTPException(status_code=403, detail="Access denied")
 
-    # 1. Nếu file có sẵn dưới local
-    if os.path.exists(local_path):
+    # 1. Nếu file có sẵn dưới local (bỏ qua nếu là thư mục -> tránh FileResponse ném 500)
+    if os.path.exists(local_path) and not os.path.isdir(local_path):
         return FileResponse(
             path=local_path,
             media_type="video/mp4",

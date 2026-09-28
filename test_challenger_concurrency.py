@@ -592,7 +592,14 @@ class TestChallengerFixVerifications(unittest.TestCase):
                  patch("shutil.which", return_value=None), \
                  patch("api_server.FFMPEG_PATH", None):
                 res = api_server.start_record(req, bg_tasks)
-                self.assertNotEqual(res.get("source"), "cloud_runner")
+                # Không có ffmpeg -> trả JSONResponse 503 (không được báo thành công giả)
+                if hasattr(res, "body"):
+                    payload = json.loads(res.body)
+                    self.assertEqual(res.status_code, 503)
+                    self.assertEqual(payload.get("status"), "no_recorder")
+                else:
+                    payload = res
+                self.assertNotEqual(payload.get("source"), "cloud_runner")
 
     def test_bg_record_worker_flushes_staging_queue_on_normal_exit(self):
         """Kiểm tra bg_record_worker trong api_server tự động flush staging queue khi kết thúc live, nhưng không flush khi user bị xóa."""

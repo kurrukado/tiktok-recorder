@@ -56,12 +56,20 @@ def sync_to_gdrive(local_path, target_user):
     falls back to rclone if available.
     """
     cfg = get_notifier_config()
-    enabled = cfg.get("gdrive_enabled", False) or bool(cfg.get("gdrive_refresh_token")) or bool(os.environ.get("GDRIVE_REFRESH_TOKEN"))
+    refresh_tok = cfg.get("gdrive_refresh_token") or os.environ.get("GDRIVE_REFRESH_TOKEN", "").strip()
+    # gdrive_enabled là công tắc TỔNG: tắt trong config thì token có sẵn cũng KHÔNG được upload.
+    # Trước đây `cfg.get("gdrive_enabled") or bool(token)` khiến cờ TẮT mất hoàn toàn hiệu lực
+    # (token luôn có thật) -> người dùng tắt Google Drive trong menu mà file vẫn bị đẩy lên
+    # và với gdrive_delete_local=true thì file local còn bị xóa.
+    if "gdrive_enabled" in cfg:
+        enabled = bool(cfg.get("gdrive_enabled")) and bool(refresh_tok)
+    else:
+        # Chưa hề cấu hình công tắc -> giữ hành vi cũ: chỉ cần có token là đồng bộ.
+        enabled = bool(refresh_tok)
     if not enabled:
         return None
 
     # Option 1: Direct Google Drive API via gdrive_manager
-    refresh_tok = cfg.get("gdrive_refresh_token") or os.environ.get("GDRIVE_REFRESH_TOKEN", "").strip()
     if refresh_tok:
         try:
             import gdrive_manager

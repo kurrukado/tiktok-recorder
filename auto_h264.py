@@ -70,6 +70,21 @@ def get_video_codec(filepath):
                     return "hevc"
                 else:
                     return part.split()[0]
+    except subprocess.TimeoutExpired:
+        # CPU đang bận (đang ghi/ghép video song song) -> probe lại với ngân sách dài hơn
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", timeout=15)
+            for line in p.stderr.splitlines():
+                if "Video:" in line:
+                    part = line.split("Video:")[1].split(",")[0].strip().lower()
+                    if "h264" in part or "avc" in part:
+                        return "h264"
+                    elif "hevc" in part or "h265" in part or "hvc1" in part:
+                        return "hevc"
+                    else:
+                        return part.split()[0]
+        except Exception:
+            pass
     except Exception:
         pass
     return "unknown"
@@ -109,35 +124,49 @@ def validate_playable_video(filepath, min_duration=5.0, min_size_bytes=250000):
         return False, f"Dung lượng quá nhỏ ({size} bytes < {min_size_bytes} bytes)", 0.0
 
     cmd = [FFMPEG_PATH, "-i", filepath]
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", timeout=8)
-        out = p.stderr
+    out = None
+    for attempt_timeout in (8, 20):
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace", timeout=attempt_timeout)
+            out = p.stderr
+            break
+        except subprocess.TimeoutExpired:
+            # CPU/đĩa đang bận (ghi/ghép video song song) -> thử lại với ngân sách dài hơn.
+            continue
+        except Exception as e:
+            # Lỗi hệ thống tạm thời, không phải bằng chứng file hỏng.
+            print(f"[auto_h264] Không probe được {os.path.basename(filepath)} (lỗi: {e}). Thử lại...")
+            time.sleep(1)
 
-        has_video = False
-        for line in out.splitlines():
-            if "Video:" in line:
-                has_video = True
-                break
+    if out is None:
+        # KHÔNG được trả False ở đây: mọi caller đều os.remove() khi validate thất bại.
+        # Probe không chạy được = sự cố tài nguyên, không phải file hỏng.
+        print(f"[auto_h264] Không chẩn đoán được {os.path.basename(filepath)} (probe timeout). Coi là HỢP LỆ để tránh xóa video đã ghi.")
+        return True, "Không chẩn đoán được (probe timeout) - giữ file để tránh xóa nhầm", 0.0
 
-        if not has_video:
-            return False, "Không tìm thấy luồng hình ảnh (Video Stream) trong file (chỉ có Audio hoặc rỗng)", 0.0
+    has_video = False
+    for line in out.splitlines():
+        if "Video:" in line:
+            has_video = True
+            break
 
-        import re
-        m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", out)
-        if not m:
-            return False, "Không xác định được thời lượng video", 0.0
+    if not has_video:
+        return False, "Không tìm thấy luồng hình ảnh (Video Stream) trong file (chỉ có Audio hoặc rỗng)", 0.0
 
-        h, mins, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
-        dur = h * 3600 + mins * 60 + s
-        if dur < min_duration:
-            return False, f"Thời lượng video quá ngắn ({dur:.2f}s < {min_duration}s)", dur
+    import re
+    m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", out)
+    if not m:
+        return False, "Không xác định được thời lượng video", 0.0
 
-        if not check_h264_stream_health(filepath):
-            return False, "Bitstream hỏng hoặc lỗi NAL unit (màn hình đen / không thể giải mã hình ảnh)", dur
+    h, mins, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+    dur = h * 3600 + mins * 60 + s
+    if dur < min_duration:
+        return False, f"Thời lượng video quá ngắn ({dur:.2f}s < {min_duration}s)", dur
 
-        return True, "Hợp lệ", dur
-    except Exception as e:
-        return False, f"Lỗi khi kiểm tra video: {e}", 0.0
+    if not check_h264_stream_health(filepath):
+        return False, "Bitstream hỏng hoặc lỗi NAL unit (màn hình đen / không thể giải mã hình ảnh)", dur
+
+    return True, "Hợp lệ", dur
 
 def get_video_resolution(filepath):
     """
@@ -290,8 +319,15 @@ def check_h264_stream_health(filepath):
     if not os.path.exists(filepath) or os.path.getsize(filepath) < 1024:
         return False
     codec = get_video_codec(filepath)
-    if codec not in ("h264", "hevc"):
+    # "unknown" = không probe được codec (timeout/tài nguyên) -> KHÔNG được kết luận file hỏng.
+    # Chỉ loại trừ khi xác định được rõ ràng là codec không phải H.264/HEVC.
+    if codec != "unknown" and codec not in ("h264", "hevc"):
         return False
+    if codec == "unknown":
+        # Thử lại một lần nữa trước khi bỏ qua cánh cửa codec.
+        codec = get_video_codec(filepath)
+        if codec != "unknown" and codec not in ("h264", "hevc"):
+            return False
     cmd = [
         FFMPEG_PATH, "-v", "error",
         "-i", filepath,
@@ -299,22 +335,31 @@ def check_h264_stream_health(filepath):
         "-t", "6",
         "-f", "null", "-"
     ]
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace", timeout=8)
+    # "non monotonically increasing dts" và "co located POCs unavailable" là cảnh báo
+    # timing/POC rất phổ biến trên luồng HLS TikTok, KHÔNG đồng nghĩa bitstream hỏng.
+    # Chúng từng nằm trong list này và khiến validate_playable_video trả False ->
+    # cloud_daemon/api_server os.remove() những video đã ghi thành công.
+    corrupt_patterns = (
+        "Invalid NAL unit size",
+        "Error splitting the input into NAL units",
+        "missing picture in access unit",
+        "Decoding error",
+        "Invalid data found when processing input"
+    )
+    last_err = None
+    for _attempt in range(2):
+        try:
+            p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace", timeout=20)
+        except Exception as ex:
+            # Timeout/Ngoại lệ là sự cố TÀI NGUYÊN (CPU/IO đang bận), không phải bằng chứng file hỏng.
+            last_err = ex
+            continue
         err = p.stderr.strip()
-        corrupt_patterns = (
-            "Invalid NAL unit size",
-            "Error splitting the input into NAL units",
-            "non monotonically increasing dts",
-            "missing picture in access unit",
-            "Decoding error",
-            "co located POCs unavailable"
-        )
         if any(pat in err for pat in corrupt_patterns):
             return False
         return p.returncode == 0
-    except Exception:
-        return False
+    print(f"[auto_h264] Không chẩn đoán được bitstream {os.path.basename(filepath)} (lỗi: {last_err}). Coi là HỢP LỆ để tránh xóa video đã ghi.")
+    return True
 
 def _parse_avcc_record(s_data):
     """
@@ -672,8 +717,16 @@ def ensure_h264(filepath):
                 final_mb = os.path.getsize(target_path) / (1024 * 1024) if os.path.exists(target_path) else 0
                 print(f"  [✓] Đã chuyển đổi thành công sang H.264 MP4 (+faststart, không phụ đề) ({final_mb:.2f} MB, {elapsed:.1f}s)")
                 return target_path
-            except Exception:
-                return target_path
+            except Exception as e:
+                # os.replace thất bại (file đang bị khóa / thiếu quyền) -> target_path KHÔNG tồn tại.
+                # Trả về target_path sẽ làm caller báo lỗi.FileNotFound và crash cả batch.
+                print(f"  [!] Không ghi đè được {os.path.basename(target_path)} ({e}). Giữ nguyên file gốc.")
+                if os.path.exists(temp_out):
+                    try:
+                        os.remove(temp_out)
+                    except Exception:
+                        pass
+                return filepath
         else:
             if os.path.exists(temp_out):
                 os.remove(temp_out)
@@ -893,7 +946,12 @@ def extract_middle_thumbnail(video_path, output_thumb=None):
     duration = get_video_duration(video_path)
     seek_targets = []
     if duration and duration > 1.0:
-        seek_targets.append(min(duration * 0.5, 60.0))
+        # -ss nằm TRƯỚC -i nên đây là INPUT seek (chỉ đọc tới keyframe gần nhất), rất rẻ.
+        # Clamp 60s cũ khiến video 1 tiếng lấy thumbnail ở giây 60 (1.7% thời lượng),
+        # trái với cam kết "50% thời lượng" của mọi caller.
+        seek_targets.append(duration * 0.5)
+        if duration > 20:
+            seek_targets.append(duration * 0.25)
     seek_targets.extend([5.0, 3.0, 1.0])
 
     for target_sec in seek_targets:

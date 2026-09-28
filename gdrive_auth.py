@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -22,10 +23,12 @@ REDIRECT_URI = "http://localhost:8080"
 SCOPES = "https://www.googleapis.com/auth/drive"
 
 AUTH_CODE = None
+AUTH_ERROR = None
+AUTH_WAIT_SECONDS = 300  # Không được treo vô hạn nếu người dùng không mở link
 
 class OAuthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        global AUTH_CODE
+        global AUTH_CODE, AUTH_ERROR
         query = urllib.parse.urlparse(self.path).query
         params = urllib.parse.parse_qs(query)
         if "code" in params:
@@ -37,6 +40,18 @@ class OAuthHandler(BaseHTTPRequestHandler):
             <html><body style="font-family: Arial; text-align: center; padding-top: 50px; background: #111; color: #fff;">
                 <h1 style="color: #4ade80;">✓ Kết nối Google Drive thành công!</h1>
                 <p>Bạn có thể đóng tab này và quay lại cửa sổ dòng lệnh để tiến hành upload video.</p>
+            </body></html>
+            """.encode("utf-8"))
+        elif "error" in params:
+            # Người dùng từ chối cấp quyền -> phải THOÁT ngay, không được chờ tới timeout
+            AUTH_ERROR = params["error"][0]
+            self.send_response(400)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(f"""
+            <html><body style="font-family: Arial; text-align: center; padding-top: 50px; background: #111; color: #fff;">
+                <h1 style="color: #f87171;">✗ Không cấp quyền ({AUTH_ERROR})</h1>
+                <p>Bạn có thể đóng tab này.</p>
             </body></html>
             """.encode("utf-8"))
         else:
@@ -84,7 +99,9 @@ def exchange_code_for_tokens(code, client_id, client_secret, redirect_uri=REDIRE
         return json.loads(resp.read().decode("utf-8"))
 
 def start_oauth_flow(client_id=None, client_secret=None, redirect_uri=REDIRECT_URI):
-    global AUTH_CODE
+    global AUTH_CODE, AUTH_ERROR
+    AUTH_CODE = None
+    AUTH_ERROR = None
     default_id, default_secret = get_config_credentials()
     client_id = client_id or default_id
     client_secret = client_secret or default_secret
@@ -101,19 +118,39 @@ def start_oauth_flow(client_id=None, client_secret=None, redirect_uri=REDIRECT_U
     print("\n[👉] Vui lòng mở đường link sau trên trình duyệt và đăng nhập / cấp quyền:\n")
     print(auth_url)
     print("\n" + "=" * 65)
-    print("[*] Đang chờ bạn xác nhận trên trình duyệt (cổng 8080)...")
+    # Cổng phải theo redirect_uri (không phải luôn 8080), nếu không callback sẽ không bao giờ tới
+    try:
+        listen_port = urllib.parse.urlparse(redirect_uri).port or 8080
+    except Exception:
+        listen_port = 8080
+
+    print(f"[*] Đang chờ bạn xác nhận trên trình duyệt (cổng {listen_port}, timeout {AUTH_WAIT_SECONDS}s)...")
 
     try:
         webbrowser.open(auth_url)
     except Exception:
         pass
 
-    server = HTTPServer(("0.0.0.0", 8080), OAuthHandler)
     try:
-        while not AUTH_CODE:
+        # Chỉ mở trên loopback: redirect_uri là localhost, không cần (và không nên)
+        # mở cổng cho cả mạng LAN.
+        server = HTTPServer(("127.0.0.1", listen_port), OAuthHandler)
+    except OSError:
+        server = HTTPServer(("0.0.0.0", listen_port), OAuthHandler)
+    server.timeout = 1.0  # handle_request() không được chặn vô hạn khi không có request
+    deadline = time.time() + AUTH_WAIT_SECONDS
+    try:
+        while not AUTH_CODE and not AUTH_ERROR and time.time() < deadline:
             server.handle_request()
     finally:
         server.server_close()
+
+    if AUTH_ERROR:
+        print(f"\n[!] Người dùng từ chối cấp quyền (error={AUTH_ERROR}). Hủy liên kết Google Drive.")
+        return None, None
+    if not AUTH_CODE:
+        print(f"\n[!] Hết {AUTH_WAIT_SECONDS}s chờ xác nhận trên trình duyệt. Hủy liên kết Google Drive.")
+        return None, None
 
     print("\n[+] Đã nhận mã ủy quyền! Đang lấy Refresh Token...")
     tokens = exchange_code_for_tokens(AUTH_CODE, client_id, client_secret, redirect_uri)

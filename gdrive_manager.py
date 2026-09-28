@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 import time
 import threading
 import requests
@@ -133,17 +134,36 @@ def find_or_create_folder(folder_name, parent_id=None, access_token=None, create
         q += f" and '{parent_id}' in parents"
 
     url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-    try:
-        with requests.get(url, headers=headers, timeout=10) as res:
-            if res.status_code == 200:
-                files = res.json().get("files", [])
-                if files:
-                    fid = files[0]["id"]
-                    with _FOLDER_CACHE_LOCK:
-                        _FOLDER_CACHE[cache_key] = fid
-                    return fid
-    except Exception:
-        pass
+    # QUAN TRỌNG: phân biệt "không tìm thấy" với "tra cứu thất bại (429/500/timeout)".
+    # Trước đây lỗi lookup rơi thẳng vào nhánh TẠO MỚI -> Drive cho phép trùng tên
+    # -> video bị chia đôi vào 2 thư mục tiktok-record/<user>/ và biến mất khỏi website.
+    lookup_error = None
+    for lookup_attempt in range(3 if create else 1):
+        lookup_error = None
+        try:
+            with requests.get(url, headers=headers, timeout=10) as res:
+                if res.status_code == 200:
+                    files = res.json().get("files", [])
+                    if files:
+                        fid = files[0]["id"]
+                        with _FOLDER_CACHE_LOCK:
+                            _FOLDER_CACHE[cache_key] = fid
+                        return fid
+                    lookup_error = None  # 200 + rỗng = THẬT SỰ chưa tồn tại
+                    break
+                lookup_error = f"HTTP {res.status_code}"
+        except Exception as ex:
+            lookup_error = str(ex)
+        time.sleep(1.0 * (lookup_attempt + 1))
+
+    if lookup_error:
+        if not create:
+            # Chế độ chỉ-đọc: trả None thay vì tạo mới / ném lỗi
+            return None
+        raise RuntimeError(
+            f"Không tra cứu được folder '{folder_name}' trên Drive ({lookup_error}). "
+            "DỪNG để tránh tạo thư mục trùng lặp làm mất dữ liệu."
+        )
 
     if not create:
         return None
@@ -205,7 +225,7 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
                 drive_sz = int(existing[0].get("size", 0))
                 if drive_sz == file_size:
                     print(f"  [-] File đã tồn tại toàn vẹn trên Drive: {file_name} ({file_size_mb:.2f} MB), bỏ qua.")
-                    return existing[0].get("id") or True
+                    return existing[0].get("id") or False
                 else:
                     print(f"  [!] Phát hiện file dở dang trên Drive ({drive_sz} != {file_size} bytes). Đang xóa để tải lại toàn vẹn...")
                     try:
@@ -311,13 +331,29 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
                                 pass
                             time.sleep(1.5 * (attempt + 1))
                             continue
-                        elif put_res.status_code in (429, 500, 502, 503, 504) or (put_res.status_code == 403 and "rateLimit" in put_res.text):
+                        elif put_res.status_code == 401:
+                            # Token hết hạn giữa chừng (upload lớn/queue dài) -> làm mới và thử lại ngay
+                            new_tok = get_access_token(force_refresh=True)
+                            if new_tok:
+                                access_token = new_tok
+                                headers["Authorization"] = f"Bearer {new_tok}"
+                                init_headers["Authorization"] = f"Bearer {new_tok}"
+                                time.sleep(1.0)
+                                continue
+                            time.sleep(2.0 * (attempt + 1))
+                            continue
+                        elif put_res.status_code in (429, 500, 502, 503, 504) or (
+                            put_res.status_code == 403 and "ratelimit" in (put_res.text or "").lower()
+                        ):
+                            # 403 Google trả về cả rateLimitExceeded lẫn userRateLimitExceeded
+                            # -> so khớp không phân biệt hoa/thường, nếu không sẽ break ngay lần thử 1.
                             time.sleep(2.0 * (attempt + 1))
                             continue
                         else:
                             print(f"\n  [!] Google Drive trả về mã {put_res.status_code}: {put_res.text}")
                             break
                     except Exception as ex:
+                        print(f"\n  [!] Lỗi mạng khi upload chunk (lần thử {attempt + 1}/5): {ex}")
                         time.sleep(1.5 * (attempt + 1))
 
                 if not chunk_ok or put_res is None:
@@ -365,7 +401,11 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
         except Exception:
             pass
 
-        return True
+        # KHÔNG trả về True: mọi caller đều kiểm tra isinstance(..., str) để lấy drive_file_id
+        # rồi MỚI xóa file local. Trả True khiến local bị xóa nhưng drive_file_id = None
+        # -> bản ghi Supabase mất link video và engine repair không thể tìm lại file.
+        print(f"\n  [!] Đã upload {file_name} nhưng không tra được Drive file ID. Giữ lại file local để upload lại.")
+        return False
 
     except Exception as e:
         print(f"\n  [!] Lỗi khi tải file {file_name}: {e}")
@@ -380,8 +420,24 @@ def make_file_public(file_id, access_token=None):
             return False
         headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
         url = f"https://www.googleapis.com/drive/v3/files/{file_id}/permissions"
-        requests.post(url, headers=headers, json={"role": "reader", "type": "anyone"}, timeout=10)
-        return True
+        res = None
+        try:
+            res = requests.post(url, headers=headers, json={"role": "reader", "type": "anyone"}, timeout=10)
+            status = getattr(res, "status_code", 0)
+            body = (getattr(res, "text", "") or "")
+            if status in (200, 201):
+                return True
+            # Google trả 400/403 khi quyền đã tồn tại -> vẫn coi là thành công
+            if status in (400, 403) and ("already" in body.lower() or "permission" in body.lower()):
+                return True
+            print(f"  [!] Không cấp quyền công khai cho {file_id} (HTTP {status}): {body[:200]}")
+            return False
+        finally:
+            if res is not None and hasattr(res, "close"):
+                try:
+                    res.close()
+                except Exception:
+                    pass
     except Exception:
         return False
 
@@ -428,7 +484,10 @@ def sync_all_to_gdrive():
         if not os.path.exists(user_folder):
             continue
 
-        files = [f for f in os.listdir(user_folder) if f.endswith(".mp4") and not f.endswith(".tmp.mp4")]
+        files = [f for f in os.listdir(user_folder)
+                 if f.endswith(".mp4") and not f.endswith(".tmp.mp4")
+                 # Không upload phân đoạn phụ: chúng đã nằm trong file ghép hoàn chỉnh
+                 and not re.search(r"_seg\d+\.mp4$", f)]
         if not files:
             continue
 
@@ -492,10 +551,14 @@ def save_streamers_to_drive(streamers_list, access_token=None):
             url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
             file_id = None
             with requests.get(url, headers=headers, timeout=10) as res:
-                if res.status_code == 200:
-                    files = res.json().get("files", [])
-                    if files:
-                        file_id = files[0]["id"]
+                if res.status_code != 200:
+                    # Không phân biệt được "chưa có file" với "tra cứu lỗi" -> KHÔNG tạo file mới,
+                    # nếu không Drive sẽ có 2 streamers.json và reader lấy nhánh cũ (mất streamer).
+                    print(f"[!] Không tra được streamers.json trên Drive (HTTP {res.status_code}). Bỏ qua lần ghi này.")
+                    return False
+                files = res.json().get("files", [])
+                if files:
+                    file_id = files[0]["id"]
 
             content_bytes = json.dumps(streamers_list, indent=2, ensure_ascii=False).encode("utf-8")
             if file_id:
@@ -594,19 +657,34 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
             url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
             file_id = None
             current_raw = []
+            read_failed = False
             with requests.get(url, headers=headers, timeout=8) as res:
-                if res.status_code == 200:
-                    files = res.json().get("files", [])
-                    if files:
-                        file_id = files[0]["id"]
-                        try:
-                            with requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=8) as d_res:
-                                if d_res.status_code == 200:
-                                    current_raw = d_res.json()
-                                    if not isinstance(current_raw, list):
-                                        current_raw = []
-                        except Exception:
-                            pass
+                if res.status_code != 200:
+                    # PHÂN BIỆT "lookup lỗi" với "file chưa tồn tại": rơi vào nhánh tạo mới
+                    # sẽ nhân bản active_recordings.json và reader lấy file cũ -> mất heartbeat.
+                    print(f"[!] Không tra được active_recordings.json trên Drive (HTTP {res.status_code}). KHÔNG ghi để tránh mất dữ liệu streamer khác.")
+                    return False
+                files = res.json().get("files", [])
+                if files:
+                    file_id = files[0]["id"]
+                    try:
+                        with requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=8) as d_res:
+                            if d_res.status_code == 200:
+                                current_raw = d_res.json()
+                                if not isinstance(current_raw, list):
+                                    read_failed = True
+                            else:
+                                read_failed = True
+                    except Exception as read_err:
+                        print(f"[!] Không đọc được nội dung active_recordings.json ({read_err}).")
+                        read_failed = True
+
+            if read_failed:
+                # current_raw = [] trong trường hợp này CHƯA PHẢI "không ai quay" mà là
+                # "đọc thất bại". Ghi đè bây giờ sẽ xóa heartbeat của mọi streamer khác
+                # -> cloud_daemon/api_server khởi động ghi hình trùng lặp.
+                print("[!] Đọc active_recordings.json thất bại. Bỏ qua lần cập nhật này để không xóa heartbeat của streamer khác.")
+                return False
 
             user = user.strip().replace("@", "").lower()
             now_ts = int(time.time())
@@ -699,14 +777,17 @@ def delete_streamer_folder_drive(user: str, access_token=None):
         q = f"name = '{safe_user}' and mimeType = 'application/vnd.google-apps.folder' and '{root_id}' in parents and trashed = false"
         url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
         res = requests.get(url, headers=headers, timeout=10)
-        if res.status_code == 200:
-            folders = res.json().get("files", [])
-            for folder in folders:
-                folder_id = folder["id"]
-                del_url = f"https://www.googleapis.com/drive/v3/files/{folder_id}"
-                del_res = requests.delete(del_url, headers=headers, timeout=15)
-                if del_res.status_code in [200, 204]:
-                    deleted_folders += 1
+        if res.status_code != 200:
+            # Lookup lỗi (401/429/5xx) KHÔNG được trả lời "Không tìm thấy thư mục":
+            # caller sẽ xóa local + bản ghi Supabase trong khi video vẫn còn trên Drive.
+            return False, f"Tra cứu thư mục @{user} trên Drive thất bại (HTTP {res.status_code}). KHÔNG xóa dữ liệu để tránh mất link video."
+        folders = res.json().get("files", [])
+        for folder in folders:
+            folder_id = folder["id"]
+            del_url = f"https://www.googleapis.com/drive/v3/files/{folder_id}"
+            del_res = requests.delete(del_url, headers=headers, timeout=15)
+            if del_res.status_code in [200, 204]:
+                deleted_folders += 1
 
         # 2. Xóa các file video/thumbnail độc lập thuộc về user còn sót lại trực tiếp dưới root tiktok-record
         try:

@@ -70,6 +70,27 @@ def find_staging_folder(user: str, access_token: str = None) -> tuple:
     """
     return get_or_create_staging_folder(user, access_token=access_token, create=False)
 
+def _list_staging_mp4s(user_staging_id: str, access_token: str) -> list:
+    """
+    Liệt kê toàn bộ file MP4 đang tồn tại trong thư mục _staging/<user> trên Drive.
+    Dùng để phát hiện "phân đoạn mồ côi" (đã upload nhưng chưa ghi vào manifest)
+    trước khi xóa cả thư mục — tránh mất dữ liệu không thể khôi phục.
+    Trả về [] nếu không tra được (coi như không có gì để bảo vệ => nhưng caller
+    phải kiểm tra riêng kết quả lỗi).
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    q = f"'{user_staging_id}' in parents and mimeType = 'video/mp4' and trashed = false"
+    url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name,size)"
+    res = None
+    try:
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            raise IOError(f"Liệt kê staging thất bại ({res.status_code})")
+        return res.json().get("files", []) or []
+    finally:
+        if res and hasattr(res, "close"):
+            res.close()
+
 def get_staging_manifest(user: str, user_staging_id: str, access_token: str = None) -> dict:
     """
     Đọc file staging_manifest.json trong thư mục _staging/<user> trên Drive.
@@ -106,22 +127,23 @@ def get_staging_manifest(user: str, user_staging_id: str, access_token: str = No
                 q_mp4 = f"'{user_staging_id}' in parents and mimeType = 'video/mp4' and trashed = false"
                 url_mp4 = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q_mp4)}&fields=files(id,name,size)&orderBy=createdTime"
                 mp4_res = None
+                # KHÔNG nuốt exception ở đây: nếu query lỗi mà trả về segments=[],
+                # caller sẽ hiểu nhầm "hàng đợi rỗng" rồi xóa cả thư mục _staging.
                 try:
                     mp4_res = requests.get(url_mp4, headers=headers, timeout=10)
-                    if mp4_res.status_code == 200:
-                        for f in mp4_res.json().get("files", []):
-                            sz = int(f.get("size", 0))
-                            if sz >= 250000:
-                                recovered_segments.append({
-                                    "file_id": f["id"],
-                                    "filename": f["name"],
-                                    "duration": 600.0,
-                                    "size_bytes": sz,
-                                    "created_at": int(time.time()),
-                                    "local_path": None
-                                })
-                except Exception:
-                    pass
+                    if mp4_res.status_code != 200:
+                        raise IOError(f"Liệt kê MP4 mồ côi thất bại ({mp4_res.status_code})")
+                    for f in mp4_res.json().get("files", []):
+                        sz = int(f.get("size", 0))
+                        if sz >= 250000:
+                            recovered_segments.append({
+                                "file_id": f["id"],
+                                "filename": f["name"],
+                                "duration": 600.0,
+                                "size_bytes": sz,
+                                "created_at": int(time.time()),
+                                "local_path": None
+                            })
                 finally:
                     if mp4_res and hasattr(mp4_res, "close"):
                         mp4_res.close()
@@ -253,7 +275,15 @@ def add_to_staging_queue(user: str, local_file_path: str, duration_seconds: floa
         manifest["segments"] = segments
         manifest["last_live_time"] = int(time.time())
 
-        save_staging_manifest(user, user_staging_id, manifest, access_token=access_token)
+        # BẮT BUỘC: manifest ghi thất bại thì KHÔNG được báo "queued".
+        # Nếu báo "queued", caller sẽ os.remove() file local trong khi phân đoạn
+        # không nằm trong manifest -> lần đóng gói sau sẽ xóa cả thư mục _staging
+        # và mất vĩnh viễn phân đoạn đó.
+        if not save_staging_manifest(user, user_staging_id, manifest, access_token=access_token):
+            return {
+                "status": "error",
+                "message": "Không ghi được staging_manifest.json lên Drive. GIỮ file local để tránh mất dữ liệu."
+            }
 
         total_duration = sum(s.get("duration", 0.0) for s in segments)
         _log(f"[@{user}] Đã lưu vào Queue Drive. Hiện có {len(segments)} đoạn, tổng: {total_duration/60:.1f} phút / {TARGET_QUEUE_SECONDS/60:.0f} phút mục tiêu.")
@@ -262,7 +292,17 @@ def add_to_staging_queue(user: str, local_file_path: str, duration_seconds: floa
         if total_duration >= TARGET_QUEUE_SECONDS:
             _log(f"🎉 [@{user}] Hàng đợi Staging đã tích lũy đủ {total_duration/60:.1f} phút! Bắt đầu ghép nối và tải lên thư mục chính...")
             pkg_res = package_and_publish_queue(user, access_token=access_token)
-            return {"status": "packaged", "details": pkg_res}
+            if pkg_res.get("ok"):
+                return {"status": "packaged", "details": pkg_res}
+            # Gói thất bại: vẫn trả "queued" (dữ liệu đã an toàn trong manifest trên Drive)
+            # nhưng KHÔNG để caller hiểu nhầm là đã xuất bản xong.
+            return {
+                "status": "queued",
+                "segments_count": len(segments),
+                "total_duration": total_duration,
+                "target_duration": TARGET_QUEUE_SECONDS,
+                "package_error": pkg_res.get("error", "")
+            }
 
         return {
             "status": "queued",
@@ -303,11 +343,34 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
             manifest = get_staging_manifest(user, user_staging_id, access_token=access_token)
             segments = manifest.get("segments", [])
             if not segments:
+                # Manifest rỗng KHÔNG có nghĩa thư mục không còn gì: có thể có phân đoạn
+                # đã upload nhưng chưa kịp ghi vào manifest. Chỉ xóa khi chắc chắn trống.
                 try:
-                    gdrive_manager.delete_file_drive(user_staging_id, access_token=access_token)
-                except Exception:
-                    pass
-                return {"ok": True, "message": "Queue trống, không có phân đoạn nào"}
+                    leftovers = _list_staging_mp4s(user_staging_id, access_token=access_token)
+                except Exception as list_err:
+                    _log(f"[!] [@{user}] Không kiểm tra được phân đoạn còn lại ({list_err}). GIỮ thư mục _staging.")
+                    return {"ok": False, "error": f"Không kiểm tra được _staging còn gì ({list_err})"}
+                if leftovers:
+                    recovered = [{
+                        "file_id": f.get("id"),
+                        "filename": f.get("name"),
+                        "duration": 600.0,
+                        "size_bytes": int(f.get("size", 0) or 0),
+                        "created_at": int(time.time()),
+                        "local_path": None
+                    } for f in leftovers if int(f.get("size", 0) or 0) >= 250000]
+                    if recovered:
+                        _log(f"[⚠️] [@{user}] Manifest rỗng nhưng còn {len(recovered)} file MP4. Khôi phục vào manifest.")
+                        manifest["segments"] = recovered
+                        if not save_staging_manifest(user, user_staging_id, manifest, access_token=access_token):
+                            return {"ok": False, "error": "Không ghi lại được manifest sau khi khôi phục phân đoạn mồ côi"}
+                        segments = recovered
+                if not segments:
+                    try:
+                        gdrive_manager.delete_file_drive(user_staging_id, access_token=access_token)
+                    except Exception:
+                        pass
+                    return {"ok": True, "message": "Queue trống, không có phân đoạn nào"}
 
             merge_dir = os.path.join(BASE_DIR, user, "_staging_merge")
             os.makedirs(merge_dir, exist_ok=True)
@@ -361,8 +424,11 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                     from recorder_core import concat_mp4_segments
                     _log(f"[@{user}] Đang ghép nối lossless {len(local_segment_files)} phân đoạn thành 1 video duy nhất...")
                     concat_res = concat_mp4_segments(local_segment_files, final_output_file)
-                    if not concat_res or not os.path.exists(concat_res):
-                        return {"ok": False, "error": "Lỗi ghép nối FFmpeg concat demuxer"}
+                    # BẮT BUỘC đúng file đầu ra: nếu FFmpeg thất bại mà trả về một phân đoạn
+                    # gốc, hàm dưới sẽ xuất bản 1 đoạn rồi XÓA toàn bộ các đoạn còn lại.
+                    if (not concat_res or not os.path.exists(concat_res)
+                            or os.path.abspath(concat_res) != os.path.abspath(final_output_file)):
+                        return {"ok": False, "error": "Lỗi ghép nối FFmpeg concat demuxer (không tạo được file hợp lệ)"}
                     final_output_file = concat_res
 
                 try:
@@ -409,8 +475,9 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                 sz_bytes = os.path.getsize(final_output_file)
                 fn_basename = os.path.basename(final_output_file)
                 drive_file_id = up_ok if isinstance(up_ok, str) else None
+                supabase_ok = False
                 try:
-                    supabase_sync.sync_recording_to_supabase(
+                    supabase_ok = bool(supabase_sync.sync_recording_to_supabase(
                         user=user,
                         filename=fn_basename,
                         size_bytes=sz_bytes,
@@ -418,8 +485,12 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                         drive_file_id=drive_file_id,
                         drive_thumb_id=drive_thumb_id,
                         source="staging_queue"
-                    )
-                    _log(f"[✓] [@{user}] Đã đồng bộ video hoàn chỉnh lên Supabase Database & Storage!")
+                    ))
+                    if supabase_ok:
+                        _log(f"[✓] [@{user}] Đã đồng bộ video hoàn chỉnh lên Supabase Database & Storage!")
+                    else:
+                        _log(f"[!] [@{user}] Supabase sync THẤT BẠI sau 3 lần thử. Video đã có trên Drive "
+                             f"nhưng CHƯA có bản ghi DB (filename: {fn_basename}) — cần re-sync.")
                 except Exception as sb_err:
                     _log(f"[!] Lỗi đồng bộ Supabase: {sb_err}")
 
@@ -431,21 +502,52 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                 remaining_segs = [s for s in segments if s.get("filename") not in merged_filenames]
                 if remaining_segs:
                     manifest["segments"] = remaining_segs
-                    save_staging_manifest(user, user_staging_id, manifest, access_token=access_token)
+                    if not save_staging_manifest(user, user_staging_id, manifest, access_token=access_token):
+                        _log(f"[!] [@{user}] Không ghi lại được manifest sau khi ghép. GIỮ nguyên thư mục _staging để tránh mất phân đoạn còn lại.")
                 else:
-                    if manifest.get("manifest_file_id"):
-                        gdrive_manager.delete_file_drive(manifest["manifest_file_id"], access_token=access_token)
+                    # AN TOÀN: chỉ xóa thư mục _staging khi chắc chắn không còn phân đoạn mồ côi
+                    # (file đã upload lên Drive nhưng chưa từng được ghi vào manifest do lỗi lưu manifest trước đó).
                     try:
-                        gdrive_manager.delete_file_drive(user_staging_id, access_token=access_token)
-                    except Exception:
+                        on_drive = _list_staging_mp4s(user_staging_id, access_token=access_token)
+                    except Exception as list_err:
+                        _log(f"[!] [@{user}] Không kiểm tra được phân đoạn mồ côi ({list_err}). GIỮ thư mục _staging, không xóa.")
+                        on_drive = None
+                    if on_drive is None:
                         pass
+                    else:
+                        orphan = [f for f in on_drive if f.get("name") not in merged_filenames]
+                        if orphan:
+                            _log(f"[⚠️] [@{user}] Phát hiện {len(orphan)} phân đoạn mồ côi chưa vào manifest. Giữ lại và đưa vào manifest.")
+                            recovered = []
+                            for f in orphan:
+                                recovered.append({
+                                    "file_id": f.get("id"),
+                                    "filename": f.get("name"),
+                                    "duration": 600.0,
+                                    "size_bytes": int(f.get("size", 0) or 0),
+                                    "created_at": int(time.time()),
+                                    "local_path": None
+                                })
+                            manifest["segments"] = recovered
+                            save_staging_manifest(user, user_staging_id, manifest, access_token=access_token)
+                        else:
+                            if manifest.get("manifest_file_id"):
+                                try:
+                                    gdrive_manager.delete_file_drive(manifest["manifest_file_id"], access_token=access_token)
+                                except Exception:
+                                    pass
+                            try:
+                                gdrive_manager.delete_file_drive(user_staging_id, access_token=access_token)
+                            except Exception:
+                                pass
 
                 _log(f"✨ [@{user}] Hoàn tất trọn vẹn chu trình Staging Queue -> Video chính thức!")
                 return {
                     "ok": True,
                     "filename": fn_basename,
                     "duration_minutes": round(total_dur / 60.0, 1),
-                    "size_mb": round(sz_bytes / (1024 * 1024), 2)
+                    "size_mb": round(sz_bytes / (1024 * 1024), 2),
+                    "supabase_synced": supabase_ok
                 }
             finally:
                 try:
@@ -513,26 +615,31 @@ def check_and_flush_idle_queues(access_token: str = None) -> list:
         for folder in folders:
             user = folder["name"].strip().lower()
             u_staging_id = folder["id"]
+            try:
+                manifest = get_staging_manifest(user, u_staging_id, access_token=access_token)
+                segments = manifest.get("segments", [])
+                if not segments:
+                    continue
 
-            manifest = get_staging_manifest(user, u_staging_id, access_token=access_token)
-            segments = manifest.get("segments", [])
-            if not segments:
+                last_live_time = manifest.get("last_live_time", now_ts)
+                idle_seconds = now_ts - last_live_time
+
+                # Nếu đã quá 24 tiếng không có phiên live mới
+                if idle_seconds >= MAX_IDLE_SECONDS:
+                    # Kiểm tra lại xem streamer hiện có đang online không
+                    is_live, _ = recorder_core.check_live_status(user)
+                    if not is_live:
+                        _log(f"⏰ [@{user}] Đã quá {idle_seconds // 3600} tiếng không live mới. Tự động xả Staging Queue ({len(segments)} phân đoạn) lên Google Drive chính thức...")
+                        res_pkg = package_and_publish_queue(user, access_token=access_token)
+                        if res_pkg.get("ok"):
+                            flushed_users.append(user)
+                    else:
+                        _log(f"⏩ [@{user}] Quá 24h nhưng streamer ĐANG LIVE trở lại. Giữ lại Queue để tiếp tục tích lũy.")
+            except Exception as folder_err:
+                # Một user lỗi không được làm hỏng cả vòng quét: nếu không,
+                # mọi hàng đợi phía sau bị kẹt vĩnh viễn cho tới lần chạy kế tiếp.
+                _log(f"[!] Lỗi khi quét hàng đợi staging của @{user}: {folder_err}. Bỏ qua, tiếp tục user khác.")
                 continue
-
-            last_live_time = manifest.get("last_live_time", now_ts)
-            idle_seconds = now_ts - last_live_time
-
-            # Nếu đã quá 24 tiếng không có phiên live mới
-            if idle_seconds >= MAX_IDLE_SECONDS:
-                # Kiểm tra lại xem streamer hiện có đang online không
-                is_live, _ = recorder_core.check_live_status(user)
-                if not is_live:
-                    _log(f"⏰ [@{user}] Đã quá {idle_seconds // 3600} tiếng không live mới. Tự động xả Staging Queue ({len(segments)} phân đoạn) lên Google Drive chính thức...")
-                    res_pkg = package_and_publish_queue(user, access_token=access_token)
-                    if res_pkg.get("ok"):
-                        flushed_users.append(user)
-                else:
-                    _log(f"⏩ [@{user}] Quá 24h nhưng streamer ĐANG LIVE trở lại. Giữ lại Queue để tiếp tục tích lũy.")
     except Exception as e:
         _log(f"Lỗi quét và xả idle queues: {e}")
 

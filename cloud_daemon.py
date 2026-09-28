@@ -73,13 +73,19 @@ def load_monitored_users():
                 log(f"[!] Lỗi đọc danh sách streamer từ Drive: {e}")
 
             supa_users = []
+            supa_ok = False
             try:
                 import supabase_sync
                 s = supabase_sync.fetch_streamers_from_supabase()
-                if s and isinstance(s, list):
+                if isinstance(s, list):
                     supa_users = [u.strip().replace("@", "").lower() for u in s if u.strip()]
+                    supa_ok = True
             except Exception:
                 pass
+
+            # d is None nghĩa là ĐỌC THẤT BẠI (không phân biệt được "chưa có file").
+            # Cả hai nguồn phải trả lời được thì mới được phép thay thế cache hoàn toàn.
+            drive_ok = d is not None
 
             merged_map = {}
             for u in drive_users + supa_users:
@@ -87,6 +93,14 @@ def load_monitored_users():
                     merged_map[u] = True
 
             if merged_map:
+                if not (drive_ok and supa_ok):
+                    # Một nguồn lỗi -> gộp cache cũ, nếu không mọi streamer chỉ có ở nguồn
+                    # còn lại sẽ biến mất khỏi danh sách và bị coi là "đã xóa"
+                    # (worker bị dừng + rmtree thư mục local => mất dữ liệu).
+                    for u in (_CACHED_DRIVE_USERS or []):
+                        merged_map.setdefault(u, True)
+                    log(f"[⚠️] Dan sách streamer chưa đầy đủ (Drive_ok={drive_ok}, Supabase_ok={supa_ok}). "
+                        f"Gộp cache cũ để KHÔNG xóa nhầm streamer.")
                 cleaned = list(merged_map.keys())
                 if _CACHED_DRIVE_USERS != cleaned:
                     log(f"[*] Cập nhật danh sách từ Google Drive & Supabase ({len(cleaned)} streamers): {cleaned}")
@@ -150,6 +164,13 @@ MAX_CHUNK_SECONDS = 3600       # Đúng 1 tiếng (1h = 3600s), tự động tá
 ACTIVE_RECORDERS = {}          # {user: {"thread": Thread, "start_time": float}}
 RECORDERS_LOCK = threading.Lock()
 
+# Chống "hot loop": nếu luồng ghi hình của 1 streamer bị tắt ngay sau khi khởi động
+# (ffmpeg lỗi, mạng lỗi, ...) thì mỗi vòng lặp ~15s sẽ khởi động lại + gửi 1 tin
+# Telegram -> spam không kiểm soát. Chờ đủ thời gian này rồi mới khởi động lại.
+USER_START_COOLDOWN_SECONDS = 180
+_USER_START_COOLDOWN = {}       # {user: last_start_ts}
+
+
 def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_event=None):
     """
     Luồng ghi hình độc lập cho từng streamer:
@@ -159,6 +180,8 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
     - Cập nhật trạng thái đang quay lên Google Drive theo thời gian thực để API hiển thị.
     """
     log(f"🎬 [Luồng mới] Bắt đầu phiên ghi hình cho @{user} (Hỗ trợ tối đa {MAX_CONCURRENT_RECORDERS} streamer cùng lúc)...")
+    global _CACHED_DRIVE_USERS
+
     
     # Cập nhật trạng thái đang quay và tạo ngay thư mục trên Google Drive
     try:
@@ -203,8 +226,12 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                                 log(f"✨ [Auto-Discover] Tự động phát hiện streamer mới từ phiên live: @{nf}")
                         if added_any:
                             with _CONFIG_USERS_LOCK:
-                                _CACHED_DRIVE_USERS = current_list
+                                # Gộp cả monitored_users trong config.json: chỉ dùng cache sẽ
+                                # "cắt" mất các streamer chỉ có trong config rồi lưu lại bản thiếu.
                                 cfg = load_config()
+                                cfg_users = [u.strip().replace("@", "").lower() for u in cfg.get("monitored_users", []) if u and u.strip()]
+                                current_list = list(dict.fromkeys(cfg_users + current_list))
+                                _CACHED_DRIVE_USERS = current_list
                                 cfg["monitored_users"] = current_list
                                 save_config(cfg)
                             try:
@@ -271,15 +298,21 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     break
 
                 seg_name = os.path.join(user_dir, f"{user}_{now_str}_p{part_number}_seg{len(part_segments)+1}.mp4")
-                rec_result = recorder_core.record_stream_ffmpeg(
-                    stream_url,
-                    output_filename=seg_name,
-                    target_user=user,
-                    duration=target_duration,
-                    stop_event=stop_event,
-                    auto_sync_gdrive=False,
-                    is_sub_only=is_sub_only
-                )
+                rec_result = None
+                try:
+                    rec_result = recorder_core.record_stream_ffmpeg(
+                        stream_url,
+                        output_filename=seg_name,
+                        target_user=user,
+                        duration=target_duration,
+                        stop_event=stop_event,
+                        auto_sync_gdrive=False,
+                        is_sub_only=is_sub_only
+                    )
+                except Exception as rec_err:
+                    # Không để ngoại lệ giết cả worker: sẽ rơi vào vòng khởi động lại
+                    # vô tận + gửi Telegram mỗi chu kỳ. Đếm như 1 lần thất bại thường.
+                    log(f"[!] [@{user}] Lỗi khi ghi hình đoạn mới: {rec_err}")
 
                 from auto_h264 import validate_playable_video
                 is_valid = False
@@ -359,6 +392,17 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             else:
                 log(f"🧩 [@{user}] Đang ghép nối {len(part_segments)} phân đoạn thành 1 file MP4 duy nhất cho Phần {part_number} ({accumulated_seconds:.1f}s)...")
                 final_rec_file = concat_mp4_segments(part_segments, output_file)
+                if not final_rec_file or not os.path.exists(final_rec_file):
+                    log(f"[!] [@{user}] Ghép nối lần 1 thất bại. Thử lại...")
+                    final_rec_file = concat_mp4_segments(part_segments, output_file)
+                if not final_rec_file or not os.path.exists(final_rec_file):
+                    # KHÔNG dùng 1 phân đoạn thay cho file ghép: sẽ xuất bản sai và xóa mất các đoạn còn lại.
+                    log(f"[!] [@{user}] Không ghép được Phần {part_number}. GIỮ nguyên {len(part_segments)} phân đoạn trên đĩa.")
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_consecutive_failures:
+                        break
+                    time.sleep(5)
+                    continue
 
             # ponytail: ensure_h264 already called inside concat_mp4_segments
 
@@ -415,6 +459,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
 
                 # 2. Tải video & thumbnail lên Google Drive trước để lấy drive_file_id
                 drive_file_id = None
+                drive_thumb_id = None
                 try:
                     log(f"[*] [@{user}] Đang tải Phần {part_number} ({final_dur:.1f}s) lên Google Drive...")
                     tok = gdrive_manager.get_access_token()
@@ -463,6 +508,19 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                         except Exception:
                             pass
 
+            # Dọn phân đoạn gốc sau khi đã gộp vào final_rec_file và bàn giao lên Cloud.
+            # Đây là lý do ổ cứng daemon đầy dần: concat_mp4_segments cố tình không xóa,
+            # trong khi không nơi nào khác xóa part_segments.
+            for seg in part_segments:
+                if not seg or not os.path.exists(seg):
+                    continue
+                if final_rec_file and os.path.abspath(seg) == os.path.abspath(final_rec_file):
+                    continue
+                try:
+                    os.remove(seg)
+                except Exception:
+                    pass
+
             part_number += 1
 
             if stop_event and stop_event.is_set():
@@ -510,12 +568,23 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
     except Exception as err:
         log(f"[!] Lỗi trong luồng ghi hình của @{user}: {err}")
     finally:
+        # Chỉ gỡ đăng ký nếu đây VẪN LÀ luồng đang giữ bản ghi: nếu luồng cũ kết thúc muộn
+        # sau khi daemon đã đăng ký luồng mới cho cùng user, pop() bừa sẽ làm luồng mới
+        # mất theo dõi (không còn heartbeat -> ghi hình trùng lặp, không stop được khi xóa).
+        stale_worker = False
         with RECORDERS_LOCK:
-            ACTIVE_RECORDERS.pop(user, None)
-        try:
-            gdrive_manager.set_user_recording_status_drive(user, False)
-        except Exception:
-            pass
+            reg = ACTIVE_RECORDERS.get(user)
+            if reg and isinstance(reg, dict) and reg.get("thread") is threading.current_thread():
+                ACTIVE_RECORDERS.pop(user, None)
+            else:
+                stale_worker = True
+        if stale_worker:
+            log(f"⚠️ [@{user}] Luồng cũ kết thúc nhưng không còn là luồng đang đăng ký. Bỏ qua cập nhật trạng thái để không ảnh hưởng luồng mới.")
+        else:
+            try:
+                gdrive_manager.set_user_recording_status_drive(user, False)
+            except Exception:
+                pass
 
         # ponytail: Chỉ đóng gói và xuất bản Staging Queue nếu luồng không bị hủy do streamer bị xóa
         is_user_deleted = bool(stop_event and getattr(stop_event, "user_deleted", False))
@@ -534,8 +603,20 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             log(f"🗑️ [@{user}] Streamer đã bị xóa: hủy xuất bản Staging Queue và dọn dẹp file tạm.")
             try:
                 local_u_dir = os.path.join(BASE_DIR, user)
-                if os.path.exists(local_u_dir):
-                    shutil.rmtree(local_u_dir, ignore_errors=True)
+                if os.path.isdir(local_u_dir):
+                    # KHÔNG rmtree cả thư mục: video đã thu có thể CHƯA upload được
+                    # lên Drive (lỗi mạng) -> đó là bản sao cuối cùng. Chỉ xóa đoạn
+                    # (segment) và thư mục staging tạm vốn là rác sau khi hand-off.
+                    for fn in os.listdir(local_u_dir):
+                        full = os.path.join(local_u_dir, fn)
+                        if fn.endswith("_staging") and os.path.isdir(full):
+                            shutil.rmtree(full, ignore_errors=True)
+                        elif os.path.isfile(full) and re.search(r"_seg\d+\.mp4$", fn):
+                            try:
+                                os.remove(full)
+                            except Exception:
+                                pass
+                    log(f"↳ Giữ lại video trong '{local_u_dir}' (chỉ xóa file đoạn tạm).")
             except Exception:
                 pass
 
@@ -545,7 +626,12 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
 def run_daemon(max_minutes=210, interval=25, auto_discover=True):
     start_time = time.time()
     max_seconds = max_minutes * 60
-    hard_limit_seconds = 320 * 60  # Giới hạn tối đa 5 tiếng 20 phút (tránh chạm mốc 6h của GitHub)
+    # Giai đoạn DRAIN: ngưng khởi động luồng mới, chờ luồng đang ghi chốt + upload.
+    DRAIN_GRACE_SECONDS = 6 * 60
+    # Chốt an toàn tuyệt đối tính từ lúc bắt đầu DRAIN (GitHub Actions timeout-minutes: 65,
+    # phiên chạy --duration-minutes 46 -> 46 + 10 = 56 phút, vẫn dư dả trước mốc 65 phút).
+    hard_limit_seconds = max_seconds + 10 * 60
+    drain_started_elapsed = None
 
     log("=" * 65)
     log("   TIKTOK 24/7 CLOUD AUTO RECORDER (MULTI-THREADED & CHUNKING)")
@@ -587,18 +673,33 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                 except Exception:
                     pass
 
-        # Kiểm tra điều kiện luân chuyển phiên mượt mà (Graceful Rotation)
+        # Kiểm tra điều kiện luân chuyển phiên mượt mà (Graceful Rotation / Drain)
+        draining = False
         if elapsed >= max_seconds:
+            draining = True
+            if drain_started_elapsed is None:
+                drain_started_elapsed = elapsed
+                with RECORDERS_LOCK:
+                    n_active = len(ACTIVE_RECORDERS)
+                log(f"[*] Đã qua {int(elapsed // 60)} phút. Vào giai đoạn DRAIN: "
+                    f"KHÔNG khởi động luồng mới, chờ {n_active} luồng đang ghi chốt và upload (thời gian gia hạn {DRAIN_GRACE_SECONDS // 60} phút)...")
             with RECORDERS_LOCK:
                 active_count = len(ACTIVE_RECORDERS)
-            if active_count > 0:
-                log(f"[*] Đã qua {int(elapsed // 60)} phút, hiện có {active_count} streamer đang quay dở. Tiếp tục chờ hoàn tất...")
-                if elapsed >= hard_limit_seconds:
-                    log("[!] Chạm ngưỡng an toàn 5.3 giờ của GitHub. Bắt đầu kết thúc an toàn phiên để chốt video và upload...")
-                    break
-            else:
+            if active_count == 0:
                 log(f"[*] Đã đạt mốc chuyển giao ({int(elapsed // 60)} phút). Không có livestream nào đang dở. Luân chuyển sang phiên mới ngay lập tức!")
                 break
+            grace_used = elapsed - drain_started_elapsed
+            if grace_used >= DRAIN_GRACE_SECONDS or elapsed >= hard_limit_seconds:
+                log(f"[!] Hết thời gian gia hạn ({int(grace_used)}s). Phát lệnh dừng mềm cho {active_count} luồng còn lại để chốt video và upload...")
+                with RECORDERS_LOCK:
+                    recs_to_stop = list(ACTIVE_RECORDERS.items())
+                for _u, _info in recs_to_stop:
+                    _se = _info.get("stop_event") if isinstance(_info, dict) else None
+                    if _se:
+                        _se.set()
+                break
+            # Đang trong giai đoạn DRAIN: vẫn quét bình thường nhưng sẽ KHÔNG khởi động luồng mới
+            # (xem điều kiện `not draining` ở khối khởi động luồng bên dưới).
 
         users = load_monitored_users()
         users_set = set(users)
@@ -651,7 +752,7 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
 
         users_to_check = [u for u in users if u not in active_set and u not in drive_busy_users]
 
-        if users_to_check and slots_available > 0:
+        if (not draining) and users_to_check and slots_available > 0:
             import concurrent.futures
 
             def _check(u):
@@ -665,6 +766,14 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
 
             for user, (is_live, room_id) in check_results:
                 if not (is_live and room_id):
+                    continue
+
+                # Chống lặp khởi động lại vô hạn (và gửi Telegram mỗi vòng)
+                last_start = _USER_START_COOLDOWN.get(user, 0.0)
+                since_start = time.time() - last_start
+                if last_start and since_start < USER_START_COOLDOWN_SECONDS:
+                    log(f"⏳ [@{user}] Luồng vừa khởi động {int(since_start)}s trước mà đã tắt. "
+                        f"Chờ {int(USER_START_COOLDOWN_SECONDS - since_start)}s nữa mới khởi động lại (chống lặp).")
                     continue
 
                 stop_ev = threading.Event()
@@ -681,6 +790,7 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                         "start_time": time.time(),
                         "stop_event": stop_ev
                     }
+                _USER_START_COOLDOWN[user] = time.time()
                 log(f"🔴 PHÁT HIỆN LIVESTREAM: @{user} đang trực tiếp (Room ID: {room_id})")
                 notifier.send_telegram(f"🔴 <b>STREAMER ĐANG LIVE!</b>\n👤 <code>@{user}</code> bắt đầu phát livestream.\nĐang tự động ghi hình đa luồng HD H.264 (< 2 tiếng/phần)...")
                 t.start()
@@ -697,11 +807,20 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
     if remaining_recorders:
         log(f"⏳ Đang chờ {len(remaining_recorders)} luồng ghi hình hoàn tất đóng gói và upload lên Google Drive...")
         for u, info in remaining_recorders:
-            if "stop_event" in info:
+            if isinstance(info, dict) and info.get("stop_event"):
                 info["stop_event"].set()
+        # Ngân sách chờ CHUNG (không phải 180s × mỗi luồng): đủ để upload video lớn
+        # nhưng vẫn nằm trong timeout-minutes của GitHub Actions.
+        join_deadline = time.time() + 7 * 60
         for u, info in remaining_recorders:
-            info["thread"].join(timeout=180)
-            log(f"  [✓] Luồng @{u} đã hoàn tất.")
+            t = info.get("thread") if isinstance(info, dict) else None
+            if not (t and hasattr(t, "join")):
+                continue
+            t.join(timeout=max(1.0, join_deadline - time.time()))
+            if t.is_alive():
+                log(f"  [!] Luồng @{u} VẪN CHƯA kết thúc sau khi chờ — video của luồng này có thể chưa upload xong.")
+            else:
+                log(f"  [✓] Luồng @{u} đã hoàn tất.")
 
     log("[✓] Phiên làm việc kết thúc thành công.")
 
