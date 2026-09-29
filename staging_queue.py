@@ -24,7 +24,7 @@ import supabase_sync
 from auto_h264 import validate_playable_video
 
 TARGET_QUEUE_SECONDS = 3000       # 50 phút (~1 tiếng chênh lệch 10p)
-MAX_IDLE_SECONDS = 600            # 10 phút offline thì tự động xả queue
+MAX_IDLE_SECONDS = 90             # 1.5 phút offline thì tự động xả queue
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _USER_STAGING_LOCKS = {}

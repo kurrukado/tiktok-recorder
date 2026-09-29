@@ -502,7 +502,7 @@ def get_memory_usage():
     }
 
 @app.post("/api/users")
-def add_user(req: AddUserRequest):
+def add_user(req: AddUserRequest, bg_tasks: BackgroundTasks):
     user = os.path.basename(req.username.strip().replace("@", "").lower())
     if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
@@ -519,7 +519,7 @@ def add_user(req: AddUserRequest):
 
         already_in = (user in users)
         if not already_in:
-            users.append(user)
+            users.insert(0, user)
             cfg["monitored_users"] = users
             save_config(cfg)
             try:
@@ -545,10 +545,35 @@ def add_user(req: AddUserRequest):
     except Exception as e:
         gdrive_status = f"Lỗi tạo folder Drive: {e}"
 
-    msg = f"@{user} đã có trong danh sách theo dõi" if already_in else f"Đã thêm @{user} vào danh sách theo dõi"
+    # TỰ ĐỘNG KÍCH HOẠT GHI HÌNH NGAY NẾU STREAMER ĐANG LIVE
+    recording_started = False
+    try:
+        live_details = get_user_live_details_cached(user)
+        if live_details.get("is_live"):
+            has_ffmpeg = bool(shutil.which("ffmpeg") or (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)))
+            if has_ffmpeg and bg_tasks:
+                with RECORDING_LOCK:
+                    if user not in ACTIVE_RECORDING_TASKS:
+                        stop_evt = threading.Event()
+                        ACTIVE_RECORDING_TASKS[user] = {"start_time": time.time(), "stop_event": stop_evt}
+                        try:
+                            gdrive_manager.set_user_recording_status_drive(user, True)
+                        except Exception:
+                            pass
+                        bg_tasks.add_task(bg_record_worker, user, None, stop_evt)
+                        recording_started = True
+    except Exception:
+        pass
+
+    if recording_started:
+        msg = f"@{user} đang phát trực tiếp! Đã tự động bắt đầu ghi hình ngay lập tức."
+    else:
+        msg = f"@{user} đã có trong danh sách theo dõi" if already_in else f"Đã thêm @{user} vào danh sách theo dõi"
+
     return {
         "message": msg,
         "username": user,
+        "is_recording": recording_started,
         "gdrive_status": gdrive_status,
         "gdrive_folder_id": folder_id,
         "users": users

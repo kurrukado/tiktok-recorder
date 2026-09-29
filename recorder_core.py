@@ -210,7 +210,15 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
         for imp in ["safari15_5", "chrome136"]:
             api_res = None
             try:
-                req_kwargs = {"impersonate": imp, "timeout": 6}
+                req_kwargs = {
+                    "impersonate": imp,
+                    "timeout": 6,
+                    "headers": {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                        "Referer": "https://www.tiktok.com/",
+                        "Accept": "*/*",
+                    }
+                }
                 if proxy:
                     req_kwargs["proxies"] = {"http": proxy, "https": proxy}
                 if cookies:
@@ -419,6 +427,17 @@ def check_user_live(user: str) -> Tuple[bool, Optional[str]]:
     AttributeError bị nuốt trong except -> daemon LUÔN trả về (False, None) và không bao giờ bắt đầu ghi hình.
     """
     return check_live_status(user)
+
+def get_live_stream_urls(room_id, user=None, cookies=None, session=None, proxy=None) -> list:
+    """
+    Lấy toàn bộ danh sách các link stream (HLS và FLV dự phòng) được phân cấp theo chất lượng.
+    Giúp luồng quay tự động fallback sang URL tiếp theo nếu URL đầu tiên gặp lỗi 403 Forbidden.
+    """
+    try:
+        urls = get_stream_urls(room_id, user, cookies=cookies, session=session, proxy=proxy)
+        return urls if isinstance(urls, list) else []
+    except Exception:
+        return []
 
 def get_live_stream_url(room_id, user=None, cookies=None, session=None, proxy=None):
     try:
