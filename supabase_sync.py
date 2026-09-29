@@ -194,7 +194,12 @@ def sync_recording_to_supabase(
                 d_str, t_str = m.groups()
                 recorded_at = f"{d_str} {t_str.replace('-', ':')}"
             else:
-                recorded_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    from recorder_core import get_now_local
+                    recorded_at = get_now_local().strftime("%Y-%m-%d %H:%M:%S")
+                except Exception:
+                    from datetime import timedelta
+                    recorded_at = datetime.now(timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M:%S")
 
         final_thumb_url = existing_thumb_url
         if thumb_source:

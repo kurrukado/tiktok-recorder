@@ -188,6 +188,8 @@ def get_video_resolution(filepath):
                 if m_res:
                     w, h = int(m_res.group(1)), int(m_res.group(2))
                 m_fps = re.search(r"(\d+(?:\.\d+)?)\s*fps", line)
+                if not m_fps:
+                    m_fps = re.search(r"(\d+(?:\.\d+)?)\s*tbr", line)
                 if m_fps:
                     fps = float(m_fps.group(1))
                 break
@@ -199,8 +201,8 @@ def upscale_to_1080p_if_needed(filepath, config=None):
     """
     Kiểm tra và nâng độ phân giải (upscale) lên chuẩn 1080p theo yêu cầu:
     1. Nếu video ĐÃ có sẵn 1080p (chiều nhỏ >= 1080 hoặc chiều lớn >= 1920) -> Bỏ qua 100%, không tốn tài nguyên.
-    2. Nếu config 'auto_upscale_1080p' tắt (mặc định False) -> Bỏ qua để tiết kiệm CPU/băng thông.
-    3. Nếu nhỏ hơn 1080p và được bật cấu hình -> Upscale bằng bộ lọc Lanczos chất lượng cao,
+    2. Nếu config 'auto_upscale_1080p' tắt -> Bỏ qua để tiết kiệm CPU/băng thông.
+    3. Nếu nhỏ hơn 1080p và được bật cấu hình (mặc định BẬT) -> Upscale bằng bộ lọc Lanczos chất lượng cao,
        giữ nguyên fps gốc của phòng live và tăng tốc bằng GPU (NVENC) nếu khả dụng.
     """
     if not filepath or not os.path.exists(filepath):
@@ -219,7 +221,7 @@ def upscale_to_1080p_if_needed(filepath, config=None):
         except Exception:
             config = {}
 
-    if not config.get("auto_upscale_1080p", False):
+    if not config.get("auto_upscale_1080p", True):
         return filepath
 
     w, h, fps = get_video_resolution(filepath)

@@ -19,6 +19,8 @@ from recorder_core import (
     check_live_details,
     get_stream_urls,
     record_stream_ffmpeg,
+    get_now_local,
+    get_now_str,
     BASE_DIR,
 )
 try:
@@ -38,17 +40,22 @@ def print_banner():
     print(BANNER)
 
 def run_auto_mode(target_user, interval):
+    cfg = load_config()
+    max_chunk = cfg.get("max_recording_seconds", 3600)
+    offline_wait = cfg.get("offline_confirm_seconds", 600)
     user_dir = os.path.join(BASE_DIR, target_user)
     os.makedirs(user_dir, exist_ok=True)
     print(f"\n[*] BẮT ĐẦU CHẾ ĐỘ TỰ ĐỘNG THEO DÕI: @{target_user}")
     print(f"[*] Tần suất kiểm tra: mỗi {interval} giây.")
     print(f"[*] Video quay được sẽ tự động lưu vào: {user_dir}")
-    print(f"[*] Video sẽ tự động được chuẩn hóa sang H.264 (AVC) sau khi ghi hình.")
+    print(f"[*] Định dạng: 1080p Full HD (chuẩn H.264 AVC, fps gốc từ live).")
+    print(f"[*] Giới hạn thời lượng: tối đa 1:00:00/bản ghi (tự động sang đợt mới nếu quá 1 tiếng).")
+    print(f"[*] Cơ chế kết thúc: xác nhận streamer offline 10 phút trước khi gửi phần ghi sau cùng.")
     print(f"[*] Nhấn [Ctrl + C] bất kỳ lúc nào để dừng chương trình.\n")
 
     consecutive_errors = 0
     while True:
-        timestamp = time.strftime("%H:%M:%S")
+        timestamp = get_now_local().strftime("%H:%M:%S")
         try:
             live_info = check_live_details(target_user)
             is_live, room_id = live_info["is_live"], live_info["room_id"]
@@ -62,30 +69,86 @@ def run_auto_mode(target_user, interval):
                         f"🔴 <b>PHÁT HIỆN LIVESTREAM MỚI!</b>\n"
                         f"👤 Streamer: <code>@{target_user}</code>\n"
                         f"🆔 Room ID: <code>{room_id}</code>\n"
-                        f"⏳ Tool đang tự động kết nối và thu luồng video..."
+                        f"⏳ Đang tự động kết nối và thu luồng video (tối đa 1:00:00/phần)..."
                     )
                 except Exception:
                     pass
 
-                # Fetch stream urls
-                stream_res = get_stream_urls(room_id, target_user)
-                if stream_res == "AGE_RESTRICTED":
-                    print(f"[{timestamp}] ⚠️ CẢNH BÁO: Phiên Live của @{target_user} bị giới hạn độ tuổi 18+ (Age-Restricted).")
-                    cookies = load_cookies()
-                    if not cookies.get("sessionid") and not cookies.get("sessionid_ss"):
-                        print(f"[{timestamp}] ⚠️ Bạn chưa cài đặt Cookie TikTok nên không thể tải luồng 18+.")
-                        print(f"[{timestamp}] 👉 Vui lòng mở file 'cookies.json' hoặc chọn menu [4] để nhập sessionid_ss!")
-                    time.sleep(interval)
-                    continue
+                part_number = 1
+                curr_room_id = room_id
 
-                if isinstance(stream_res, list) and stream_res:
+                while True:
+                    cur_ts = get_now_local().strftime("%H:%M:%S")
+                    stream_res = get_stream_urls(curr_room_id, target_user)
+                    if stream_res == "AGE_RESTRICTED":
+                        print(f"[{cur_ts}] ⚠️ CẢNH BÁO: Phiên Live của @{target_user} bị giới hạn độ tuổi 18+ (Age-Restricted).")
+                        cookies = load_cookies()
+                        if not cookies.get("sessionid") and not cookies.get("sessionid_ss"):
+                            print(f"[{cur_ts}] ⚠️ Bạn chưa cài đặt Cookie TikTok nên không thể tải luồng 18+.")
+                            print(f"[{cur_ts}] 👉 Vui lòng mở file 'cookies.json' hoặc chọn menu [4] để nhập sessionid_ss!")
+                        break
+
+                    if not (isinstance(stream_res, list) and stream_res):
+                        print(f"[{cur_ts}] Không tìm thấy link luồng stream hợp lệ. Kiểm tra lại...")
+                        break
+
                     stream_url = stream_res[0]
-                    print(f"[{timestamp}] [✓] Đã lấy được link stream chất lượng cao nhất.")
-                    record_stream_ffmpeg(stream_url=stream_url, target_user=target_user, is_sub_only=live_info.get("is_sub_only", False))
-                    print(f"\n[{time.strftime('%H:%M:%S')}] Phiên live đã kết thúc hoặc bị ngắt. Tiếp tục chờ phiên live mới...")
-                else:
-                    print(f"[{timestamp}] Không tìm thấy link luồng stream hợp lệ. Thử lại sau {interval}s...")
-                
+                    now_str = get_now_str("%Y-%m-%d_%H-%M-%S")
+                    part_suffix = f"_part{part_number}" if part_number > 1 else ""
+                    out_filename = os.path.join(user_dir, f"{target_user}_{now_str}{part_suffix}.mp4")
+
+                    print(f"[{cur_ts}] [✓] Đang thu Phần {part_number} (tối đa 1:00:00): {os.path.basename(out_filename)}")
+                    rec_result = record_stream_ffmpeg(
+                        stream_url=stream_url,
+                        output_filename=out_filename,
+                        target_user=target_user,
+                        duration=max_chunk,
+                        is_sub_only=live_info.get("is_sub_only", False)
+                    )
+
+                    # Kiểm tra trạng thái sau đợt ghi
+                    st_live = False
+                    try:
+                        det = check_live_details(target_user)
+                        st_live = bool(det.get("is_live"))
+                        if det.get("room_id"):
+                            curr_room_id = det.get("room_id")
+                    except Exception:
+                        st_live = False
+
+                    if st_live:
+                        part_number += 1
+                        print(f"\n[{get_now_local().strftime('%H:%M:%S')}] ⏩ Streamer VẪN ĐANG LIVE! Tự động bắt đầu đợt ghi mới: Phần {part_number}...")
+                        continue
+                    else:
+                        # Tín hiệu live ngắt: chờ xác nhận offline tầm 10 phút trước khi gửi/chốt phần sau cùng
+                        print(f"\n[{get_now_local().strftime('%H:%M:%S')}] ⏳ Tín hiệu live tạm ngắt. Chờ xác nhận offline {offline_wait//60} phút ({offline_wait}s) trước khi chốt phần ghi sau cùng...")
+                        offline_confirmed = False
+                        w_start = time.time()
+                        offline_checks = max(1, int(offline_wait / 15))
+                        for _ in range(offline_checks):
+                            time.sleep(15)
+                            try:
+                                re_det = check_live_details(target_user)
+                                if re_det.get("is_live"):
+                                    print(f"[{get_now_local().strftime('%H:%M:%S')}] 🔴 Streamer ĐÃ LIVE TRỞ LẠI! Tiếp tục đợt ghi mới...")
+                                    if re_det.get("room_id"):
+                                        curr_room_id = re_det.get("room_id")
+                                    part_number += 1
+                                    st_live = True
+                                    break
+                            except Exception:
+                                pass
+                        else:
+                            offline_confirmed = True
+
+                        if st_live:
+                            continue
+
+                        if offline_confirmed:
+                            print(f"\n[{get_now_local().strftime('%H:%M:%S')}] 🏁 ĐÃ XÁC NHẬN OFFLINE {offline_wait//60} phút. Đã hoàn tất và lưu trữ toàn bộ buổi live!")
+                            break
+
                 consecutive_errors = 0
             else:
                 sys.stdout.write(f"\r[{timestamp}] ⏳ Đang quét @{target_user}... Trạng thái: [Offline]. Sẽ kiểm tra lại sau {interval}s.")

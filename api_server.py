@@ -835,7 +835,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 continue
             consecutive_offline_checks = 0
 
-            now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            now_str = recorder_core.get_now_str("%Y-%m-%d_%H-%M-%S")
             part_suffix = f"_part{part_number}" if part_number > 1 else ""
             user_dir = os.path.join(BASE_DIR, user)
             os.makedirs(user_dir, exist_ok=True)
@@ -843,9 +843,10 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
 
             part_segments = []
             accumulated_seconds = 0.0
-            print(f"[🔴] [@{user}] Bắt đầu tích lũy Phần {part_number} (Mục tiêu gom đủ 1 tiếng: {MAX_CHUNK_SECONDS}s)...")
+            offline_confirmed = False
+            print(f"[🔴] [@{user}] Bắt đầu tích lũy Phần {part_number} (Tối đa 1 tiếng: {MAX_CHUNK_SECONDS}s)...")
 
-            while accumulated_seconds < (300 if is_sub_only else (MAX_CHUNK_SECONDS - 60)):
+            while accumulated_seconds < (300 if is_sub_only else MAX_CHUNK_SECONDS):
                 if stop_event and stop_event.is_set():
                     break
 
@@ -926,8 +927,8 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 if is_sub_only:
                     break
 
-                if accumulated_seconds >= MAX_CHUNK_SECONDS - 60:
-                    print(f"[⏱️ Đủ 1 tiếng] [@{user}] Phần {part_number} đã tích lũy đủ 1 tiếng ({accumulated_seconds:.1f}s)!")
+                if accumulated_seconds >= MAX_CHUNK_SECONDS - 5:
+                    print(f"[⏱️ Đạt tối đa 1:00:00] [@{user}] Phần {part_number} đã tích lũy đủ 1 tiếng ({accumulated_seconds:.1f}s)! Chuẩn bị chốt và bắt đầu phần mới...")
                     break
 
                 # Kiểm tra streamer còn live không để tiếp tục tích lũy
@@ -998,7 +999,13 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                     time.sleep(5)
                     continue
 
-            # ponytail: ensure_h264 already called inside concat_mp4_segments
+            # Đảm bảo video chuẩn H.264 và upscale lên 1080p (giữ nguyên fps gốc)
+            try:
+                from auto_h264 import ensure_h264, upscale_to_1080p_if_needed
+                final_rec_file = ensure_h264(final_rec_file)
+                final_rec_file = upscale_to_1080p_if_needed(final_rec_file)
+            except Exception as up_err:
+                print(f"[!] [@{user}] Lỗi chuẩn hóa H.264 / upscale 1080p: {up_err}")
 
             # Streamer bị xóa giữa chừng -> hủy kết quả đã ghép. Dừng bình thường thì
             # GIỮ file để tiếp tục validate + upload ở phía dưới.
@@ -1025,10 +1032,12 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 continue
 
             consecutive_failures = 0
-            print(f"[✓] [@{user}] Hoàn tất trọn vẹn Phần {part_number} ({final_dur:.1f}s): {os.path.basename(final_rec_file)}")
+            is_final_part = bool(stop_event and stop_event.is_set())
+            part_desc = "phần ghi sau cùng" if is_final_part else f"Phần {part_number}"
+            print(f"[✓] [@{user}] Hoàn tất trọn vẹn {part_desc} ({final_dur:.1f}s): {os.path.basename(final_rec_file)}")
             # Kiểm tra thời lượng video:
-            # Nếu video ngắn dưới 50 phút (< 3000s, chênh lệch 10p so với 60p): Đẩy vào Staging Queue trên Google Drive!
-            if final_dur < 3000:
+            # Nếu là phần ghi sau cùng (đã xác nhận offline 10p) hoặc đủ 1 tiếng (>= 3000s) -> Xuất bản trực tiếp lên Drive chính và Supabase!
+            if not is_final_part and final_dur < 3000:
                 print(f"[📦] [@{user}] Video Phần {part_number} ngắn hơn 50 phút ({final_dur/60:.1f}p < 50p). Chuyển vào Cloud Staging Queue trên Google Drive...")
                 try:
                     import staging_queue
@@ -1118,6 +1127,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             if stop_event and stop_event.is_set():
                 break
 
+
             # Kiểm tra streamer còn live không để tiếp tục phân đoạn tiếp theo
             time.sleep(3)
             curr_det = recorder_core.check_live_details(user)
@@ -1131,7 +1141,36 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 if consecutive_offline_checks < 3:
                     print(f"[⏳] [@{user}] Chưa xác nhận streamer xuống live (lần {consecutive_offline_checks}/3). Kiểm tra lại...")
                     continue
-                print(f"[🏁] [@{user}] Xác nhận {consecutive_offline_checks} lần liên tiếp — streamer đã xuống live sau {part_number - 1} phần.")
+                cfg_offline_wait = load_config().get("offline_confirm_seconds", 600)
+                print(f"[⏳] [@{user}] Xác nhận {consecutive_offline_checks} lần streamer ngắt live. Chờ xác nhận offline {cfg_offline_wait//60} phút ({cfg_offline_wait}s)...")
+                offline_checks = max(1, int(cfg_offline_wait / 15))
+                streamer_back = False
+                for _ in range(offline_checks):
+                    if stop_event and stop_event.is_set():
+                        break
+                    try:
+                        gdrive_manager.set_user_recording_status_drive(user, True)
+                    except Exception:
+                        pass
+                    time.sleep(15)
+                    recheck = recorder_core.check_live_details(user)
+                    if recheck.get("is_live"):
+                        streamer_back = True
+                        print(f"[🔴] [@{user}] Streamer ĐÃ LIVE TRỞ LẠI! Tự động ghi hình nối tiếp Phần {part_number}...")
+                        break
+                if streamer_back:
+                    consecutive_offline_checks = 0
+                    continue
+
+                print(f"[🏁] [@{user}] ĐÃ XÁC NHẬN OFFLINE ĐỦ {cfg_offline_wait//60} PHÚT. Kiểm tra và xuất bản phần ghi sau cùng (nếu còn trong Staging Queue)...")
+                try:
+                    import staging_queue
+                    token = gdrive_manager.get_access_token()
+                    pkg_res = staging_queue.package_and_publish_queue(user, access_token=token)
+                    if pkg_res.get("ok"):
+                        print(f"[✓] [@{user}] Đã xuất bản phần ghi sau cùng từ Staging Queue: {pkg_res.get('filename')}")
+                except Exception as sq_flush_err:
+                    print(f"[!] [@{user}] Lỗi xả Staging Queue sau offline: {sq_flush_err}")
                 break
             else:
                 consecutive_offline_checks = 0

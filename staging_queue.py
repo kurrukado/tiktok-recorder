@@ -24,7 +24,7 @@ import supabase_sync
 from auto_h264 import validate_playable_video
 
 TARGET_QUEUE_SECONDS = 3000       # 50 phút (~1 tiếng chênh lệch 10p)
-MAX_IDLE_SECONDS = 3600           # 1 tiếng không live mới thì tự động xả queue
+MAX_IDLE_SECONDS = 600            # 10 phút offline thì tự động xả queue
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _USER_STAGING_LOCKS = {}
@@ -432,10 +432,11 @@ def package_and_publish_queue(user: str, access_token: str = None) -> dict:
                     final_output_file = concat_res
 
                 try:
-                    from auto_h264 import ensure_h264
+                    from auto_h264 import ensure_h264, upscale_to_1080p_if_needed
                     final_output_file = ensure_h264(final_output_file)
+                    final_output_file = upscale_to_1080p_if_needed(final_output_file)
                 except Exception as e_err:
-                    _log(f"[!] [@{user}] Lỗi kiểm tra/chuẩn hóa H.264 staging: {e_err}")
+                    _log(f"[!] [@{user}] Lỗi kiểm tra/chuẩn hóa H.264 hoặc upscale 1080p staging: {e_err}")
 
                 is_valid, v_reason, total_dur = validate_playable_video(final_output_file, min_duration=5.0, min_size_bytes=250000)
                 if not is_valid:
@@ -624,17 +625,18 @@ def check_and_flush_idle_queues(access_token: str = None) -> list:
                 last_live_time = manifest.get("last_live_time", now_ts)
                 idle_seconds = now_ts - last_live_time
 
-                # Nếu đã quá 24 tiếng không có phiên live mới
+                # Nếu đã quá 10 phút không có phiên live mới (streamer đã offline)
                 if idle_seconds >= MAX_IDLE_SECONDS:
                     # Kiểm tra lại xem streamer hiện có đang online không
                     is_live, _ = recorder_core.check_live_status(user)
                     if not is_live:
-                        _log(f"⏰ [@{user}] Đã quá {idle_seconds // 3600} tiếng không live mới. Tự động xả Staging Queue ({len(segments)} phân đoạn) lên Google Drive chính thức...")
+                        idle_min = max(1, idle_seconds // 60)
+                        _log(f"⏰ [@{user}] Đã quá {idle_min} phút không live mới (xác nhận offline). Tự động xả Staging Queue ({len(segments)} phân đoạn) lên Google Drive chính thức...")
                         res_pkg = package_and_publish_queue(user, access_token=access_token)
                         if res_pkg.get("ok"):
                             flushed_users.append(user)
                     else:
-                        _log(f"⏩ [@{user}] Quá 24h nhưng streamer ĐANG LIVE trở lại. Giữ lại Queue để tiếp tục tích lũy.")
+                        _log(f"⏩ [@{user}] Quá {MAX_IDLE_SECONDS // 60}p nhưng streamer ĐANG LIVE trở lại. Giữ lại Queue để tiếp tục tích lũy.")
             except Exception as folder_err:
                 # Một user lỗi không được làm hỏng cả vòng quét: nếu không,
                 # mọi hàng đợi phía sau bị kẹt vĩnh viễn cho tới lần chạy kế tiếp.

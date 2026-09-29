@@ -76,6 +76,8 @@ jobs:
 
       - name: Run TikTok 24-7 Recorder
         env:
+          TZ: 'Asia/Ho_Chi_Minh'
+          TZ_OFFSET_HOURS: '7'
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           GDRIVE_REFRESH_TOKEN: ${{ secrets.GDRIVE_REFRESH_TOKEN }}

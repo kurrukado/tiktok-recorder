@@ -8,7 +8,7 @@ import subprocess
 import random
 import threading
 import atexit
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, Any
 from curl_cffi import requests
 
@@ -46,8 +46,35 @@ DEFAULT_CONFIG = {
     "gdrive_enabled": False,
     "gdrive_remote": "gdrive",
     "gdrive_delete_local": False,
-    "auto_upscale_1080p": False
+    "auto_upscale_1080p": True,
+    "max_recording_seconds": 3600,
+    "offline_confirm_seconds": 600,
+    "timezone_offset_hours": 7
 }
+
+def get_app_timezone():
+    """
+    Trả về múi giờ chuẩn hoạt động (mặc định GMT+7 cho Việt Nam).
+    Có thể cấu hình qua config.json ('timezone_offset_hours': 7) hoặc biến môi trường TZ_OFFSET_HOURS.
+    """
+    try:
+        env_offset = os.environ.get("TZ_OFFSET_HOURS")
+        if env_offset is not None:
+            offset_hours = float(env_offset)
+        else:
+            cfg = load_config()
+            offset_hours = float(cfg.get("timezone_offset_hours", 7))
+        return timezone(timedelta(hours=offset_hours))
+    except Exception:
+        return timezone(timedelta(hours=7))
+
+def get_now_local() -> datetime:
+    """Trả về datetime hiện tại chuẩn múi giờ (GMT+7)."""
+    return datetime.now(get_app_timezone())
+
+def get_now_str(fmt="%Y-%m-%d_%H-%M-%S") -> str:
+    """Trả về chuỗi ngày giờ hiện tại chuẩn xác theo múi giờ (GMT+7)."""
+    return get_now_local().strftime(fmt)
 
 def load_config():
     if os.path.exists(CONFIG_FILE):
@@ -793,7 +820,11 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
     if not os.path.exists(FFMPEG_PATH) and not shutil.which(FFMPEG_PATH):
         raise FileNotFoundError(f"Không tìm thấy ffmpeg tại {FFMPEG_PATH}")
 
-    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if duration is None:
+        cfg = load_config()
+        duration = cfg.get("max_recording_seconds", 3600)
+
+    now_str = get_now_str("%Y-%m-%d_%H-%M-%S")
     if not output_filename:
         user_dir = os.path.join(BASE_DIR, target_user)
         os.makedirs(user_dir, exist_ok=True)

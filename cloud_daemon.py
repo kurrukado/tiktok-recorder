@@ -25,7 +25,7 @@ import notifier
 concat_mp4_segments = recorder_core.concat_mp4_segments
 
 def log(msg):
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = recorder_core.get_now_local().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{now}] {msg}", flush=True)
 
 def load_config():
@@ -246,7 +246,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 except Exception:
                     pass
 
-            now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            now_str = recorder_core.get_now_str("%Y-%m-%d_%H-%M-%S")
             part_suffix = f"_part{part_number}" if part_number > 1 else ""
             user_dir = os.path.join(BASE_DIR, user)
             os.makedirs(user_dir, exist_ok=True)
@@ -254,15 +254,16 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
 
             part_segments = []
             accumulated_seconds = 0.0
-            log(f"🔴 [@{user}] Bắt đầu tích lũy Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Mục tiêu gom đủ 1 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
+            offline_confirmed = False
+            log(f"🔴 [@{user}] Bắt đầu tích lũy Phần {part_number}{' (VIP Sub-Only Preview)' if is_sub_only else f' (Tối đa 1 tiếng: {MAX_CHUNK_SECONDS}s)'}...")
 
             # Vòng lặp thu thập các phân đoạn cho đến khi đủ 1 tiếng hoặc streamer tắt live
-            while accumulated_seconds < (300 if is_sub_only else (MAX_CHUNK_SECONDS - 60)):
+            while accumulated_seconds < (300 if is_sub_only else MAX_CHUNK_SECONDS):
                 if stop_event and stop_event.is_set():
                     break
 
                 target_duration = (300 - int(accumulated_seconds)) if is_sub_only else (MAX_CHUNK_SECONDS - int(accumulated_seconds))
-                if target_duration <= 30:
+                if target_duration <= 5:
                     break
 
                 stream_url = None
@@ -347,8 +348,8 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 if is_sub_only:
                     break
 
-                if accumulated_seconds >= MAX_CHUNK_SECONDS - 60:
-                    log(f"[⏱️ Đủ 1 tiếng] [@{user}] Phần {part_number} đã tích lũy đủ 1 tiếng ({accumulated_seconds:.1f}s)!")
+                if accumulated_seconds >= MAX_CHUNK_SECONDS - 5:
+                    log(f"[⏱️ Đạt tối đa 1:00:00] [@{user}] Phần {part_number} đã tích lũy đủ 1 tiếng ({accumulated_seconds:.1f}s)! Chuẩn bị chốt và bắt đầu phần mới...")
                     break
 
                 # Kiểm tra streamer còn live không để tiếp tục tích lũy vào Phần hiện tại
@@ -409,7 +410,13 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     time.sleep(5)
                     continue
 
-            # ponytail: ensure_h264 already called inside concat_mp4_segments
+            # Đảm bảo video chuẩn H.264 và upscale lên 1080p (giữ nguyên fps gốc)
+            try:
+                from auto_h264 import ensure_h264, upscale_to_1080p_if_needed
+                final_rec_file = ensure_h264(final_rec_file)
+                final_rec_file = upscale_to_1080p_if_needed(final_rec_file)
+            except Exception as up_err:
+                log(f"[!] [@{user}] Lỗi chuẩn hóa H.264 / upscale 1080p: {up_err}")
 
             # Đảm bảo file hợp lệ trước khi đẩy lên Cloud
             is_valid, v_reason, final_dur = validate_playable_video(final_rec_file, min_duration=5.0, min_size_bytes=250000)
@@ -427,11 +434,14 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 continue
 
             consecutive_failures = 0
-            log(f"[✓] [@{user}] Hoàn tất trọn vẹn Phần {part_number} ({final_dur:.1f}s): {os.path.basename(final_rec_file)}")
+            is_final_part = offline_confirmed or bool(stop_event and stop_event.is_set())
+            part_desc = "phần ghi sau cùng" if is_final_part else f"Phần {part_number}"
+            log(f"[✓] [@{user}] Hoàn tất trọn vẹn {part_desc} ({final_dur:.1f}s): {os.path.basename(final_rec_file)}")
 
             # Kiểm tra thời lượng video:
-            # Nếu video ngắn dưới 50 phút (< 3000s, chênh lệch 10p so với 60p): Đẩy vào Staging Queue trên Google Drive!
-            if final_dur < 3000:
+            # Nếu là phần ghi sau cùng (đã xác nhận offline 10p) hoặc đủ 1 tiếng (>= 3000s) -> Xuất bản trực tiếp lên Drive chính và Supabase!
+            # Chỉ đẩy vào Staging Queue nếu chưa xác nhận offline và video < 50p (ví dụ preview VIP dở dang)
+            if not is_final_part and final_dur < 3000:
                 log(f"📦 [@{user}] Video Phần {part_number} ngắn hơn 50 phút ({final_dur/60:.1f}p < 50p). Chuyển vào Cloud Staging Queue trên Google Drive...")
                 try:
                     import staging_queue
@@ -448,7 +458,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 except Exception as sq_err:
                     log(f"[!] [@{user}] Lỗi khi chuyển vào Staging Queue: {sq_err}")
             else:
-                # Video đã đạt chuẩn >= 50 phút: Xuất bản trực tiếp lên Drive chính và Supabase
+                # Video đã đạt chuẩn 1 tiếng HOẶC là phần ghi sau cùng sau 10p xác nhận offline: Xuất bản trực tiếp lên Drive chính và Supabase
                 # 1. Trích xuất thumbnail từ 50% thời lượng của đoạn này
                 thumb_file = None
                 try:
@@ -538,6 +548,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 log(f"⏹️ [@{user}] Nhận lệnh dừng phiên. Không ghi tiếp phần mới.")
                 break
 
+
             # 4. Kiểm tra xem streamer còn live hay không để ghi tiếp Phần tiếp theo
             if is_sub_only:
                 if part_number > max_vip_attempts:
@@ -556,7 +567,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     log(f"🏁 [@{user}] Streamer đã xuống live sau {part_number - 1} phần preview.")
                     break
             else:
-                log(f"🔍 [@{user}] Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number} (1 tiếng tiếp theo)...")
+                log(f"🔍 [@{user}] Phần {part_number - 1} (1 tiếng) đã chốt và lưu trữ thành công. Kiểm tra xem streamer còn live để ghi tiếp Phần {part_number} (tối đa 1 tiếng tiếp theo)...")
                 time.sleep(3)
                 curr_det = recorder_core.check_live_details(user)
                 if not curr_det.get("is_live"):
@@ -570,11 +581,43 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                     if curr_det.get("is_sub_only"):
                         is_sub_only = True
                         log(f"🔒 [@{user}] Streamer đã chuyển sang chế độ VIP Sub-Only! Kích hoạt Quick Watchdog và Guest Rotation...")
-                    log(f"⏩ [@{user}] Streamer VẪN ĐANG LIVE! Tiếp tục ghi hình nối tiếp Phần {part_number} ngay lập tức...")
+                    log(f"⏩ [@{user}] Streamer VẪN ĐANG LIVE! Bắt đầu đợt ghi mới: Phần {part_number} (tối đa 1 tiếng tiếp theo)...")
                     continue
                 else:
-                    log(f"🏁 [@{user}] Phiên livestream đã kết thúc hoàn toàn sau {part_number - 1} phần.")
-                    break
+                    # Streamer tạm ngắt ngay khi kết thúc phần 1 tiếng: chờ 10 phút xác nhận offline trước khi kết thúc
+                    cfg_offline_wait = recorder_core.load_config().get("offline_confirm_seconds", 600)
+                    log(f"⏳ [@{user}] Chưa phát hiện tín hiệu live nối tiếp. Bắt đầu chờ {cfg_offline_wait//60} phút ({cfg_offline_wait}s) xác nhận offline...")
+                    next_offline_confirmed = False
+                    w_start = time.time()
+                    offline_checks = max(1, int(cfg_offline_wait / 15))
+                    for _ in range(offline_checks):
+                        if stop_event and stop_event.is_set():
+                            break
+                        try:
+                            gdrive_manager.set_user_recording_status_drive(user, True)
+                        except Exception:
+                            pass
+                        time.sleep(15)
+                        recheck = recorder_core.check_live_details(user)
+                        if recheck.get("is_live"):
+                            log(f"🔴 [@{user}] Streamer ĐÃ LIVE TRỞ LẠI! Bắt đầu đợt ghi mới: Phần {part_number}...")
+                            if recheck.get("room_id"):
+                                current_room_id = recheck.get("room_id")
+                            break
+                    else:
+                        next_offline_confirmed = True
+
+                    if next_offline_confirmed or (stop_event and stop_event.is_set()):
+                        log(f"🏁 [@{user}] Đã xác nhận streamer offline đủ {cfg_offline_wait//60} phút. Kiểm tra và xuất bản phần ghi sau cùng (nếu còn trong Staging Queue)...")
+                        try:
+                            import staging_queue
+                            tok = gdrive_manager.get_access_token()
+                            sq_res = staging_queue.package_and_publish_queue(user, access_token=tok)
+                            if sq_res.get("ok"):
+                                log(f"✨ [@{user}] Đã xuất bản phần ghi sau cùng từ Staging Queue: {sq_res.get('filename')}")
+                        except Exception as sq_err:
+                            log(f"[!] [@{user}] Lỗi xả Staging Queue sau offline: {sq_err}")
+                        break
 
     except Exception as err:
         log(f"[!] Lỗi trong luồng ghi hình của @{user}: {err}")
