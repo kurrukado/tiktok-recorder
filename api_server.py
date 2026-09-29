@@ -815,7 +815,17 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
     last_heartbeat_at = 0.0
 
     my_task_entry = None
+    rec_lock_cm = None
     try:
+        from config_lock import streamer_recording_lock
+        rec_lock_cm = streamer_recording_lock(user)
+        got_lock = rec_lock_cm.__enter__()
+        if not got_lock:
+            rec_lock_cm.__exit__(None, None, None)
+            rec_lock_cm = None
+            print(f"[⚠️] [@{user}] Streamer đang được ghi hình bởi tiến trình khác trên máy chủ. Bỏ qua.")
+            return
+
         with RECORDING_LOCK:
             if user in ACTIVE_RECORDING_TASKS and isinstance(ACTIVE_RECORDING_TASKS[user], dict):
                 ACTIVE_RECORDING_TASKS[user]["thread"] = threading.current_thread()
@@ -883,16 +893,16 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 if target_duration <= 30:
                     break
 
-                stream_url = None
+                stream_candidates = []
                 for s_att in range(3):
                     if is_sub_only:
                         guest_session = None
                         try:
                             guest_session = recorder_core.generate_guest_session()
-                            stream_url = recorder_core.get_live_stream_url(room_id, user=user, session=guest_session)
+                            stream_candidates = recorder_core.get_stream_candidates(room_id, user=user, session=guest_session)
                         except Exception as gs_err:
                             print(f"[!] [API Server] Lỗi xoay Guest Session cho @{user}: {gs_err}")
-                            stream_url = None
+                            stream_candidates = []
                         finally:
                             if guest_session:
                                 try:
@@ -900,36 +910,57 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                                 except Exception:
                                     pass
                     else:
-                        stream_url = recorder_core.get_live_stream_url(room_id, user=user)
-                    if stream_url:
+                        stream_candidates = recorder_core.get_stream_candidates(room_id, user=user)
+                    if stream_candidates:
                         break
                     time.sleep(2.5)
 
-                if not stream_url:
+                if not stream_candidates:
                     st_live, new_rid = recorder_core.check_live_status(user)
                     if st_live and new_rid:
                         room_id = new_rid
-                        stream_url = recorder_core.get_live_stream_url(room_id, user=user)
+                        stream_candidates = recorder_core.get_stream_candidates(room_id, user=user)
 
-                if not stream_url:
+                if not stream_candidates:
                     print(f"[!] [@{user}] Không lấy được link stream sau các lần thử. Kết thúc tích lũy Phần {part_number}.")
                     consecutive_failures += 1
                     time.sleep(5)
                     break
 
                 seg_name = os.path.join(user_dir, f"{user}_{now_str}_p{part_number}_seg{len(part_segments)+1}.mp4")
-                rec_res = recorder_core.record_stream_ffmpeg(
-                    stream_url,
-                    output_filename=seg_name,
-                    target_user=user,
-                    duration=target_duration,
-                    stop_event=stop_event,
-                    auto_sync_gdrive=False,
-                    is_sub_only=is_sub_only
-                )
-
+                rec_res = None
                 from auto_h264 import validate_playable_video
-                is_valid, reason, dur = validate_playable_video(rec_res, min_duration=5.0, min_size_bytes=250000)
+                is_valid = False
+                reason = "Không có kết quả thu"
+                dur = 0.0
+
+                # Tự động fallback qua các luồng (HLS -> FLV HD...) để tránh lỗi HTTP 403 Forbidden
+                for cand_idx, stream_url in enumerate(stream_candidates[:4]):
+                    try:
+                        rec_res = recorder_core.record_stream_ffmpeg(
+                            stream_url,
+                            output_filename=seg_name,
+                            target_user=user,
+                            duration=target_duration,
+                            stop_event=stop_event,
+                            auto_sync_gdrive=False,
+                            is_sub_only=is_sub_only
+                        )
+                    except Exception as rec_err:
+                        print(f"[!] [@{user}] Lỗi khi ghi hình đoạn mới (luồng #{cand_idx+1}): {rec_err}")
+                        rec_res = None
+
+                    if rec_res and os.path.exists(rec_res):
+                        is_valid, reason, dur = validate_playable_video(rec_res, min_duration=5.0, min_size_bytes=250000)
+                        if is_valid:
+                            break
+                        else:
+                            try:
+                                os.remove(rec_res)
+                            except Exception:
+                                pass
+                            if len(stream_candidates) > cand_idx + 1:
+                                print(f"[⚠️] [@{user}] Luồng #{cand_idx+1} không đạt chuẩn ({reason}). Fallback sang luồng dự phòng #{cand_idx+2}...")
 
                 if is_valid:
                     consecutive_failures = 0
@@ -1166,7 +1197,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 if consecutive_offline_checks < 3:
                     print(f"[⏳] [@{user}] Chưa xác nhận streamer xuống live (lần {consecutive_offline_checks}/3). Kiểm tra lại...")
                     continue
-                cfg_offline_wait = load_config().get("offline_confirm_seconds", 600)
+                cfg_offline_wait = load_config().get("offline_confirm_seconds", 90)
                 print(f"[⏳] [@{user}] Xác nhận {consecutive_offline_checks} lần streamer ngắt live. Chờ xác nhận offline {cfg_offline_wait//60} phút ({cfg_offline_wait}s)...")
                 offline_checks = max(1, int(cfg_offline_wait / 15))
                 streamer_back = False
@@ -1239,6 +1270,12 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                     print(f"[!] [@{user}] Staging Queue khi kết thúc live: {pkg_res.get('error', '')}")
             except Exception as flush_err:
                 print(f"[!] [@{user}] Lỗi flush Staging Queue: {flush_err}")
+
+        if rec_lock_cm:
+            try:
+                rec_lock_cm.__exit__(None, None, None)
+            except Exception:
+                pass
 
         gc.collect()
 

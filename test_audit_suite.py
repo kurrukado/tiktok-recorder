@@ -1716,6 +1716,52 @@ class TestBatch5ConfigLockAndSupabaseGuards(unittest.TestCase):
             self.assertEqual(mock_sync.call_args[1].get("drive_file_id"), "drive_file_id_ok")
 
 
+class TestLatentBugsAndLockGuards(unittest.TestCase):
+    def test_streamer_recording_lock_mutual_exclusion(self):
+        """
+        Unit Test: Verify streamer_recording_lock guarantees mutual exclusion
+        between two workers trying to record the same streamer.
+        """
+        import config_lock
+        user = "mutual_exclude_streamer"
+
+        with config_lock.streamer_recording_lock(user) as locked1:
+            self.assertTrue(locked1, "First worker must acquire lock")
+            with config_lock.streamer_recording_lock(user) as locked2:
+                self.assertFalse(locked2, "Second worker must NOT acquire lock concurrently")
+
+        # After releasing, a subsequent worker can acquire it again
+        with config_lock.streamer_recording_lock(user) as locked3:
+            self.assertTrue(locked3, "New worker must acquire lock after release")
+
+    def test_flv_and_hls_regex_without_query_params(self):
+        """
+        Unit Test: Verify recorder_core parses FLV and HLS URLs with and without query parameters.
+        """
+        import recorder_core
+        raw_html = '''
+        <html>
+        <script>
+        var stream1 = "https://pull-flv.tiktokcdn.com/stage/stream-1080p.flv";
+        var stream2 = "https://pull-hls.tiktokcdn.com/stage/stream-1080p.m3u8";
+        var stream3 = "https://pull-flv.tiktokcdn.com/stage/stream-720p.flv?auth=xyz";
+        </script>
+        </html>
+        '''
+        with patch("curl_cffi.requests.Session") as mock_sess_cls:
+            mock_sess = MagicMock()
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.text = raw_html
+            mock_sess.get.return_value = mock_resp
+            mock_sess_cls.return_value = mock_sess
+
+            with patch("curl_cffi.requests.get", side_effect=Exception("skip native")):
+                urls = recorder_core.get_stream_urls("9999", user="test_regex_user", session=None)
+                self.assertTrue(any(".flv" in u for u in urls))
+                self.assertTrue(any("stream-1080p.flv" in u for u in urls))
+
+
 if __name__ == "__main__":
     unittest.main()
 

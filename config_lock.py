@@ -117,3 +117,66 @@ def config_transaction(timeout=LOCK_TIMEOUT_SECONDS):
                     pass
         if thread_ok:
             _THREAD_LOCK.release()
+
+
+_LOCKS_DIR = os.path.join(BASE_DIR, ".locks")
+
+@contextlib.contextmanager
+def streamer_recording_lock(user: str):
+    """
+    Khóa file liên tiến trình độc quyền cho từng streamer.
+    Ngăn chặn tuyệt đối tình trạng api_server và cloud_daemon (hoặc 2 worker)
+    cùng lúc ghi hình 1 streamer trên cùng một máy chủ.
+    Trả về True nếu chiếm được khóa, False nếu streamer đã có tiến trình khác đang quay.
+    """
+    user_clean = os.path.basename(str(user or "").strip().replace("@", "").lower())
+    if not user_clean or user_clean in (".", ".."):
+        yield False
+        return
+
+    try:
+        os.makedirs(_LOCKS_DIR, exist_ok=True)
+    except Exception:
+        pass
+
+    lock_file = os.path.join(_LOCKS_DIR, f"{user_clean}.recording.lock")
+    fd = None
+    locked = False
+    try:
+        fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o666)
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                locked = True
+            except OSError:
+                locked = False
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                locked = True
+            except OSError:
+                locked = False
+        yield locked
+    except Exception:
+        yield False
+    finally:
+        if locked and fd is not None:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_UN | fcntl.LOCK_NB)
+            except OSError:
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+

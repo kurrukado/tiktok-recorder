@@ -33,6 +33,13 @@ _USER_LOCKS_MUTEX = threading.Lock()
 def _get_user_staging_lock(user: str) -> threading.RLock:
     user = (user or "").strip().replace("@", "").lower()
     with _USER_LOCKS_MUTEX:
+        if len(_USER_STAGING_LOCKS) > 100:
+            for old_u in list(_USER_STAGING_LOCKS.keys()):
+                if old_u != user:
+                    l = _USER_STAGING_LOCKS[old_u]
+                    if l.acquire(blocking=False):
+                        l.release()
+                        _USER_STAGING_LOCKS.pop(old_u, None)
         if user not in _USER_STAGING_LOCKS:
             _USER_STAGING_LOCKS[user] = threading.RLock()
         return _USER_STAGING_LOCKS[user]

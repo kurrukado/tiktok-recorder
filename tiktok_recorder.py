@@ -23,11 +23,6 @@ from recorder_core import (
     get_now_str,
     BASE_DIR,
 )
-try:
-    from download_archives import download_all_archives
-except ImportError:
-    download_all_archives = None
-
 
 BANNER = r"""
   ╔═══════════════════════════════════════════════════════════════╗
@@ -42,7 +37,7 @@ def print_banner():
 def run_auto_mode(target_user, interval):
     cfg = load_config()
     max_chunk = cfg.get("max_recording_seconds", 3600)
-    offline_wait = cfg.get("offline_confirm_seconds", 600)
+    offline_wait = cfg.get("offline_confirm_seconds", 90)
     user_dir = os.path.join(BASE_DIR, target_user)
     os.makedirs(user_dir, exist_ok=True)
     print(f"\n[*] BẮT ĐẦU CHẾ ĐỘ TỰ ĐỘNG THEO DÕI: @{target_user}")
@@ -50,7 +45,7 @@ def run_auto_mode(target_user, interval):
     print(f"[*] Video quay được sẽ tự động lưu vào: {user_dir}")
     print(f"[*] Định dạng: 1080p Full HD (chuẩn H.264 AVC, fps gốc từ live).")
     print(f"[*] Giới hạn thời lượng: tối đa 1:00:00/bản ghi (tự động sang đợt mới nếu quá 1 tiếng).")
-    print(f"[*] Cơ chế kết thúc: xác nhận streamer offline 10 phút trước khi gửi phần ghi sau cùng.")
+    print(f"[*] Cơ chế kết thúc: xác nhận streamer offline 1.5 phút (90s) trước khi gửi phần ghi sau cùng.")
     print(f"[*] Nhấn [Ctrl + C] bất kỳ lúc nào để dừng chương trình.\n")
 
     consecutive_errors = 0
@@ -327,12 +322,7 @@ def main_menu():
             set_cookie_interactive()
             input("\nNhấn Enter để quay lại menu chính...")
         elif choice == "5":
-            if download_all_archives:
-                ans = input(f"\nBạn muốn tải bao nhiêu video gần nhất của @{target_user}? (Ví dụ: 5, 10, hoặc gõ 'all' để tải tất cả): ").strip()
-                limit = None if ans.lower() in ["all", "tat ca", "0"] else (int(ans) if ans.isdigit() else 5)
-                download_all_archives(username=target_user, limit=limit, output_dir=user_dir)
-            else:
-                print("\n[!] Tính năng tải video lưu trữ yêu cầu module download_archives.")
+            print("\n[!] Tính năng tải video lưu trữ đã chuyển sang giao diện Web.")
             input("\nNhấn Enter để quay lại menu chính...")
         elif choice == "6":
             from auto_h264 import convert_all_videos_in_folder

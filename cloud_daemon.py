@@ -177,37 +177,9 @@ _USER_START_COOLDOWN = {}       # {user: last_start_ts}
 
 def _fetch_stream_candidates_for_worker(room_id, user=None, session=None):
     """
-    Lấy danh sách các URL stream ứng viên.
-    Tự động tương thích với mock unittest (khi get_live_stream_url được patch)
-    và trong môi trường thực tế sẽ lấy toàn bộ danh sách candidate (HLS + FLV fallback).
+    Lấy danh sách các URL stream ứng viên (phân cấp HLS + FLV fallback).
     """
-    fn = getattr(recorder_core, "get_live_stream_url", None)
-    mock_detected = hasattr(fn, "assert_called") or hasattr(fn, "return_value")
-    if mock_detected:
-        try:
-            val = recorder_core.get_live_stream_url(room_id, user=user, session=session)
-            if isinstance(val, list):
-                return val
-            if isinstance(val, str) and val:
-                return [val]
-        except Exception:
-            return []
-
-    candidates = []
-    try:
-        candidates = recorder_core.get_live_stream_urls(room_id, user=user, session=session)
-    except Exception:
-        pass
-    if not candidates:
-        try:
-            single = recorder_core.get_live_stream_url(room_id, user=user, session=session)
-            if isinstance(single, list):
-                candidates = single
-            elif isinstance(single, str) and single:
-                candidates = [single]
-        except Exception:
-            pass
-    return candidates or []
+    return recorder_core.get_stream_candidates(room_id, user=user, session=session)
 
 
 def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_event=None):
@@ -218,6 +190,16 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
     - Nếu streamer vẫn đang live: tự động nối tiếp ghi Phần tiếp theo (part 2, part 3...) mà không ngắt quãng bot.
     - Cập nhật trạng thái đang quay lên Google Drive theo thời gian thực để API hiển thị.
     """
+    rec_lock_cm = None
+    from config_lock import streamer_recording_lock
+    rec_lock_cm = streamer_recording_lock(user)
+    got_lock = rec_lock_cm.__enter__()
+    if not got_lock:
+        rec_lock_cm.__exit__(None, None, None)
+        rec_lock_cm = None
+        log(f"⚠️ [@{user}] Streamer đang được ghi hình bởi tiến trình khác trên hệ thống. Bỏ qua luồng này.")
+        return
+
     log(f"🎬 [Luồng mới] Bắt đầu phiên ghi hình cho @{user} (Hỗ trợ tối đa {MAX_CONCURRENT_RECORDERS} streamer cùng lúc)...")
     global _CACHED_DRIVE_USERS
 
@@ -720,6 +702,12 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
             except Exception:
                 pass
 
+        if rec_lock_cm:
+            try:
+                rec_lock_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+
         gc.collect()
         log(f"⏹️ [@{user}] Đã đóng luồng ghi hình.")
 
@@ -823,6 +811,12 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
         session_count += 1
         if session_count % 15 == 1:
             log(f"[*] Đang theo dõi {len(users)} streamers. Đang ghi hình song song ({len(active_now)}/{MAX_CONCURRENT_RECORDERS}): {active_now}")
+            # Dọn dẹp _USER_START_COOLDOWN định kỳ để tránh rò rỉ RAM
+            now_ts_cd = time.time()
+            for u_cd in list(_USER_START_COOLDOWN.keys()):
+                if now_ts_cd - _USER_START_COOLDOWN[u_cd] > USER_START_COOLDOWN_SECONDS * 2:
+                    _USER_START_COOLDOWN.pop(u_cd, None)
+
             # Định kỳ kiểm tra và tự động xả các video trong Staging Queue đã quá 24h không live mới
             try:
                 import staging_queue

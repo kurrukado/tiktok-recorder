@@ -2,6 +2,8 @@
 config.json
 config.json.tmp
 config.lock
+*.lock
+.locks/
 cookies.json
 .env
 *.pem
