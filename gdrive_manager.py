@@ -692,13 +692,13 @@ def load_active_recordings_from_drive(access_token=None, as_details=False):
             headers = {"Authorization": f"Bearer {access_token}"}
             q = f"name = 'active_recordings.json' and '{root_id}' in parents and trashed = false"
             url = f"https://www.googleapis.com/drive/v3/files?q={requests.utils.quote(q)}&fields=files(id,name)"
-            with requests.get(url, headers=headers, timeout=8) as res:
+            with requests.get(url, headers=headers, timeout=12) as res:
                 if res.status_code == 200:
                     files = res.json().get("files", [])
                     if files:
                         file_id = files[0]["id"]
                         down_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media"
-                        with requests.get(down_url, headers=headers, timeout=8) as d_res:
+                        with requests.get(down_url, headers=headers, timeout=12) as d_res:
                             if d_res.status_code == 200:
                                 raw_data = d_res.json()
                                 if not isinstance(raw_data, list):
@@ -746,27 +746,44 @@ def set_users_recording_status_drive(users: list, is_recording: bool = True, acc
             file_id = None
             current_raw = []
             read_failed = False
-            with requests.get(url, headers=headers, timeout=8) as res:
-                if res.status_code != 200:
-                    print(f"[!] Không tra được active_recordings.json trên Drive (HTTP {res.status_code}). KHÔNG ghi để tránh mất dữ liệu streamer khác.")
-                    return False
-                files = res.json().get("files", [])
-                if files:
-                    file_id = files[0]["id"]
-                    try:
-                        with requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=8) as d_res:
-                            if d_res.status_code == 200:
-                                current_raw = d_res.json()
-                                if not isinstance(current_raw, list):
+
+            # Đọc danh sách đang ghi hiện tại trên Drive (hỗ trợ thử lại 1 lần nếu mạng trễ)
+            for attempt in range(2):
+                try:
+                    with requests.get(url, headers=headers, timeout=12) as res:
+                        if res.status_code != 200:
+                            if attempt == 1:
+                                print(f"\n[!] Không tra được active_recordings.json trên Drive (HTTP {res.status_code}). KHÔNG ghi để tránh mất dữ liệu streamer khác.")
+                                return False
+                            time.sleep(1)
+                            continue
+                        files = res.json().get("files", [])
+                        if files:
+                            file_id = files[0]["id"]
+                            with requests.get(f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media", headers=headers, timeout=12) as d_res:
+                                if d_res.status_code == 200:
+                                    current_raw = d_res.json()
+                                    if not isinstance(current_raw, list):
+                                        read_failed = True
+                                    else:
+                                        read_failed = False
+                                else:
                                     read_failed = True
-                            else:
-                                read_failed = True
-                    except Exception as read_err:
-                        print(f"[!] Không đọc được nội dung active_recordings.json ({read_err}).")
-                        read_failed = True
+                        else:
+                            file_id = None
+                            current_raw = []
+                            read_failed = False
+                    if not read_failed:
+                        break
+                except Exception as read_err:
+                    read_failed = True
+                    if attempt < 1:
+                        time.sleep(1)
+                    else:
+                        print(f"\n[!] Không đọc được nội dung active_recordings.json ({read_err}).")
 
             if read_failed:
-                print("[!] Đọc active_recordings.json thất bại. Bỏ qua lần cập nhật này để không xóa heartbeat của streamer khác.")
+                print("\n[!] Đọc active_recordings.json thất bại. Bỏ qua lần cập nhật này để không xóa heartbeat của streamer khác.")
                 return False
 
             now_ts = int(time.time())

@@ -755,4 +755,15 @@ Còn lại / cần quyết định:
 
 ---
 
-*Tài liệu tạo từ việc đọc mã nguồn tại `D:\tiktok-recorder` và khảo sát `D:\web-truyen`.*
+### 12.6 Khắc phục Read timed out (timeout=8) khi đồng bộ active_recordings.json trên Drive
+
+* **Hiện tượng**: Log hiển thị `[!] Không đọc được nội dung active_recordings.json (HTTPSConnectionPool... Read timed out. (read timeout=8))` dính vào dòng tiến độ ghi hình ffmpeg.
+* **Bản chất**: Đây là cơ chế bảo vệ an toàn (Fail-safe): khi Drive API bị trễ mạng ngắt quãng, tool từ chối ghi đè danh sách trống để không làm mất trạng thái recording của các streamer khác. Video đang quay hoàn toàn KHÔNG bị ảnh hưởng.
+* **Đã cải tiến**:
+  - Nâng timeout đọc Drive API từ 8s lên 12s trong cả `load_active_recordings_from_drive` và `set_users_recording_status_drive`.
+  - Bổ sung cơ chế tự động thử lại (Retry loop 2 lần kèm backoff 1s) trước khi bỏ qua chu kỳ heartbeat.
+  - Thêm ký tự xuống dòng `\n` trước các thông báo log của Drive manager để không bị ghi đè/nối đuôi vào dòng `\r` tiến độ thời gian thực của FFmpeg.
+
+---
+
+*Tài liệu tạo từ việc đọc mã nguồn tại `D:\\tiktok-recorder` và khảo sát `D:\\web-truyen`.*
