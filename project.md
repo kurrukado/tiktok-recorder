@@ -446,19 +446,22 @@ URL phát: `https://drive.usercontent.google.com/download?id={drive_file_id}&exp
 
 ## 9. GITHUB ACTIONS — CHẠY 24/7 MIỄN PHÍ
 
-### `recorder.yml` — "TikTok 24-7 Auto Recorder" (142 dòng)
+### `recorder.yml` — "TikTok 24-7 Auto Recorder" (146 dòng)
 * Kích hoạt: `workflow_dispatch` + `cron: '*/50 * * * *'`.
 * `concurrency: tiktok-recorder-runner` với `cancel-in-progress: false` (không đứt phiên).
+* Khai báo môi trường `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'` chạy Node 24 chuẩn GitHub Actions.
 * Job `run-recorder`, `ubuntu-latest`, **`timeout-minutes: 65`**.
-* Bước chính: checkout → Python 3.11 → `apt install ffmpeg` → `pip install -r requirements.txt`
-  → ghi secrets vào `config.json`/`cookies.json` (`:39-75`) →
+* Bước chính: checkout (`actions/checkout@v7` native Node 24) → Python 3.11 (`actions/setup-python@v7` native Node 24) → `apt install ffmpeg` → `pip install -r requirements.txt`
+  → ghi secrets vào `config.json`/`cookies.json` (`:42-78`) →
   `python -u cloud_daemon.py --duration-minutes 46 --interval 20`
-  với `TZ=Asia/Ho_Chi_Minh`, `TZ_OFFSET_HOURS=7`, `SUPABASE_*`, `TELEGRAM_*` (`:77-87`) →
+  với `TZ=Asia/Ho_Chi_Minh`, `TZ_OFFSET_HOURS=7`, `SUPABASE_*`, `TELEGRAM_*` (`:80-90`) →
   **bước cuối `if: always()`** POST `actions/workflows/recorder.yml/dispatches` bằng
   `WORKFLOW_PAT || GH_PAT || GITHUB_TOKEN` để kích hoạt phiên kế tiếp **ngay lập tức**
   (không PAT → fallback cron 50 phút).
 
-### `repair-watchdog.yml` — "Kuru Record Self-Healing Watchdog" (64 dòng)
+### `repair-watchdog.yml` — "Kuru Record Self-Healing Watchdog" (68 dòng)
+* `concurrency: kuru-record-watchdog`, `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'`
+* `actions/checkout@v7` + `actions/setup-python@v7` (Node 24 native)
 * `cron: '0 1,5,9,13,17,21 * * *'` (6 lần/ngày) → timeout 20 phút →
   `python repair_cloud_videos_engine.py --today`.
 
@@ -737,6 +740,18 @@ Còn lại / cần quyết định:
      * Định tuyến Cloudflare Tunnel `https://record.kurumieverything.io.vn` trỏ trực tiếp về `127.0.0.1:8000` (được cấu hình trong `~/.cloudflared/config.yml`).
      * Cập nhật Next.js proxy `route.js` trong `web-truyen` thêm các candidate ưu tiên: Tunnel `record.kurumieverything.io.vn` và `http://127.0.0.1:8000` trước khi fallback sang Render.
      * Cập nhật `D:\web-truyen\start.bat` và `start-all-services.mjs` tự động bật kèm `python d:\tiktok-recorder\api_server.py` trên Port 8000.
+
+---
+### 12.5 Nâng cấp GitHub Actions sang Node.js 24 (Khử sạch cảnh báo Deprecation Node 20)
+
+* **Hiện tượng**: GitHub Actions runner cảnh báo `Warning: Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4, actions/setup-python@v5`.
+* **Cơ chế**: Theo [GitHub Changelog 2025-09-19](https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/), Node 20 chạm mốc End-of-Life. GitHub Runner hỗ trợ Node 24 và khuyến nghị người dùng nâng cấp lên action bản mới hoặc kích hoạt cờ môi trường `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24=true`.
+* **Đã thực hiện**:
+  1. Nâng cấp toàn diện workflow `.github/workflows/recorder.yml` và `.github/workflows/repair-watchdog.yml`:
+     - Chuyển `actions/checkout@v4` → `actions/checkout@v7` (chạy gốc `node24`).
+     - Chuyển `actions/setup-python@v5` → `actions/setup-python@v7` (chạy gốc `node24`).
+     - Khai báo biến môi trường cấp workflow: `FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'`.
+  2. Kết quả: Khử sạch 100% cảnh báo Deprecation của GitHub Runner, tối ưu thời gian khởi tạo và tương thích chuẩn mới nhất của GitHub.
 
 ---
 
