@@ -790,4 +790,27 @@ Còn lại / cần quyết định:
 
 ---
 
+### 12.8 Đồng bộ toàn diện sang web-truyen/kuruRecord và Kiểm định Hệ thống (System Health Check)
+
+* **Mục tiêu**: Đảm bảo cả hai repository (`tiktok-recorder` độc lập và submodule tích hợp trong `web-truyen/kuruRecord`) đều đồng nhất 100% phiên bản, triệt tiêu độ lệch mã nguồn (code drift).
+* **Nội dung thực hiện**:
+  1. **Đồng bộ mã nguồn cốt lõi**:
+     - Sao chép 13 file động cơ từ `D:\tiktok-recorder` sang `D:\web-truyen\kuruRecord`: `cloud_daemon.py`, `recorder_core.py`, `auto_h264.py`, `staging_queue.py`, `supabase_sync.py`, `gdrive_manager.py`, `gdrive_auth.py`, `api_server.py`, `repair_cloud_videos_engine.py`, `notifier.py`, `config_lock.py`, `test_audit_suite.py`, `test_challenger_concurrency.py`.
+     - Giữ nguyên các file cấu hình và môi trường cục bộ (`config.json`, `cookies.json`, `.env`).
+  2. **Dọn dẹp kiểm soát phiên bản Git**:
+     - Cập nhật `.gitignore` của `web-truyen` chặn thư mục `.locks/` và `*.lock` do cơ chế khóa tiến trình `config_lock` sinh ra.
+     - Xóa bỏ các lock file tạm bị track nhầm trên git (`kuruRecord/.locks/*`, `config.lock`).
+  3. **Kiểm định chất lượng 2 tầng**:
+     - **Tầng 1 (kuruRecord Test Suite)**: 104/104 tests vượt qua (`test_audit_suite.py`: 78/78 OK, `test_challenger_concurrency.py`: 26/26 OK).
+     - **Tầng 2 (Next.js Frontend Build)**: Chạy `npm run build` thành công trong 10.2s với Turbopack, toàn bộ 37 routes tĩnh và động hợp lệ.
+  4. **Kiểm tra End-to-End Trực tiếp**:
+     - Local API (`http://127.0.0.1:8000/api/users`): Phản hồi HTTP 200 OK (5.46s, 59 monitored users).
+     - Cloudflare Tunnel (`https://record.kurumieverything.io.vn/api/users`): Phản hồi HTTP 200 OK (5.58s), tích hợp xuyên suốt với web frontend.
+  5. **Triển khai GitHub**:
+     - Đã commit và push đồng bộ lên cả 2 repository:
+       - `kurrukado/tiktok-recorder` (nhánh `main`)
+       - `kurrukado/web-truyen` (nhánh `main`)
+
+---
+
 *Tài liệu tạo từ việc đọc mã nguồn tại `D:\\tiktok-recorder` và khảo sát `D:\\web-truyen`.*
