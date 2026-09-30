@@ -225,7 +225,7 @@ Chi tiết các chặng quan trọng:
 
 ## 5. GIẢI THÍCH TỪNG MODULE
 
-### 5.1 `cloud_daemon.py` (921 dòng) — bộ điều phối
+### 5.1 `cloud_daemon.py` (922 dòng) — bộ điều phối
 * `load_monitored_users():58` — hợp nhất Drive + Supabase + config, cache 15s (cả 2 nguồn
   trả rỗng **hợp lệ** thì dùng rỗng, không rơi vào nhánh "giữ cache cũ").
 * `discover_new_streamers():133` — quét HTML trang live bằng `curl_cffi` (impersonate chrome136),
@@ -241,7 +241,7 @@ Chi tiết các chặng quan trọng:
 * Worker upload trực tiếp mọi segment lên Drive + Supabase (không qua staging queue).
   Supabase row chỉ tạo khi đã có `drive_file_id`.
 
-### 5.2 `recorder_core.py` (1182 dòng) — lõi trích xuất
+### 5.2 `recorder_core.py` (1201 dòng) — lõi trích xuất
 * `generate_guest_session():146`, `load_cookies():119` (cookie `sessionid_ss` cho live 18+/VIP).
 * `check_live_details():182`, `check_live_status():412`, `check_user_live():423`.
 * `get_stream_urls():622`, `parse_sdk_stream_data():538` (giải mã JSON SDK của TikTok).
@@ -310,7 +310,7 @@ Sau khi xả hết hàng đợi cũ, xoá khối này thì `staging_queue.py` m�
   (tránh link chết), file local được giữ lại.
 * `delete_streamer_data_supabase():315` — xóa recordings + streamer + thumbnail Storage.
 
-### 5.7 `api_server.py` (1975 dòng) — REST API cho website (xem mục 6)
+### 5.7 `api_server.py` (1978 dòng) — REST API cho website (xem mục 6)
 * CORS `allow_origins=["*"]` (`:91`) + **middleware PIN opt-in** cho POST/PUT/PATCH/DELETE
   (`:135`, xem mục 12) — GET luôn công khai.
 * Live cache 60s (`LIVE_CACHE_TTL`, `:227`), recordings cache 60s (`_RECORDINGS_CACHE`, `:52`).

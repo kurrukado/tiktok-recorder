@@ -620,6 +620,8 @@ def add_user(req: AddUserRequest, bg_tasks: BackgroundTasks):
     # TỰ ĐỘNG KÍCH HOẠT GHI HÌNH NGAY NẾU STREAMER ĐANG LIVE
     recording_started = False
     try:
+        with LIVE_CACHE_LOCK:
+            LIVE_CACHE.pop(user, None)
         live_details = get_user_live_details_cached(user)
         if live_details.get("is_live"):
             has_ffmpeg = bool(shutil.which("ffmpeg") or (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)))

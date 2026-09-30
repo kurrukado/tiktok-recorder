@@ -117,18 +117,36 @@ def save_config_fields(updates):
         save_config(cfg)
 
 def load_cookies():
-    if os.path.exists(COOKIES_FILE):
-        try:
-            with open(COOKIES_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                # If user entered sessionid or sessionid_ss
-                cookies = {}
-                for k, v in data.items():
-                    if v:
-                        cookies[k] = str(v).strip()
-                return cookies
-        except Exception:
-            pass
+    cookie_paths = [
+        COOKIES_FILE,
+        os.path.join(os.path.dirname(BASE_DIR), "web-truyen", "kuruRecord", "cookies.json")
+    ]
+    for cp in cookie_paths:
+        if os.path.exists(cp):
+            try:
+                with open(cp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    cookies = {}
+                    for k, v in data.items():
+                        if v:
+                            cookies[k] = str(v).strip()
+                    if cookies:
+                        return cookies
+            except Exception:
+                pass
+
+    env_session = os.environ.get("TIKTOK_SESSION_ID", "").strip()
+    if env_session:
+        return {"sessionid_ss": env_session, "sessionid": env_session}
+
+    try:
+        cfg = load_config()
+        cfg_session = (cfg.get("tiktok_session_id") or cfg.get("sessionid_ss") or "").strip()
+        if cfg_session:
+            return {"sessionid_ss": cfg_session, "sessionid": cfg_session}
+    except Exception:
+        pass
+
     return {}
 
 def save_cookies(cookies_dict):
@@ -203,6 +221,9 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
     }
     if not user:
         return details
+
+    if cookies is None:
+        cookies = load_cookies()
 
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     try:
@@ -624,6 +645,9 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
     Extract candidate stream URLs (FLV or HLS / m3u8).
     Supports 18+ restricted streams using authenticated sessionid cookies or custom guest session.
     """
+    if cookies is None:
+        cookies = load_cookies()
+
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     if user:
         try:
