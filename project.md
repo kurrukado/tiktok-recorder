@@ -202,10 +202,12 @@ Chi tiết các chặng quan trọng:
    Vòng trong giám sát: dung lượng không tăng ≥20s (≥250KB) → check live
    (3 lần liên tiếp = xuống live), VIP preview dừng ở 14s, hard-limit 30/90/120s → cắt file.
    Dừng mềm `_safe_stop_ffmpeg()` (`:816`, leo thang 8→4→2s rồi kill) để FFmpeg ghi `moov atom`.
-5. **Chuẩn hóa** — `auto_h264.py`: `validate_playable_video():111` (≥5s, ≥250KB),
-   `ensure_h264():561`, `sanitize_mp4_bitstream():399` (gõ AVCC, bỏ byte rác `01 64 00 1f…`),
-   `has_faststart():300`, `upscale_to_1080p_if_needed():200` (NVENC/x264, Lanczos, timeout 1200s),
-   `extract_middle_thumbnail():935` (seek 50% → 25% → 5/3/1s).
+ 5. **Chuẩn hóa** — `auto_h264.py`: `validate_playable_video():111` (≥5s, ≥250KB),
+    `check_h264_stream_health():360` (quét nhiều cửa sổ, ngưỡng lỗi macroblock — xem 5.3),
+    `ensure_h264():687`, `sanitize_mp4_bitstream():485` (gõ AVCC, bỏ byte rác `01 64 00 1f…`,
+    kiểm tra biên SPS/PPS + `lengthSizeMinusOne`),
+    `has_faststart():300`, `upscale_to_1080p_if_needed():200` (NVENC/x264, Lanczos, timeout 1200s),
+    `extract_middle_thumbnail():1067` (seek 50% → 25% → 5/3/1s).
 6. **Upload trực tiếp** — Mọi segment (bất kể thời lượng) đều được upload trực tiếp lên
    Google Drive `tiktok-record/<user>/` + đồng bộ Supabase ngay sau khi chuẩn hóa.
    Segment đủ 1h → upload ngay + bắt đầu record phần mới. Segment cuối → upload sau
@@ -239,20 +241,35 @@ Chi tiết các chặng quan trọng:
 * Worker upload trực tiếp mọi segment lên Drive + Supabase (không qua staging queue).
   Supabase row chỉ tạo khi đã có `drive_file_id`.
 
-### 5.2 `recorder_core.py` (1162 dòng) — lõi trích xuất
+### 5.2 `recorder_core.py` (1182 dòng) — lõi trích xuất
 * `generate_guest_session():146`, `load_cookies():119` (cookie `sessionid_ss` cho live 18+/VIP).
 * `check_live_details():182`, `check_live_status():412`, `check_user_live():423`.
 * `get_stream_urls():622`, `parse_sdk_stream_data():538` (giải mã JSON SDK của TikTok).
 * `record_stream_ffmpeg():869` (globale `GLOBAL_RECORDING_PROCS:855` + `atexit` dọn process),
-  `concat_mp4_segments():1092` (concat demuxer, `-c copy`, timeout 180s, bỏ segment <50KB),
+  `concat_mp4_segments():1092` (concat demuxer, `-c copy`, timeout 180s, bỏ segment <50KB;
+  **probe đầu/giữa/cuối 3 segment để cảnh báo đổi độ phân giải giữa chừng** — `-c copy` giữ
+  nguyên SPS/PPS từng mẫu nên segment 1080p + 720p trong cùng part cho file đổi chuẩn giữa chừng),
   `_safe_stop_ffmpeg():816`.
 * `DEFAULT_CONFIG:38` — `check_interval_seconds=20`, `max_recording_seconds=3600`,
   `offline_confirm_seconds=300`, `timezone_offset_hours=7`, `auto_upscale_1080p=true`.
 
-### 5.3 `auto_h264.py` (1015 dòng) — chuẩn hóa H.264
+### 5.3 `auto_h264.py` (1147 dòng) — chuẩn hóa H.264
 `get_best_h264_encoder():31` (NVENC → QSV → AMF → MF → libx264), `get_video_codec():53`,
-`check_h264_stream_health():320`, `sanitize_mp4_bitstream():399` (bảo mật/correctness
-theo ISO/IEC 14496-15), `convert_all_videos_in_folder():746`, `get_video_duration():793`.
+`validate_playable_video():111`, `check_h264_stream_health():360`,
+`sanitize_mp4_bitstream():485` (theo ISO/IEC 14496-15),
+`ensure_h264():687`, `convert_all_videos_in_folder():878`, `get_video_duration():925`.
+
+**Vá lỗi "khung hình khối xám + nhiễu macroblock" (corrupt frame):**
+
+| Lỗ hổng | Trước | Sau |
+|---|---|---|
+| Quét quá hẹm | `check_h264_stream_health` chỉ decode **6 giây đầu** (`-t 6`) → lỗi ở phút 30 không bao giờ bị thấy, `validate_playable_video` vẫn trả "Hợp lệ" | `_build_scan_windows():350` quét **3 cửa sổ** (giây 0 / 40% / 75% thời lượng, `-ss` trước `-i` = keyframe seek, mỗi cửa sổ 4s). File <90s chỉ quét cửa sổ đầu. Nhận `duration` truyền sẵn để không tốn thêm lần `ffmpeg -i` |
+| Pattern thiếu | `corrupt_patterns` không chứa chính xác câu chữ FFmpeg phát ra khi vỡ macroblock | `_FATAL_PATTERNS:322` giữ 5 pattern "hỏng triệt để"; thêm `_MB_ERROR_PATTERNS:333` (`error while decoding MB`, `concealing`, `reference picture missing`, `Missing reference picture`, `mmco: unref short failure`, `non-existing/PPS/SPS`, `decode_slice_header error`) |
+| Chẩn đoán sai | Lỗi MB nói chung là **bỏ qua hoàn toàn** | Ngưỡng `_MB_ERROR_THRESHOLD = 40` lỗi/cửa sổ 4s. Kết luận hỏng khi **≥2 cửa sổ** vượt ngưỡng **hoẶC** 1 cửa sổ ≥4× ngưỡng. Lẻ tẻ → vẫn "Hợp lệ" (tránh `os.remove()` nhầm video đã ghi tốt — lỗi từng xảy ra với cảnh báo timing/POC) |
+| Cửa sổ avcC 96 byte | `moov[avcc_idx+4 : avcc_idx+100]` — avcC dài hơn thì SPS/PPS **bị cụt âm thầm** (slice Python không ném lỗi) → ghi header toàn cục sai → decoder cấu hình sai → khối xám | Đọc `moov[avcc_idx+4 : +4096]`, **kiểm tra biên từng NAL**; không đọc đủ → để `global_headers` **trống** (không ghi header sai) và rơi vào nhánh remux/transcode an toàn |
+| `lengthSizeMinusOne` | **Không đọc bao giờ** — mọi nơi mặc định tiền tố NAL là 4 byte → stream dùng 1/2/3 byte thì cắt sai ranh giới NAL → garbage = khối nhiễu màu | `_parse_avcc_record():426` trả thêm `nalu_len_bytes = (byte[4] & 0x03) + 1`; `_write_length_prefixed_nals():467` dùng đúng độ dài đó; `_is_avcc_record():416` tách riêng "đúng là avcC" khỏi "avcC parse hỏng" → parse hỏng thì **bỏ mẫu**, không ghi rác |
+| Box walker | `sz < 8` → `content_sz` âm → `f.seek()` lùi → có thể quay vô hạn | `sz < 8` / box type không phải fourcc / box mở rộng <16 byte → `break` ngay |
+| Audio gating | `is_healthy` chỉ True khi `audio_codec in ("aac","none")` → file H.264 + audio mp3/opus rơi vào `sanitize_mp4_bitstream` (tự viết lại bitstream thủ công) | `ensure_h264():687` tách bạch: **sức khỏe bitstream video** quyết định `is_healthy`; audio khác AAC → Case 1 remux (giữ nguyên video, chỉ transcode audio). Gộp 2 lần gọi health check thành 1, truyền `duration` xuống |
 
 ### 5.4 `staging_queue.py` (654 dòng) — ~~chống mất dữ liệu~~ **NGỪNG SỬ DỤNG**
 Mọi segment giờ đều upload trực tiếp lên Google Drive ngay sau khi chuẩn hóa, bất kể
@@ -451,9 +468,9 @@ URL phát: `https://drive.usercontent.google.com/download?id={drive_file_id}&exp
 
 ```bash
 pip install -r requirements.txt
-python -B -m unittest test_audit_suite.py            # 67 test tổng hợp
+python -B -m unittest test_audit_suite.py            # 78 test tổng hợp
 python -B -m unittest test_challenger_concurrency.py # 26 test đa luồng/đối kháng
-python -B -m unittest test_audit_suite.py test_challenger_concurrency.py  # 93/93
+python -B -m unittest test_audit_suite.py test_challenger_concurrency.py  # 104/104
 run_cloud_daemon.bat                                 # daemon local + watchdog 5s
 run_recorder.bat                                     # CLI menu
 python api_server.py                                 # REST API :8000
@@ -674,11 +691,35 @@ Sau đó chạy lại `python -B -m unittest test_audit_suite.py` trong `kuruRec
 * API `:8000` vẫn **CORS `*`** và GET không có auth → chỉ mở trong mạng nội bộ, hoặc bật
   `RECORD_PIN` + đặt sau proxy (cách web-truyen đang làm). PIN hiện là opt-in nên **mặc
   định vẫn mở** — phải chủ động đặt mới có tác dụng.
-* Bộ test: `test_audit_suite.py` (**67** bài) và `test_challenger_concurrency.py` (**26** bài)
-  = **93 test**, đang `OK 93/93` — chạy trước mọi thay đổi mã nguồn.
+* Bộ test: `test_audit_suite.py` (**78** bài, gồm 11 bài mới ở `TestBitstreamCorruptionDetection`)
+  và `test_challenger_concurrency.py` (**26** bài) = **104 test**, đang `OK 104/104` —
+  chạy trước mọi thay đổi mã nguồn.
 * `staging_queue.py` **đã ngừng được `api_server.py` sử dụng**; `cloud_daemon.py:815-816`
   còn 1 lời gọi `check_and_flush_idle_queues()` để xả hàng đợi legacy trên Drive.
   Sau khi xả hết thì xoá khối import + xoá luôn module (xem mục 5.4).
+
+### 12.3 Vá lỗi khung hình corrupt (khối xám + nhiễu macroblock)
+Xem bảng chi tiết ở **mục 5.3**. Tóm tắt nguyên nhân đã xử lý:
+1. **Lọt lưới** — quét chỉ 6 giây đầu + pattern thiếu câu chữ của lỗi macroblock →
+   `validate_playable_video` trả "Hợp lệ" cho file hỏng và video vẫn được upload.
+2. **Tạo lỗi** — cửa sổ avcC 96 byte cắt cụt SPS/PPS, không đọc `lengthSizeMinusOne`,
+   bỏ qua kiểm tra biên box/box size âm.
+3. **Đường sai** — `is_healthy` bị audio codec gating khiến file H.264 khỏe bị đẩy qua
+   `sanitize_mp4_bitstream` (viết lại bitstream thủ công).
+
+Còn lại / cần quyết định:
+* **Chưa vá (nguy cơ cao, cần sửa gốc)** — `bg_record_worker` / `streamer_recording_worker`
+  vẫn tích lũy segment từ **nhiều stream candidate khác tier trong cùng một part**
+  (`stream_candidates[:4]` theo thứ tự 1080p → 720p → 540p → 360p). `concat_mp4_segments`
+  hiện **chỉ cảnh báo** (probe 3 segment đầu/giữa/cuối) chứ chưa chốt part khi đổi
+  độ phân giải — muốn dứt điểm thì phải tách part ngay khi `get_video_resolution()` đổi.
+* **Chưa vá (nguy cơ thấp)** — `record_stream_ffmpeg` bật `+nobuffer` (`recorder_core.py:905`)
+  nên có thể bắt đầu ghi **giữa GOP** (frame đầu tham chiếu IDR chưa về) → 1–N frame lỗi.
+  `+discardcorrupt` **không bắt được** lỗi này vì gói không bị gắn cờ corrupt, chỉ thiếu
+  tham chiếu. Cần cơ chế chờ keyframe đầu (`-ss` / bỏ qua NAL đầu tiên).
+* **Chưa xác nhận được từ ảnh** — cần user cho biết ảnh chụp ở đoạn nào của file
+  (đầu / giữa / sau upload) và file `.mp4` gốc nếu có, để phân biệt giữa bắt-mới-GOP,
+  file đã qua `sanitize_mp4_bitstream`, hay segment khác độ phân giải bị ghép.
 
 ---
 

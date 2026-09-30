@@ -1800,6 +1800,142 @@ class TestLatentBugsAndLockGuards(unittest.TestCase):
                 self.assertTrue(any("stream-1080p.flv" in u for u in urls))
 
 
+class TestBitstreamCorruptionDetection(unittest.TestCase):
+    """Bao phủ lớp vá lỗi khung hình khối xám + nhiễu macroblock (corrupt frame)."""
+
+    @staticmethod
+    def _build_avcc(length_size_minus_one, sps=b"\x67\x42\xc0\x1f", pps=b"\x68\xce\x06\xe2"):
+        rec = bytearray()
+        rec += b"\x01\x64\x00\x1f"
+        rec.append(0xfc | (length_size_minus_one & 0x03))
+        rec.append(0xe0 | 0x01)                      # 1 SPS
+        rec += len(sps).to_bytes(2, "big") + sps
+        rec.append(0x01)                             # 1 PPS
+        rec += len(pps).to_bytes(2, "big") + pps
+        return bytes(rec)
+
+    def test_parse_avcc_record_returns_length_size_from_record(self):
+        """lengthSizeMinusOne phải được đọc từ avcC, không phải mặc định 4 byte."""
+        import auto_h264
+        for lsi in (1, 2, 3):
+            rec = self._build_avcc(lsi)
+            res = auto_h264._parse_avcc_record(rec)
+            self.assertIsNotNone(res, f"không parse được avcC lengthSizeMinusOne={lsi}")
+            ptr, sps_list, pps_list, nalu = res
+            self.assertEqual(nalu, lsi + 1)
+            self.assertEqual(sps_list, [b"\x67\x42\xc0\x1f"])
+            self.assertEqual(pps_list, [b"\x68\xce\x06\xe2"])
+            self.assertEqual(ptr, len(rec))
+
+    def test_parse_avcc_record_truncated_nal_returns_none(self):
+        """SPS bị cắt cụt phải trả None để bỏ mẫu, không ghi header sai."""
+        import auto_h264
+        rec = bytearray(self._build_avcc(3))
+        rec[13:15] = (4096).to_bytes(2, "big")  # PPS khai 4096 byte nhưng buffer ngắn hơn
+        self.assertIsNone(auto_h264._parse_avcc_record(bytes(rec)))
+
+        bad = bytearray(self._build_avcc(3))
+        bad[6:8] = (4096).to_bytes(2, "big")  # SPS khai 4096 byte nhưng buffer ngắn hơn
+        self.assertIsNone(auto_h264._parse_avcc_record(bytes(bad)))
+
+    def test_write_length_prefixed_nals_uses_record_length_size(self):
+        """Tiền tố 2-byte phải được chuyển đúng sang Annex-B (trước đây luôn đọc 4 byte)."""
+        import io
+        import auto_h264
+        sps = b"\x67\x42\xc0\x1f"
+        pps = b"\x68\xce\x06\xe2"
+        data = len(sps).to_bytes(2, "big") + sps + len(pps).to_bytes(2, "big") + pps
+        out = io.BytesIO()
+        auto_h264._write_length_prefixed_nals(out, data, 2)
+        self.assertEqual(out.getvalue(), b"\x00\x00\x00\x01" + sps + b"\x00\x00\x00\x01" + pps)
+
+    def test_write_length_prefixed_nals_stops_on_overrun(self):
+        """Dữ liệu không khớp phải dừng lại, không ném lỗi và không ghi NAL rác."""
+        import io
+        import auto_h264
+        out = io.BytesIO()
+        auto_h264._write_length_prefixed_nals(out, (9999).to_bytes(4, "big") + b"abc", 4)
+        self.assertEqual(out.getvalue(), b"")
+        auto_h264._write_length_prefixed_nals(out, b"", 4)
+        auto_h264._write_length_prefixed_nals(out, b"\x00\x00\x00\x01\x65", 7)
+        self.assertEqual(out.getvalue(), b"")
+
+    def test_build_scan_windows_covers_middle_and_tail_of_long_file(self):
+        """File dài phải được quét ở giữa/cuối, không chỉ 6 giây đầu."""
+        import auto_h264
+        self.assertEqual(auto_h264._build_scan_windows(30), [0.0])
+        self.assertEqual(auto_h264._build_scan_windows(None), [0.0])
+        w = auto_h264._build_scan_windows(600)
+        self.assertEqual(w[0], 0.0)
+        self.assertEqual(len(w), 3)
+        self.assertAlmostEqual(w[1], 240.0)
+        self.assertAlmostEqual(w[2], 450.0)
+
+    def test_corrupt_patterns_catch_macroblock_errors(self):
+        """Pattern phải nhận đúng log FFmpeg của lỗi macroblock trong ảnh báo lỗi."""
+        import auto_h264
+        blob = "\n".join(auto_h264._MB_ERROR_PATTERNS)
+        for pat in ("error while decoding MB", "reference picture missing",
+                    "concealing", "mmco: unref short failure"):
+            self.assertIn(pat, blob)
+        for pat in ("non monotonically increasing dts", "co located POCs unavailable"):
+            self.assertNotIn(pat, auto_h264._FATAL_PATTERNS)
+            self.assertNotIn(pat, auto_h264._MB_ERROR_PATTERNS)
+
+    def _run_health_check(self, stderr_text, returncode=0, duration=30.0):
+        import auto_h264
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+            tf.write(b"0" * 4096)
+            path = tf.name
+        try:
+            with patch.object(auto_h264, "get_video_codec", return_value="h264"), \
+                 patch.object(auto_h264, "get_video_duration", return_value=duration), \
+                 patch.object(auto_h264.subprocess, "run",
+                              return_value=MagicMock(returncode=returncode, stderr=stderr_text)) as m:
+                return auto_h264.check_h264_stream_health(path), m
+        finally:
+            os.remove(path)
+
+    def test_health_check_flags_catastrophic_macroblock_density(self):
+        """Mật độ lỗi MB kinh khủng trong một cửa sổ -> file hỏng."""
+        err = "".join(f"[h264] error while decoding MB {i} at {i}\n" for i in range(300))
+        ok, _ = self._run_health_check(err)
+        self.assertFalse(ok)
+
+    def test_health_check_ignores_sporadic_macroblock_errors(self):
+        """Lẻ tẻ là bình thường trên luồng live -> KHÔNG được trả False (tránh xóa nhầm)."""
+        ok, _ = self._run_health_check("[h264] error while decoding MB 3 at 1\n")
+        self.assertTrue(ok)
+
+    def test_health_check_fatal_pattern_and_probe_all_windows(self):
+        ok, _ = self._run_health_check("[h264] Invalid NAL unit size")
+        self.assertFalse(ok)
+        ok, m = self._run_health_check("", duration=600.0)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(m.call_count, 3, "file 600s phải được quét ở 3 cửa sổ")
+
+    def test_ensure_h264_video_health_not_gated_by_audio_codec(self):
+        """Sức khỏe bitstream video không được quyết định bởi audio codec."""
+        import auto_h264
+        src = inspect.getsource(auto_h264.ensure_h264)
+        self.assertIn("is_healthy = check_h264_stream_health(filepath, duration=file_dur)", src)
+        old_gate = 'filepath.lower().endswith(".mp4") and codec == "h264" and audio_codec in ("aac", "none")'
+        self.assertNotIn(old_gate, src)
+
+    def test_sanitize_rejects_corrupt_box_without_hanging(self):
+        """Box size < 8 phải dừng ngay, không seek lùi/làm treo vòng lặp."""
+        import auto_h264
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tf:
+            tf.write(b"\x00\x00\x00\x04mdat" + b"0" * 2048)
+            path = tf.name
+        try:
+            self.assertIsNone(auto_h264.sanitize_mp4_bitstream(path))
+        finally:
+            os.remove(path)
+
+
 if __name__ == "__main__":
     unittest.main()
 

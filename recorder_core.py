@@ -1109,6 +1109,26 @@ def concat_mp4_segments(segment_files, output_file):
                 return valid_files[0]
         return output_file
 
+    # -c copy không đổi mã: mỗi phân đoạn giữ SPS/PPS/độ phân giải của riêng nó. Nếu fallback
+    # giữa các stream candidate (1080p -> 720p -> 540p) làm đổi độ phân giải GIỮA MỘT phần,
+    # file ghép ra sẽ đổi chuẩn giữa chừng — tín hiệu quen thấy của khung xám + nhiễu macroblock.
+    # Probe tối đa 3 file (đầu/giữa/cuối) để không tốn N lần ffmpeg -i.
+    try:
+        from auto_h264 import get_video_resolution
+        ref_w, ref_h, _ = get_video_resolution(valid_files[0])
+        if ref_w:
+            for i in sorted({len(valid_files) // 2, len(valid_files) - 1}):
+                w, h, _ = get_video_resolution(valid_files[i])
+                if w and (w, h) != (ref_w, ref_h):
+                    print(
+                        f"[!] Ghép nối: {os.path.basename(valid_files[i])} là {w}x{h} nhưng "
+                        f"phân đoạn đầu là {ref_w}x{ref_h} — đổi độ phân giải giữa chừng trong "
+                        f"cùng một file. Nguồn stream đã rơi tier trong lúc ghi."
+                    )
+                    break
+    except Exception:
+        pass
+
     list_txt = output_file + ".concat.txt"
     try:
         with open(list_txt, "w", encoding="utf-8") as f:

@@ -230,12 +230,12 @@ Mỗi bản ghi trả về mã `drive_file_id`. URL phát video chuẩn Google E
 | `gdrive_auth.py` | Bộ cấp phép và tự động làm mới OAuth2 Refresh Token Google Drive |
 | `api_server.py` | Máy chủ REST API FastAPI cung cấp các endpoint bổ trợ và kiểm thử |
 | `run_cloud_daemon.bat` | Script chạy ngầm cục bộ với GPU NVIDIA NVENC, tự khởi động lại sau 5s |
-| `test_audit_suite.py` | Bộ kiểm thử tự động toàn diện 67 bài test (Đạt 67/67 OK) |
+| `test_audit_suite.py` | Bộ kiểm thử tự động toàn diện 78 bài test (Đạt 78/78 OK) |
 | `test_challenger_concurrency.py`| Bộ kiểm thử đối kháng đa luồng 26 bài test (Đạt 26/26 OK) |
 | `.github/workflows/recorder.yml` | Workflow GitHub Actions chạy liên tục 24/7 (Relay + Cron 50 phút) |
 | `.github/workflows/repair-watchdog.yml` | Workflow GitHub Actions tự phục hồi chạy định kỳ mỗi 6 giờ |
 
-Tổng cộng **93/93 bài test**: `python -B -m unittest test_audit_suite test_challenger_concurrency`
+Tổng cộng **104/104 bài test**: `python -B -m unittest test_audit_suite test_challenger_concurrency`
 
 ---
 

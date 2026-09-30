@@ -163,7 +163,7 @@ def validate_playable_video(filepath, min_duration=5.0, min_size_bytes=250000):
     if dur < min_duration:
         return False, f"Thời lượng video quá ngắn ({dur:.2f}s < {min_duration}s)", dur
 
-    if not check_h264_stream_health(filepath):
+    if not check_h264_stream_health(filepath, duration=dur):
         return False, "Bitstream hỏng hoặc lỗi NAL unit (màn hình đen / không thể giải mã hình ảnh)", dur
 
     return True, "Hợp lệ", dur
@@ -317,7 +317,47 @@ def has_faststart(filepath):
         pass
     return False
 
-def check_h264_stream_health(filepath):
+# Lỗi "file hỏng triệt để": decoder không chạy được / container sai cấu trúc.
+# Chỉ cần xuất hiện ở BẤT KỲ cửa sổ quét nào -> file hỏng.
+_FATAL_PATTERNS = (
+    "Invalid NAL unit size",
+    "Error splitting the input into NAL units",
+    "missing picture in access unit",
+    "Decoding error",
+    "Invalid data found when processing input",
+)
+# Vỡ macroblock / thiếu tham chiếu: đúng kiểu khung hình xám + khối nhiễu macroblock màu.
+# Lẻ tẻ là bình thường trên luồng live (mất gói đã được che) nên KHÔNG được chặn ngay
+# một lần xuất hiện, mà chỉ kết luận "hỏng" khi mật độ lỗi trong một cửa sổ quét đạt
+# _MB_ERROR_THRESHOLD (xem check_h264_stream_health).
+_MB_ERROR_PATTERNS = (
+    "error while decoding MB",
+    "concealing",
+    "reference picture missing",
+    "Missing reference picture",
+    "mmco: unref short failure",
+    "non-existing PPS",
+    "non-existing SPS",
+    "decode_slice_header error",
+)
+# Số lỗi MB tối đa trong một cửa sổ quét (giây _SCAN_WINDOW_SECONDS) vẫn coi là lành.
+# Cửa sổ ~4s ≈ 100 frame @25fps -> 40 MB hỏng là 40% khung hình, chắc chắn không ổn.
+_MB_ERROR_THRESHOLD = 40
+_SCAN_WINDOW_SECONDS = 4
+# Cửa sổ quét bổ sung (tỉ lệ trên tổng thời lượng). File < 90s chỉ quét cửa sổ đầu.
+_EXTRA_SCAN_FRACTIONS = (0.4, 0.75)
+
+def _build_scan_windows(duration):
+    """Chọn các mốc -ss cần quét để không bỏ sót lỗi ở giữa/cuối file."""
+    windows = [0.0]
+    if duration and duration > 90:
+        for frac in _EXTRA_SCAN_FRACTIONS:
+            t = duration * frac
+            if t > 10:
+                windows.append(round(t, 2))
+    return windows
+
+def check_h264_stream_health(filepath, duration=None):
     if not os.path.exists(filepath) or os.path.getsize(filepath) < 1024:
         return False
     codec = get_video_codec(filepath)
@@ -330,71 +370,117 @@ def check_h264_stream_health(filepath):
         codec = get_video_codec(filepath)
         if codec != "unknown" and codec not in ("h264", "hevc"):
             return False
-    cmd = [
-        FFMPEG_PATH, "-v", "error",
-        "-i", filepath,
-        "-map", "0:v:0",
-        "-t", "6",
-        "-f", "null", "-"
-    ]
     # "non monotonically increasing dts" và "co located POCs unavailable" là cảnh báo
     # timing/POC rất phổ biến trên luồng HLS TikTok, KHÔNG đồng nghĩa bitstream hỏng.
-    # Chúng từng nằm trong list này và khiến validate_playable_video trả False ->
+    # Chúng từng nằm trong corrupt_patterns và khiến validate_playable_video trả False ->
     # cloud_daemon/api_server os.remove() những video đã ghi thành công.
-    corrupt_patterns = (
-        "Invalid NAL unit size",
-        "Error splitting the input into NAL units",
-        "missing picture in access unit",
-        "Decoding error",
-        "Invalid data found when processing input"
-    )
+    windows = _build_scan_windows(duration if duration is not None else get_video_duration(filepath))
+    mb_per_window = []
+    probed_any = False
     last_err = None
-    for _attempt in range(2):
-        try:
-            p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace", timeout=20)
-        except Exception as ex:
-            # Timeout/Ngoại lệ là sự cố TÀI NGUYÊN (CPU/IO đang bận), không phải bằng chứng file hỏng.
-            last_err = ex
-            continue
-        err = p.stderr.strip()
-        if any(pat in err for pat in corrupt_patterns):
-            return False
-        return p.returncode == 0
-    print(f"[auto_h264] Không chẩn đoán được bitstream {os.path.basename(filepath)} (lỗi: {last_err}). Coi là HỢP LỆ để tránh xóa video đã ghi.")
+    for ss in windows:
+        cmd = [FFMPEG_PATH, "-v", "error"]
+        if ss > 0:
+            # -ss trước -i = input seek (nhảy đúng keyframe, gần như không tốn giải mã).
+            cmd += ["-ss", f"{ss}"]
+        cmd += ["-i", filepath, "-map", "0:v:0", "-t", str(_SCAN_WINDOW_SECONDS), "-f", "null", "-"]
+        for _attempt in range(2):
+            try:
+                p = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace", timeout=30)
+            except Exception as ex:
+                # Timeout/Ngoại lệ là sự cố TÀI NGUYÊN (CPU/IO đang bận), không phải bằng chứng file hỏng.
+                last_err = ex
+                continue
+            probed_any = True
+            err = p.stderr.strip()
+            for pat in _FATAL_PATTERNS:
+                if pat in err:
+                    print(f"[auto_h264] Bitstream hỏng ở giây {ss:.1f} của {os.path.basename(filepath)} ({pat})")
+                    return False
+            if p.returncode != 0:
+                return False
+            mb_per_window.append(sum(err.count(pat) for pat in _MB_ERROR_PATTERNS))
+            break
+    if not probed_any:
+        print(f"[auto_h264] Không chẩn đoán được bitstream {os.path.basename(filepath)} (lỗi: {last_err}). Coi là HỢP LỆ để tránh xóa video đã ghi.")
+        return True
+    # Mật độ lỗi MB: hỏng ở >=2 cửa sổ (hỏng kéo dài) HOẶC một cửa sổ kinh khủng
+    # (>=4x ngưỡng) -> file thực sự hỏng. 1 cửa sổ lẻ thì bỏ qua để không xóa nhầm.
+    bad_windows = sum(1 for n in mb_per_window if n >= _MB_ERROR_THRESHOLD)
+    catastrophic = any(n >= _MB_ERROR_THRESHOLD * 4 for n in mb_per_window)
+    if bad_windows >= 2 or catastrophic:
+        print(f"[auto_h264] {os.path.basename(filepath)}: mật độ lỗi macroblock {mb_per_window} vượt ngưỡng -> đánh dấu hỏng.")
+        return False
     return True
+
+def _is_avcc_record(s_data):
+    """avcC record nhúng trong FLV: version 0x01, lengthSizeMinusOne ở byte[4], cấu hình level ở byte[5]."""
+    return (
+        isinstance(s_data, (bytes, bytearray))
+        and len(s_data) > 7
+        and s_data[0] == 0x01
+        and (s_data[4] & 0xfc) == 0xfc
+        and (s_data[5] & 0xe0) == 0xe0
+    )
 
 def _parse_avcc_record(s_data):
     """
     Parses ISO/IEC 14496-15 AVCDecoderConfigurationRecord prepended in FLV streams.
-    Returns (clean_offset, sps_list, pps_list) or None.
+    Returns (clean_offset, sps_list, pps_list, nalu_len_bytes) hoặc None.
+    nalu_len_bytes = lengthSizeMinusOne + 1 (1..4) đọc từ byte[4] của record — trước đây
+    code mặc định mọi nơi đều là 4 byte, cắt sai ranh giới NAL nếu stream dùng 1/2/3 byte.
+    Mọi phép slice đều được kiểm tra biên; SPS/PPS bị cắt cụt sẽ trả về None thay vì
+    âm thầm trả NAL không hoàn chỉnh.
     """
-    if s_data.startswith(b"\x01") and len(s_data) > 7:
-        if (s_data[4] & 0xfc) == 0xfc and (s_data[5] & 0xe0) == 0xe0:
-            ptr = 5
-            num_sps = s_data[ptr] & 0x1f
-            ptr += 1
-            sps_list = []
-            for _ in range(num_sps):
-                if ptr + 2 > len(s_data):
-                    return None
-                sps_l = int.from_bytes(s_data[ptr:ptr+2], "big")
-                ptr += 2
-                sps_list.append(s_data[ptr:ptr+sps_l])
-                ptr += sps_l
-            if ptr >= len(s_data):
+    if _is_avcc_record(s_data):
+        nalu_len_bytes = (s_data[4] & 0x03) + 1
+        ptr = 5
+        num_sps = s_data[ptr] & 0x1f
+        ptr += 1
+        sps_list = []
+        for _ in range(num_sps):
+            if ptr + 2 > len(s_data):
                 return None
-            num_pps = s_data[ptr]
-            ptr += 1
-            pps_list = []
-            for _ in range(num_pps):
-                if ptr + 2 > len(s_data):
-                    return None
-                pps_l = int.from_bytes(s_data[ptr:ptr+2], "big")
-                ptr += 2
-                pps_list.append(s_data[ptr:ptr+pps_l])
-                ptr += pps_l
-            return ptr, sps_list, pps_list
+            sps_l = int.from_bytes(s_data[ptr:ptr+2], "big")
+            ptr += 2
+            if sps_l == 0 or ptr + sps_l > len(s_data):
+                return None
+            sps_list.append(s_data[ptr:ptr+sps_l])
+            ptr += sps_l
+        if ptr >= len(s_data):
+            return None
+        num_pps = s_data[ptr]
+        ptr += 1
+        pps_list = []
+        for _ in range(num_pps):
+            if ptr + 2 > len(s_data):
+                return None
+            pps_l = int.from_bytes(s_data[ptr:ptr+2], "big")
+            ptr += 2
+            if pps_l == 0 or ptr + pps_l > len(s_data):
+                return None
+            pps_list.append(s_data[ptr:ptr+pps_l])
+            ptr += pps_l
+        return ptr, sps_list, pps_list, nalu_len_bytes
     return None
+
+def _write_length_prefixed_nals(out_f, data, nalu_len_bytes):
+    """
+    Ghi dữ liệu NALU theo tiền tố độ dài (mẫu MP4/avcC) ra Annex-B.
+    Đọc đúng nalu_len_bytes (1..4) thay vì mặc định 4; cắt đúng ranh giới NAL,
+    dừng ngay khi dữ liệu không khớp để không ghi NAL rác vào bitstream.
+    """
+    n = nalu_len_bytes
+    if n not in (1, 2, 3, 4) or not data:
+        return
+    p = 0
+    total = len(data)
+    while p + n <= total:
+        nal_len = int.from_bytes(data[p:p+n], "big")
+        if nal_len == 0 or p + n + nal_len > total:
+            break
+        out_f.write(b"\x00\x00\x00\x01" + data[p+n:p+n+nal_len])
+        p += n + nal_len
 
 def sanitize_mp4_bitstream(input_path, output_path=None):
     """
@@ -418,14 +504,24 @@ def sanitize_mp4_bitstream(input_path, output_path=None):
                 if len(hdr) < 8:
                     break
                 sz, a_type = struct.unpack(">I4s", hdr)
+                # Box type phải là fourcc in được; size âm/dưới 8 sẽ làm seek lùi -> lặp vô hạn.
+                if not all(32 <= b < 127 for b in a_type):
+                    break
                 if sz == 1:
-                    sz = struct.unpack(">Q", f.read(8))[0]
+                    ext = f.read(8)
+                    if len(ext) < 8:
+                        break
+                    sz = struct.unpack(">Q", ext)[0]
+                    if sz < 16:
+                        break
                     cur = f.tell()
                     content_sz = sz - 16
                 elif sz == 0:
                     content_sz = file_size - f.tell()
                     cur = f.tell()
                 else:
+                    if sz < 8:
+                        break
                     cur = f.tell()
                     content_sz = sz - 8
                 if a_type == b"moov":
@@ -441,20 +537,53 @@ def sanitize_mp4_bitstream(input_path, output_path=None):
             if vide_idx == -1:
                 return None
 
-            # Lấy global SPS / PPS từ avcC trong moov để đảm bảo demuxer nhận diện dimensions ngay từ Sample 0
+            # Lấy global SPS / PPS từ avcC trong moov để đảm bảo demuxer nhận diện dimensions ngay từ Sample 0.
+            # Trước đây cắt cửa sổ cố định 96 byte (avcc_idx+4:avcc_idx+100): avcC dài hơn thế thì
+            # SPS/PPS bị CỤT âm thầm (Python slice không ném lỗi) -> ghi header toàn cục sai ->
+            # decoder cấu hình sai -> khối xám + nhiễu macroblock. Nay đọc toàn bộ và kiểm tra biên;
+            # nếu không đọc đủ thì để trống (KHÔNG ghi header sai) và rơi vào đường remux/transcode.
             global_headers = b""
+            nalu_len_bytes = 4
             avcc_idx = moov_data.find(b"avcC")
             if avcc_idx != -1:
-                try:
-                    avcc = moov_data[avcc_idx+4:avcc_idx+100]
-                    g_sps_len = int.from_bytes(avcc[6:8], "big")
-                    g_sps = avcc[8:8+g_sps_len]
-                    g_pps_offset = 8 + g_sps_len + 1
-                    g_pps_len = int.from_bytes(avcc[g_pps_offset:g_pps_offset+2], "big")
-                    g_pps = avcc[g_pps_offset+2:g_pps_offset+2+g_pps_len]
-                    global_headers = b"\x00\x00\x00\x01" + g_sps + b"\x00\x00\x00\x01" + g_pps
-                except Exception:
-                    pass
+                avcc = moov_data[avcc_idx+4 : avcc_idx+4+4096]
+                if len(avcc) >= 7 and avcc[0] == 0x01:
+                    nalu_len_bytes = (avcc[4] & 0x03) + 1  # lengthSizeMinusOne + 1
+                    try:
+                        _ok = True
+                        _p = 6
+                        _sps_list = []
+                        for _ in range(avcc[5] & 0x1F):
+                            if _p + 2 > len(avcc):
+                                _ok = False
+                                break
+                            _l = int.from_bytes(avcc[_p:_p+2], "big")
+                            _p += 2
+                            if _l == 0 or _p + _l > len(avcc):
+                                _ok = False
+                                break
+                            _sps_list.append(avcc[_p:_p+_l])
+                            _p += _l
+                        _pps_list = []
+                        if _ok and _p < len(avcc):
+                            _num_pps = avcc[_p]
+                            _p += 1
+                            for _ in range(_num_pps):
+                                if _p + 2 > len(avcc):
+                                    _ok = False
+                                    break
+                                _l = int.from_bytes(avcc[_p:_p+2], "big")
+                                _p += 2
+                                if _l == 0 or _p + _l > len(avcc):
+                                    _ok = False
+                                    break
+                                _pps_list.append(avcc[_p:_p+_l])
+                                _p += _l
+                        if _ok and _sps_list and _pps_list:
+                            global_headers = b"".join(b"\x00\x00\x00\x01" + s for s in _sps_list) \
+                                + b"".join(b"\x00\x00\x00\x01" + x for x in _pps_list)
+                    except Exception:
+                        global_headers = b""
 
             trak_start = moov_data.rfind(b"trak", 0, vide_idx)
             trak_end = moov_data.find(b"trak", vide_idx)
@@ -497,40 +626,37 @@ def sanitize_mp4_bitstream(input_path, output_path=None):
                     num_s = chunk_samples[c_idx]
                     f.seek(off)
                     for _ in range(num_s):
+                        if s_idx >= len(sample_sizes):
+                            break
                         sz = sample_sizes[s_idx]
                         s_idx += 1
                         s_data = f.read(sz)
-                        avcc_res = _parse_avcc_record(s_data)
-                        if avcc_res:
-                            ptr, sps_list, pps_list = avcc_res
+                        if not s_data:
+                            continue
+                        if _is_avcc_record(s_data):
+                            avcc_res = _parse_avcc_record(s_data)
+                            if not avcc_res:
+                                # avcC hỏng/cụt: bỏ mẫu này, TUYỆT ĐỐI không ghi rác ra bitstream.
+                                continue
+                            ptr, sps_list, pps_list, rec_nalu = avcc_res
                             for sps in sps_list:
                                 out_f.write(b"\x00\x00\x00\x01" + sps)
                             for pps in pps_list:
                                 out_f.write(b"\x00\x00\x00\x01" + pps)
                             clean = s_data[ptr:]
-                            if len(clean) > 8:
-                                l0 = int.from_bytes(clean[:4], "big")
-                                t0 = clean[4] & 0x1f if l0 < len(clean) else 0
+                            # Một số máy chủ nhúng thêm 1 tiền tố độ dài rác ở đầu sample:
+                            # nếu byte đầu không phải NAL header hợp lệ mà byte sau đó có thì bỏ nó đi.
+                            if len(clean) > rec_nalu * 2:
+                                t0 = clean[rec_nalu] & 0x1f
                                 if t0 not in (1, 5, 6, 7, 8):
-                                    l4 = int.from_bytes(clean[4:8], "big")
-                                    t4 = clean[8] & 0x1f if l4 < len(clean) else 0
-                                    if t4 in (1, 5, 6, 7, 8) and l4 < len(clean):
-                                        clean = clean[4:]
-                            p = 0
-                            while p + 4 < len(clean):
-                                nal_len = int.from_bytes(clean[p:p+4], "big")
-                                if p + 4 + nal_len > len(clean) or nal_len == 0:
-                                    break
-                                out_f.write(b"\x00\x00\x00\x01" + clean[p+4:p+4+nal_len])
-                                p += 4 + nal_len
+                                    t1 = clean[rec_nalu * 2] & 0x1f
+                                    if t1 in (1, 5, 6, 7, 8):
+                                        _l1 = int.from_bytes(clean[rec_nalu:rec_nalu * 2], "big")
+                                        if _l1 and rec_nalu * 2 + _l1 <= len(clean):
+                                            clean = clean[rec_nalu:]
+                            _write_length_prefixed_nals(out_f, clean, rec_nalu)
                         else:
-                            p = 0
-                            while p + 4 < len(s_data):
-                                nal_len = int.from_bytes(s_data[p:p+4], "big")
-                                if p + 4 + nal_len > len(s_data) or nal_len == 0:
-                                    break
-                                out_f.write(b"\x00\x00\x00\x01" + s_data[p+4:p+4+nal_len])
-                                p += 4 + nal_len
+                            _write_length_prefixed_nals(out_f, s_data, nalu_len_bytes)
 
         cmd = [
             FFMPEG_PATH, "-y",
@@ -576,12 +702,18 @@ def ensure_h264(filepath):
     target_path = os.path.splitext(filepath)[0] + ".mp4"
     temp_out = filepath + ".fixed.tmp.mp4"
 
+    # Sức khỏe BITSTREAM của video là điều kiện để bỏ qua remux — KHÔNG phụ thuộc audio codec.
+    # Trước đây thêm "audio_codec in (aac,none)" vào đây nên file H.264 + audio mp3/opus
+    # bị coi là unhealthy -> rơi vào sanitize_mp4_bitstream (tự viết lại bitstream thủ công).
+    # Nay: video khỏe + audio aac/none + đã faststart -> dùng ngay; video khỏe nhưng
+    # audio khác -> vào Case 1 để remux (giữ nguyên video, chỉ transcode audio).
     is_healthy = False
-    if filepath.lower().endswith(".mp4") and codec == "h264" and audio_codec in ("aac", "none"):
-        if has_faststart(filepath) and check_h264_stream_health(filepath):
+    file_dur = None
+    if filepath.lower().endswith(".mp4") and codec == "h264":
+        file_dur = get_video_duration(filepath)
+        is_healthy = check_h264_stream_health(filepath, duration=file_dur)
+        if is_healthy and audio_codec in ("aac", "none") and has_faststart(filepath):
             return filepath
-        if check_h264_stream_health(filepath):
-            is_healthy = True
 
     # Case 1: Video is already H.264 and bitstream is healthy -> Fast remux with +faststart, strip all subtitles (-sn -dn)
     if codec == "h264" and is_healthy:
@@ -631,7 +763,7 @@ def ensure_h264(filepath):
     # Case 1.5: Video is H.264 but bitstream has NAL unit size errors -> Fast in-stream bitstream sanitization
     if codec == "h264" and not is_healthy:
         sanitized = sanitize_mp4_bitstream(filepath, temp_out)
-        if sanitized and os.path.exists(sanitized) and check_h264_stream_health(sanitized):
+        if sanitized and os.path.exists(sanitized) and check_h264_stream_health(sanitized, duration=file_dur):
             if target_path == filepath:
                 os.replace(sanitized, target_path)
             else:

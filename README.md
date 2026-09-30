@@ -72,13 +72,13 @@ Website chỉ cần đọc bảng `tiktok_recordings` từ Supabase:
 # Cài đặt thư viện
 pip install -r requirements.txt
 
-# Chạy bộ kiểm thử toàn diện (67 bài test)
+# Chạy bộ kiểm thử toàn diện (78 bài test)
 python -B -m unittest test_audit_suite.py
 
 # Chạy bộ kiểm thử đa luồng và đồng thời (26 bài test)
 python -B -m unittest test_challenger_concurrency.py
 
-# Chạy trọn vẹn cả hai bộ: 93/93 bài test
+# Chạy trọn vẹn cả hai bộ: 104/104 bài test
 python -B -m unittest test_audit_suite test_challenger_concurrency
 
 # Chạy daemon ghi hình tại máy cá nhân (hỗ trợ GPU NVENC)
