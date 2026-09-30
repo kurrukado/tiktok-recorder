@@ -42,6 +42,7 @@ class TestChallengerZeroRenderBandwidth(unittest.TestCase):
         pointing to Google CDN and strictly 0 bytes (or empty) transit body payload.
         """
         with patch("gdrive_manager.get_access_token", return_value="valid_token"), \
+             patch("gdrive_manager.is_recorder_owned_file", return_value=True), \
              patch("gdrive_manager.make_file_public") as mock_pub:
             
             resp = self.client.get("/api/stream-video-id/test_file_id_001")
@@ -62,6 +63,7 @@ class TestChallengerZeroRenderBandwidth(unittest.TestCase):
         Render MUST NOT intercept Range and proxy binary chunks; it must return 302 redirect.
         """
         with patch("gdrive_manager.get_access_token", return_value="valid_token"), \
+             patch("gdrive_manager.is_recorder_owned_file", return_value=True), \
              patch("gdrive_manager.make_file_public"):
             
             headers = {"Range": "bytes=0-1048576"}
@@ -76,6 +78,7 @@ class TestChallengerZeroRenderBandwidth(unittest.TestCase):
         redirect to Google Drive Preview URL with 0 transit video payload.
         """
         with patch("gdrive_manager.get_access_token", return_value="valid_token"), \
+             patch("gdrive_manager.is_recorder_owned_file", return_value=True), \
              patch("gdrive_manager.make_file_public", side_effect=RuntimeError("Google Drive API rate limit")):
             
             resp = self.client.get("/api/stream-video-id/test_error_file")
@@ -97,6 +100,7 @@ class TestChallengerZeroRenderBandwidth(unittest.TestCase):
         with patch("os.path.exists", return_value=False), \
              patch("gdrive_manager.get_access_token", return_value="valid_token"), \
              patch("gdrive_manager.find_or_create_folder", return_value="mock_user_fid"), \
+             patch("gdrive_manager.is_recorder_owned_file", return_value=True), \
              patch("requests.get", return_value=mock_drive_search), \
              patch("gdrive_manager.make_file_public") as mock_pub:
             
@@ -602,9 +606,10 @@ class TestChallengerFixVerifications(unittest.TestCase):
                 self.assertNotEqual(payload.get("source"), "cloud_runner")
 
     def test_bg_record_worker_flushes_staging_queue_on_normal_exit(self):
-        """Kiểm tra bg_record_worker trong api_server tự động flush staging queue khi kết thúc live, nhưng không flush khi user bị xóa."""
+        """bg_record_worker PHẢI upload trực tiếp (không staging) ở cả 2 nhánh: dừng bình thường lẫn user bị xóa, và luôn nhả khóa."""
         import api_server
         import staging_queue
+        from config_lock import streamer_recording_lock
         user = "test_bg_flush_user"
 
         stop_event = threading.Event()
@@ -617,16 +622,22 @@ class TestChallengerFixVerifications(unittest.TestCase):
 
             # Trường hợp 1: Dừng bình thường (streamer hết live / stop_record), user chưa bị xóa
             api_server.bg_record_worker(user, stop_event=stop_event)
-            mock_pkg.assert_called_once_with(user, access_token="fake_tok")
+            mock_pkg.assert_not_called()
+
+            with streamer_recording_lock(user) as got_lock:
+                self.assertTrue(got_lock, "streamer_recording_lock bị rò sau khi worker dừng bình thường")
 
             mock_pkg.reset_mock()
 
-            # Trường hợp 2: Streamer bị xóa (user_deleted = True) -> Không được flush staging
+            # Trường hợp 2: Streamer bị xóa (user_deleted = True) -> cũng không được flush staging
             stop_event_deleted = threading.Event()
             stop_event_deleted.user_deleted = True
             stop_event_deleted.set()
             api_server.bg_record_worker(user, stop_event=stop_event_deleted)
             mock_pkg.assert_not_called()
+
+            with streamer_recording_lock(user) as got_lock2:
+                self.assertTrue(got_lock2, "streamer_recording_lock bị rò sau khi worker kết thúc vì user bị xóa")
 
 
 if __name__ == "__main__":

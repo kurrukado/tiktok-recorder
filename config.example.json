@@ -6,10 +6,12 @@
     "output_dir": ".",
     "auto_upscale_1080p": true,
     "max_recording_seconds": 3600,
-    "offline_confirm_seconds": 90,
+    "offline_confirm_seconds": 300,
     "timezone_offset_hours": 7,
     "google_client_id": "YOUR_GOOGLE_CLIENT_ID",
     "google_client_secret": "YOUR_GOOGLE_CLIENT_SECRET",
     "gdrive_refresh_token": "YOUR_GDRIVE_REFRESH_TOKEN",
-    "gdrive_enabled": true
+    "gdrive_enabled": true,
+    "supabase_key": "YOUR_SUPABASE_ANON_KEY",
+    "api_pin": ""
 }

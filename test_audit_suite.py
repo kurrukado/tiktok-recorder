@@ -94,9 +94,9 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
         import api_server
         self.assertEqual(api_server.LIVE_CACHE_TTL, 60.0, "LIVE_CACHE_TTL must be 60.0")
 
-        # Verify max_workers in get_users
+        # Verify max_workers in get_users (chỉ probe streamer CHƯA đang ghi hình)
         get_users_source = inspect.getsource(api_server.get_users)
-        self.assertIn("max_workers=min(len(users), 3)", get_users_source)
+        self.assertIn("max_workers=min(len(users_to_probe), 8)", get_users_source)
         self.assertIn("gc.collect()", get_users_source)
 
         # Verify max_workers in list_recordings_from_drive
@@ -668,40 +668,70 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
     def test_bg_record_worker_infinite_retry_prevention(self):
         """
         Adversarial Test: Verify bg_record_worker in api_server prevents infinite busy loops:
-        - When final_rec_file validation fails, increments consecutive_failures and stops after max_consecutive_failures.
-        - When room is VIP sub-only and preview generation fails, stops after max_vip_attempts.
+        - Segment validation failure increments consecutive_failures and stops at max_consecutive_failures (4).
+        - VIP sub-only room whose stream links can never be fetched also stops at the same failure cap.
+        Mọi lời gọi mạng (TikTok scrape / Google Drive heartbeat / Drive token) đều bị mock
+        để bộ test chạy offline, không phụ thuộc mạng và không kẹt trong vòng chờ offline 300s.
         """
         import api_server
+        import contextlib
+        import io
 
         # 1. Video validation failure stops after 4 consecutive failures
+        v_calls = {"n": 0}
+
+        def _fail_validation(*_a, **_k):
+            v_calls["n"] += 1
+            if v_calls["n"] > 4:
+                # Chốt chặn: nếu logic break bị hỏng thì fail ngay thay vì treo vô hạn.
+                raise RuntimeError(f"validate_playable_video bị gọi {v_calls['n']} lần -> worker kẹt vòng lặp")
+            return (False, "corrupt container", 0.0)
+
         with patch("api_server.get_user_live_details_cached", return_value={"is_live": True, "room_id": "999", "is_sub_only": False}), \
-             patch("recorder_core.get_live_stream_url", return_value="https://live.tiktok.com/stream.flv"), \
+             patch("recorder_core.get_stream_candidates", return_value=["https://live.tiktok.com/stream.flv"]), \
+             patch("recorder_core.check_live_details", return_value={"is_live": True, "room_id": "999"}), \
              patch("recorder_core.record_stream_ffmpeg", return_value="mock_invalid.mp4"), \
-             patch("auto_h264.validate_playable_video", side_effect=[
-                 (True, "seg ok", 10.0),             # seg validation passes
-                 (False, "corrupt container", 0.0),  # final file validation fails (failure 1)
-                 (True, "seg ok", 10.0),
-                 (False, "corrupt container", 0.0),  # (failure 2)
-                 (True, "seg ok", 10.0),
-                 (False, "corrupt container", 0.0),  # (failure 3)
-                 (True, "seg ok", 10.0),
-                 (False, "corrupt container", 0.0),  # (failure 4 -> breaks out!)
-             ]), \
+             patch("auto_h264.validate_playable_video", side_effect=_fail_validation), \
              patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
              patch("os.path.exists", return_value=True), \
              patch("os.remove"), \
+             patch("gdrive_manager.set_user_recording_status_drive"), \
+             patch("gdrive_manager.get_access_token", return_value=None), \
              patch.object(time, "sleep"):
 
-            # Run worker; should encounter consecutive failures and break cleanly without infinite loop
-            api_server.bg_record_worker("worker_test_user")
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                api_server.bg_record_worker("worker_test_user")
+            out = buf.getvalue()
 
-        # 2. Sub-only preview reaches max_vip_attempts
+        self.assertEqual(v_calls["n"], 4, "Worker phải dừng đúng sau max_consecutive_failures=4 lần lỗi liên tiếp")
+        self.assertIn("Dừng tích lũy", out)
+
+        # 2. Sub-only preview: không lấy được link stream -> dừng ở cùng ngưỡng thất bại
+        cs_calls = {"n": 0}
+
+        def _no_stream(*_a, **_k):
+            cs_calls["n"] += 1
+            if cs_calls["n"] > 4:
+                raise RuntimeError(f"check_live_status bị gọi {cs_calls['n']} lần -> worker kẹt vòng lặp")
+            return (False, None)
+
         with patch("api_server.get_user_live_details_cached", return_value={"is_live": True, "room_id": "999", "is_sub_only": True}), \
              patch("recorder_core.generate_guest_session", side_effect=RuntimeError("Captcha")), \
+             patch("recorder_core.get_stream_candidates", return_value=[]), \
+             patch("recorder_core.check_live_status", side_effect=_no_stream), \
              patch("shutil.which", return_value="/usr/bin/ffmpeg"), \
+             patch("gdrive_manager.set_user_recording_status_drive"), \
+             patch("gdrive_manager.get_access_token", return_value=None), \
              patch.object(time, "sleep"):
 
-            api_server.bg_record_worker("vip_worker_user")
+            buf2 = io.StringIO()
+            with contextlib.redirect_stdout(buf2):
+                api_server.bg_record_worker("vip_worker_user")
+            out2 = buf2.getvalue()
+
+        self.assertEqual(cs_calls["n"], 4, "Worker VIP sub-only phải dừng sau max_consecutive_failures=4 lần")
+        self.assertIn("Không lấy được link stream", out2)
 
     def test_gc_collect_exception_safety_in_api_server(self):
         """
@@ -830,6 +860,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
         import api_server
 
         with patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("gdrive_manager.is_recorder_owned_file", return_value=True), \
              patch("gdrive_manager.make_file_public") as mock_public:
 
             client = TestClient(api_server.app, follow_redirects=False)
@@ -896,6 +927,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
 
         # 1. Fallback to Drive Preview on make_file_public failure
         with patch("gdrive_manager.get_access_token", return_value="fake_token"), \
+             patch("gdrive_manager.is_recorder_owned_file", return_value=True), \
              patch("gdrive_manager.make_file_public", side_effect=Exception("CDN permission error")):
 
             client = TestClient(api_server.app, follow_redirects=False)
@@ -1197,6 +1229,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
 
         # 1. stream_video_by_id returns 302 to Google Edge CDN
         with patch("gdrive_manager.get_access_token", return_value="fake_access_token"), \
+             patch("gdrive_manager.is_recorder_owned_file", return_value=True), \
              patch("gdrive_manager.make_file_public") as mock_public:
 
             res_id = client.get("/api/stream-video-id/drive_vid_999")
@@ -1215,6 +1248,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
         with patch("os.path.exists", return_value=False), \
              patch("gdrive_manager.get_access_token", return_value="fake_access_token"), \
              patch("gdrive_manager.find_or_create_folder", return_value="user_drive_fid"), \
+             patch("gdrive_manager.is_recorder_owned_file", return_value=True), \
              patch("requests.get", return_value=mock_search_res), \
              patch("gdrive_manager.make_file_public") as mock_public2:
 
@@ -1488,10 +1522,11 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
             self.assertIn("25.0", called_cmd)
 
     def test_streamer_worker_publishes_staging_queue_on_live_end(self):
-        """Kiểm tra streamer_recording_worker tự động gọi package_and_publish_queue khi streamer tắt live."""
+        """Worker PHẢI upload trực tiếp, KHÔNG gọi staging queue (staging đã ngừng sử dụng) và PHẢI nhả khóa liên tiến trình."""
         import cloud_daemon
         import staging_queue
         import threading
+        from config_lock import streamer_recording_lock
 
         user = "test_auto_pub_user"
         stop_ev = threading.Event()
@@ -1502,10 +1537,13 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
              patch("gdrive_manager.set_user_recording_status_drive"), \
              patch("gdrive_manager.create_streamer_folder_drive"), \
              patch("gdrive_manager.get_access_token", return_value="fake_token"), \
-             patch("staging_queue.package_and_publish_queue", return_value={"ok": True, "filename": "pub_full.mp4", "duration_minutes": 15.0}) as mock_pub:
+             patch("staging_queue.package_and_publish_queue") as mock_pub:
             cloud_daemon.streamer_recording_worker(user, "room_123", stop_event=stop_ev)
-            mock_pub.assert_called_once_with(user, access_token="fake_token")
+            mock_pub.assert_not_called()
             self.assertNotIn(user, cloud_daemon.ACTIVE_RECORDERS)
+
+        with streamer_recording_lock(user) as got_lock:
+            self.assertTrue(got_lock, "streamer_recording_lock bị rò sau khi worker kết thúc")
 
     def test_find_folder_does_not_create_folder(self):
         """Kiểm tra find_folder chỉ đọc, không gọi POST để tạo mới khi không tìm thấy folder."""

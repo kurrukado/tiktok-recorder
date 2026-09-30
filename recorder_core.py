@@ -9,7 +9,7 @@ import random
 import threading
 import atexit
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple
 from curl_cffi import requests
 
 if sys.platform == "win32":
@@ -48,7 +48,7 @@ DEFAULT_CONFIG = {
     "gdrive_delete_local": False,
     "auto_upscale_1080p": True,
     "max_recording_seconds": 3600,
-    "offline_confirm_seconds": 600,
+    "offline_confirm_seconds": 300,
     "timezone_offset_hours": 7
 }
 
@@ -99,7 +99,7 @@ def save_config(cfg):
             print(f"[!] Lỗi ghi config: {e}")
             if os.path.exists(tmp_path):
                 try: os.remove(tmp_path)
-                except: pass
+                except Exception: pass
 
 def save_config_fields(updates):
     """
@@ -141,7 +141,7 @@ def save_cookies(cookies_dict):
         print(f"[!] Lỗi ghi cookies: {e}")
         if os.path.exists(tmp_path):
             try: os.remove(tmp_path)
-            except: pass
+            except Exception: pass
 
 def generate_guest_session(proxy: Optional[str] = None) -> requests.Session:
     """

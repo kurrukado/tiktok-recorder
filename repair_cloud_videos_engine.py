@@ -201,7 +201,7 @@ def process_single_repair(rec, access_token=None):
         print(f"  ❌ Không thể tải video ID {rec_id} từ Drive.")
         if os.path.exists(temp_raw):
             try: os.remove(temp_raw)
-            except: pass
+            except Exception: pass
         return False
     dl_time = time.time() - t0
     raw_size_mb = os.path.getsize(temp_raw) / (1024 * 1024)
@@ -218,7 +218,7 @@ def process_single_repair(rec, access_token=None):
         print("  ❌ Không có file kết quả sau khi chuẩn hóa. Hủy patch Drive.")
         if os.path.exists(temp_raw):
             try: os.remove(temp_raw)
-            except: pass
+            except Exception: pass
         return False
     trans_time = time.time() - t1
     repaired_size_mb = os.path.getsize(repaired_path) / (1024 * 1024)
@@ -230,10 +230,10 @@ def process_single_repair(rec, access_token=None):
         print(f"  ❌ File sau khi xử lý vẫn không đạt chuẩn ({val_reason}). Hủy patch Drive.")
         if os.path.exists(repaired_path):
             try: os.remove(repaired_path)
-            except: pass
+            except Exception: pass
         if os.path.exists(temp_raw):
             try: os.remove(temp_raw)
-            except: pass
+            except Exception: pass
         return False
 
     # 3. In-Place PATCH to Google Drive (Chỉ ghi đè khi cần làm sạch/sửa lỗi bitstream)
@@ -246,10 +246,10 @@ def process_single_repair(rec, access_token=None):
             print(f"  ❌ Ghi đè lên Google Drive thất bại.")
             if os.path.exists(repaired_path):
                 try: os.remove(repaired_path)
-                except: pass
+                except Exception: pass
             if os.path.exists(temp_raw):
                 try: os.remove(temp_raw)
-                except: pass
+                except Exception: pass
             return False
         patch_time = time.time() - t2
         print(f"  [✓] Ghi đè Drive thành công ({patch_time:.1f}s)")
@@ -264,10 +264,10 @@ def process_single_repair(rec, access_token=None):
     # Cleanup
     if os.path.exists(repaired_path):
         try: os.remove(repaired_path)
-        except: pass
+        except Exception: pass
     if os.path.exists(temp_raw):
         try: os.remove(temp_raw)
-        except: pass
+        except Exception: pass
 
     total_time = time.time() - t0
     print(f"✨ HOÀN TẤT XỬ LÝ ID {rec_id} TRONG {total_time:.1f} GIÂY!\n")

@@ -552,10 +552,10 @@ def sanitize_mp4_bitstream(input_path, output_path=None):
     finally:
         if os.path.exists(raw_h264):
             try: os.remove(raw_h264)
-            except: pass
+            except Exception: pass
     if os.path.exists(output_path):
         try: os.remove(output_path)
-        except: pass
+        except Exception: pass
     return None
 
 def ensure_h264(filepath):
@@ -638,7 +638,7 @@ def ensure_h264(filepath):
                 os.replace(sanitized, target_path)
                 if os.path.exists(filepath):
                     try: os.remove(filepath)
-                    except: pass
+                    except Exception: pass
             print(f"  [✓] Đã làm sạch bitstream NAL Unit & chuẩn hóa H.264 (+faststart): Tương thích 100% mọi thiết bị.")
             return target_path
 
@@ -927,7 +927,7 @@ def _extract_raw_keyframe_thumb(video_path, output_thumb):
                     finally:
                         if os.path.exists(raw_tmp):
                             try: os.remove(raw_tmp)
-                            except: pass
+                            except Exception: pass
     except Exception:
         pass
     return None

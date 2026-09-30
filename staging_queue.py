@@ -10,7 +10,6 @@ staging_queue.py - Hệ thống Hàng đợi Đệm Cloud Staging Queue (Google 
 """
 
 import os
-import sys
 import time
 import json
 import shutil
@@ -23,8 +22,8 @@ import recorder_core
 import supabase_sync
 from auto_h264 import validate_playable_video
 
-TARGET_QUEUE_SECONDS = 3000       # 50 phút (~1 tiếng chênh lệch 10p)
-MAX_IDLE_SECONDS = 90             # 1.5 phút offline thì tự động xả queue
+TARGET_QUEUE_SECONDS = 3600       # Đúng 1 tiếng (3600s)
+MAX_IDLE_SECONDS = 300            # 5 phút (300s) offline thì tự động xả queue
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 _USER_STAGING_LOCKS = {}

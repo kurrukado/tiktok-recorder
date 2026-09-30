@@ -4,7 +4,7 @@ import json
 import time
 import sys
 from datetime import datetime, timezone
-from typing import Optional, Union, Tuple
+from typing import Optional, Union
 import requests
 
 if sys.platform == "win32":
@@ -14,10 +14,31 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-DEFAULT_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpldHd0cWFreXhqY2ZmYndoaG90Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzUzNjg0MDcsImV4cCI6MjA5MDk0NDQwN30.7QxzLxJs1gdNMG_ruiYcYo_5_1sX0t5Wb9hM92ix4j8"
+_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _secret_from_config(key_name: str) -> str:
+    """
+    Đọc bí mật từ config.json (đã .gitignore, không track trong git).
+    KHÔNG hardcode key trong source: repo chạy công khai trên GitHub Actions
+    thì mọi người đều đọc được key commit trong mã nguồn.
+    """
+    try:
+        with open(os.path.join(_BASE_DIR, "config.json"), "r", encoding="utf-8") as f:
+            return str(json.load(f).get(key_name, "") or "")
+    except Exception:
+        return ""
+
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://jetwtqakyxjcffbwhhot.supabase.co").rstrip("/")
-SUPABASE_KEY = os.environ.get("SUPABASE_ANON_KEY") or os.environ.get("SUPABASE_KEY") or DEFAULT_KEY
+SUPABASE_KEY = (
+    os.environ.get("SUPABASE_ANON_KEY")
+    or os.environ.get("SUPABASE_KEY")
+    or _secret_from_config("supabase_key")
+)
 STORAGE_BUCKET = "covers"
+
+if not SUPABASE_KEY:
+    print("[SUPABASE-SYNC] [!] Chưa có SUPABASE_KEY (env SUPABASE_KEY/SUPABASE_ANON_KEY "
+          "hoặc khóa supabase_key trong config.json) -> đồng bộ Supabase sẽ KHÔNG hoạt động.")
 
 def get_supabase_headers(content_type: str = "application/json"):
     return {

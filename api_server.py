@@ -72,6 +72,11 @@ def shutdown_all_recording_tasks():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if get_api_pin():
+        print("[🔐] Đã BẬT xác thực PIN cho mọi endpoint POST/PUT/PATCH/DELETE.")
+    else:
+        print('[⚠️] Chưa bật PIN cho API: mọi POST/DELETE đều công khai nếu expose ra Internet. '
+              'Đặt biến môi trường RECORD_PIN (hoặc khóa "api_pin" trong config.json) để bật xác thực.')
     yield
     shutdown_all_recording_tasks()
 
@@ -90,6 +95,67 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --------------------------------------------------------------------------- #
+# Xác thực PIN cho các endpoint thay đổi dữ liệu (POST/PUT/PATCH/DELETE)
+# - Kích hoạt khi khai báo biến môi trường RECORD_PIN HOẶC khóa "api_pin" trong config.json.
+# - Chưa khai báo -> giữ nguyên hành vi cũ (không auth) để không làm đứt tích hợp cũ,
+#   đồng thời in cảnh báo khi khởi động.
+# - Client gửi PIN qua header `x-record-pin` hoặc `Authorization: Bearer <pin>`
+#   (web-truyen proxy đã gửi `x-record-pin` sẵn).
+# --------------------------------------------------------------------------- #
+_PIN_CACHE = {"value": None, "checked_at": 0.0}
+_PIN_CACHE_TTL = 5.0
+
+def get_api_pin() -> str:
+    env_pin = (os.environ.get("RECORD_PIN", "") or "").strip()
+    if env_pin:
+        return env_pin
+    now = time.time()
+    if now - _PIN_CACHE["checked_at"] > _PIN_CACHE_TTL:
+        pin = ""
+        try:
+            cfg = load_config()
+            pin = str(cfg.get("api_pin", "") or "").strip()
+        except Exception:
+            pin = ""
+        _PIN_CACHE["value"] = pin
+        _PIN_CACHE["checked_at"] = now
+    return _PIN_CACHE["value"] or ""
+
+def _extract_pin(request: Request) -> str:
+    pin = (request.headers.get("x-record-pin") or "").strip()
+    if pin:
+        return pin
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return ""
+
+@app.middleware("http")
+async def enforce_pin_on_mutations(request: Request, call_next):
+    # Preflight CORS phải đi thẳng vào CORSMiddleware (nằm phía trong).
+    if request.method == "OPTIONS" or request.method not in ("POST", "PUT", "PATCH", "DELETE"):
+        return await call_next(request)
+
+    required = get_api_pin()
+    if required and _extract_pin(request) != required:
+        # Middleware này chạy NGOÀI CORSMiddleware -> tự gắn header CORS,
+        # nếu không trình duyệt sẽ báo lỗi CORS thay vì 401.
+        headers = {}
+        origin = request.headers.get("origin")
+        if origin:
+            headers = {
+                "Access-Control-Allow-Origin": origin,
+                "Access-Control-Allow-Headers": request.headers.get("access-control-request-headers", "*"),
+                "Access-Control-Allow-Methods": "GET, POST, PUT, PATCH, DELETE, OPTIONS",
+            }
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "PIN không hợp lệ hoặc thiếu header x-record-pin", "status": "unauthorized"},
+            headers=headers,
+        )
+    return await call_next(request)
 
 # load -> mutate -> save trên config.json phải nguyên tử: 2 request chồng lấp
 # (thêm 1 streamer / xóa 1 streamer / start_record tự thêm user) sẽ làm mất 1 trong 2 thay đổi.
@@ -117,7 +183,7 @@ def save_config(cfg):
         print(f"[!] Lỗi ghi config: {e}")
         if os.path.exists(tmp_path):
             try: os.remove(tmp_path)
-            except: pass
+            except Exception: pass
 
 _DURATION_CACHE = {}
 _DURATION_CACHE_LOCK = threading.Lock()
@@ -245,9 +311,9 @@ def clean_zombie_recordings(live_statuses=None):
             if is_local_recorder_running_for_user(u):
                 continue
 
-            # Heartbeat check: Nếu vừa mới được cập nhật trong 3 phút thì chắc chắn đang chạy trên Cloud Runner
+            # Heartbeat check: Nếu vừa mới được cập nhật trong 10 phút thì chắc chắn đang chạy trên Cloud Runner
             updated_at = item.get("updated_at", 0) if isinstance(item, dict) else 0
-            if updated_at and (now_ts - updated_at) < 180:
+            if updated_at and (now_ts - updated_at) < 600:
                 continue
 
             # Nếu quá 10 phút không có heartbeat, kiểm tra trực tiếp trên TikTok
@@ -260,7 +326,10 @@ def clean_zombie_recordings(live_statuses=None):
 
             if not is_live:
                 print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (quá 10p không heartbeat & Offline). Đang dọn dẹp...")
-                gdrive_manager.set_user_recording_status_drive(u, False)
+                try:
+                    threading.Thread(target=gdrive_manager.set_user_recording_status_drive, args=(u, False), daemon=True).start()
+                except Exception:
+                    pass
                 zombies_cleaned.append(u)
 
         return zombies_cleaned
@@ -375,15 +444,16 @@ def get_users(check_live: bool = True):
         # Khử trùng lặp và giữ thứ tự chuẩn
         users = list(dict.fromkeys([u.strip().replace("@", "").lower() for u in users_list if u.strip()]))
 
-        # Tự động đồng bộ lên Drive nếu Supabase có streamer mới
+        # Tự động đồng bộ lên Drive nếu Supabase có streamer mới (chạy nền để không block GET API)
         if d_users is not None and supa_users and (set(supa_users) - set(drive_users)):
-            try:
-                gdrive_manager.save_streamers_to_drive(users)
-                for u in supa_users:
-                    if u not in drive_users:
-                        gdrive_manager.create_streamer_folder_drive(u)
-            except Exception:
-                pass
+            def _bg_drive_folder_sync(all_u, new_u):
+                try:
+                    gdrive_manager.save_streamers_to_drive(all_u)
+                    for nu in new_u:
+                        gdrive_manager.create_streamer_folder_drive(nu)
+                except Exception:
+                    pass
+            threading.Thread(target=_bg_drive_folder_sync, args=(users, set(supa_users) - set(drive_users)), daemon=True).start()
 
         active_users = set()
         try:
@@ -396,11 +466,13 @@ def get_users(check_live: bool = True):
             active_keys = list(ACTIVE_RECORDING_TASKS.keys())
         active_users.update(active_keys)
         
-        # Kiểm tra live đa luồng song song (ThreadPoolExecutor) để tốc độ siêu nhanh
+        # Chỉ probe live status đối với các streamer CHƯA có trong active_users
+        # (Streamer đã nằm trong active_users chắc chắn đang quay & live, không cần scrape chậm)
+        users_to_probe = [u for u in users if u not in active_users]
         live_statuses = {}
-        if check_live and users:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users), 3)) as executor:
-                future_to_user = {executor.submit(get_user_live_details_cached, u): u for u in users}
+        if check_live and users_to_probe:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_probe), 8)) as executor:
+                future_to_user = {executor.submit(get_user_live_details_cached, u): u for u in users_to_probe}
                 for fut in concurrent.futures.as_completed(future_to_user):
                     u = future_to_user[fut]
                     try:
@@ -418,14 +490,14 @@ def get_users(check_live: bool = True):
 
         result = []
         for u in users:
+            is_recording = (u in active_users)
             det = live_statuses.get(u, {})
-            is_live = det.get("is_live", False)
+            is_live = det.get("is_live", False) or is_recording
             room_id = det.get("room_id")
             is_sub_only = det.get("is_sub_only", False)
             is_preview = det.get("is_preview", False)
             avatar_thumb = det.get("avatar_thumb")
             nickname = det.get("nickname")
-            is_recording = (u in active_users)
             if is_recording:
                 status_str = "recording"
                 is_live = True
@@ -999,8 +1071,33 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                         room_id = curr_det.get("room_id")
                     print(f"[⏩] [@{user}] Luồng tạm gián đoạn sau {dur:.1f}s nhưng streamer VẪN ĐANG LIVE. Tự động thu tiếp nối vào Phần {part_number} (còn thiếu {MAX_CHUNK_SECONDS - int(accumulated_seconds)}s)...")
                 else:
-                    print(f"[🏁] [@{user}] Streamer đã xuống live sau {accumulated_seconds:.1f}s tích lũy.")
-                    break
+                    # Streamer ngắt live khi chưa đủ 1:00:00 -> Chờ đúng 5 phút (300s) xác nhận offline chắc chắn
+                    cfg_offline_wait = load_config().get("offline_confirm_seconds", 300)
+                    print(f"[⏳] [@{user}] Tín hiệu live tạm ngắt sau {accumulated_seconds:.1f}s (< 1:00:00). Bắt đầu chờ {cfg_offline_wait//60} phút ({cfg_offline_wait}s) xác nhận offline...")
+                    streamer_reconnected = False
+                    offline_checks = max(1, int(cfg_offline_wait / 15))
+                    for _ in range(offline_checks):
+                        if stop_event and stop_event.is_set():
+                            break
+                        try:
+                            gdrive_manager.set_user_recording_status_drive(user, True)
+                        except Exception:
+                            pass
+                        time.sleep(15)
+                        recheck = recorder_core.check_live_details(user)
+                        if recheck.get("is_live"):
+                            streamer_reconnected = True
+                            if recheck.get("room_id"):
+                                room_id = recheck.get("room_id")
+                            print(f"[🔴] [@{user}] Streamer ĐÃ LIVE TRỞ LẠI! Tiếp tục thu tiếp nối vào Phần {part_number} (còn thiếu {MAX_CHUNK_SECONDS - int(accumulated_seconds)}s)...")
+                            break
+
+                    if streamer_reconnected:
+                        continue
+                    else:
+                        offline_confirmed = True
+                        print(f"[🏁] [@{user}] Đã xác nhận streamer offline đủ {cfg_offline_wait//60} phút ({accumulated_seconds:.1f}s tích lũy). Xuất bản video lên Drive & Supabase ngay...")
+                        break
 
             if not part_segments:
                 if consecutive_failures >= max_consecutive_failures:
@@ -1088,61 +1185,55 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 continue
 
             consecutive_failures = 0
-            is_final_part = bool(stop_event and stop_event.is_set())
+            is_final_part = offline_confirmed or bool(stop_event and stop_event.is_set())
             part_desc = "phần ghi sau cùng" if is_final_part else f"Phần {part_number}"
             print(f"[✓] [@{user}] Hoàn tất trọn vẹn {part_desc} ({final_dur:.1f}s): {os.path.basename(final_rec_file)}")
-            # Kiểm tra thời lượng video:
-            # Nếu là phần ghi sau cùng (đã xác nhận offline 10p) hoặc đủ 1 tiếng (>= 3000s) -> Xuất bản trực tiếp lên Drive chính và Supabase!
-            if not is_final_part and final_dur < 3000:
-                print(f"[📦] [@{user}] Video Phần {part_number} ngắn hơn 50 phút ({final_dur/60:.1f}p < 50p). Chuyển vào Cloud Staging Queue trên Google Drive...")
-                try:
-                    import staging_queue
-                    token = gdrive_manager.get_access_token()
-                    q_res = staging_queue.add_to_staging_queue(user, final_rec_file, final_dur, access_token=token)
-                    print(f"[📋] [@{user}] Trạng thái Staging Queue: {q_res.get('status')} - {q_res.get('message', '')}")
-                    if q_res.get("status") in ("queued", "packaged"):
-                        if final_rec_file and os.path.exists(final_rec_file):
-                            try:
-                                os.remove(final_rec_file)
-                                print(f"[🗑️] [@{user}] Đã giải phóng ổ cứng Render: xóa video tạm ({final_dur/60:.1f}p) sau khi chuyển vào Staging Queue thành công.")
-                            except Exception:
-                                pass
-                except Exception as sq_err:
-                    print(f"[!] [@{user}] Lỗi khi chuyển vào Staging Queue: {sq_err}")
-            else:
-                # Video đạt chuẩn >= 50 phút: Tải lên Drive chính lấy ID và đồng bộ Supabase Storage & Database
+
+            # Upload trực tiếp lên Drive và đồng bộ Supabase cho MỌI segment
+            # (segment đủ 1h upload ngay, segment cuối upload sau khi xác nhận offline 5 phút)
+            # File có thể biến mất giữa chừng (worker khác dọn, antivirus...) -> không để
+            # lỗi thumbnail/getsize làm sập TOÀN BỘ worker và mất phần vừa ghi.
+            thumb_f = None
+            try:
                 thumb_f = extract_middle_thumbnail(final_rec_file)
+            except Exception as th_err:
+                print(f"[!] [@{user}] Lỗi tạo thumbnail Phần {part_number}: {th_err}")
+            try:
                 sz = os.path.getsize(final_rec_file) if (final_rec_file and os.path.exists(final_rec_file)) else 0
-                rec_basename = os.path.basename(final_rec_file)
+            except OSError:
+                sz = 0
+            rec_basename = os.path.basename(final_rec_file)
 
-                # 1. Upload Google Drive trước để lấy drive_file_id
-                drive_file_id = None
-                drive_thumb_id = None
-                try:
-                    token = gdrive_manager.get_access_token()
-                    if token:
-                        root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
-                        sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
-                        ok = gdrive_manager.upload_file_to_drive(final_rec_file, sub_id, access_token=token)
-                        if ok:
-                            drive_file_id = ok if isinstance(ok, str) else None
-                            try:
-                                os.remove(final_rec_file)
-                                print(f"[🗑️] [@{user}] Đã xóa video tạm Phần {part_number} sau khi upload Drive thành công.")
-                            except Exception:
-                                pass
-                        if thumb_f and os.path.exists(thumb_f):
-                            t_ok = gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
-                            if t_ok and isinstance(t_ok, str):
-                                drive_thumb_id = t_ok
-                except Exception as gdrive_err:
-                    # KHÔNG để lỗi Drive làm sập toàn bộ worker: vẫn đồng bộ Supabase với file local còn lại
-                    print(f"[!] [@{user}] Lỗi tải lên Google Drive ở Phần {part_number}: {gdrive_err}")
+            # 1. Upload Google Drive trước để lấy drive_file_id
+            drive_file_id = None
+            drive_thumb_id = None
+            try:
+                token = gdrive_manager.get_access_token()
+                if token:
+                    root_id = gdrive_manager.find_or_create_folder("tiktok-record", access_token=token)
+                    sub_id = gdrive_manager.find_or_create_folder(user, parent_id=root_id, access_token=token)
+                    ok = gdrive_manager.upload_file_to_drive(final_rec_file, sub_id, access_token=token)
+                    if ok:
+                        drive_file_id = ok if isinstance(ok, str) else None
+                        try:
+                            os.remove(final_rec_file)
+                            print(f"[🗑️] [@{user}] Đã xóa video tạm Phần {part_number} sau khi upload Drive thành công.")
+                        except Exception:
+                            pass
+                    if thumb_f and os.path.exists(thumb_f):
+                        t_ok = gdrive_manager.upload_file_to_drive(thumb_f, sub_id, access_token=token)
+                        if t_ok and isinstance(t_ok, str):
+                            drive_thumb_id = t_ok
+            except Exception as gdrive_err:
+                # KHÔNG để lỗi Drive làm sập toàn bộ worker: vẫn đồng bộ Supabase với file local còn lại
+                print(f"[!] [@{user}] Lỗi tải lên Google Drive ở Phần {part_number}: {gdrive_err}")
 
-
-                # 2. Đồng bộ Supabase Storage & Database kèm drive_file_id
-                try:
-                    import supabase_sync
+            # 2. Đồng bộ Supabase Storage & Database kèm drive_file_id
+            try:
+                import supabase_sync
+                if not drive_file_id:
+                    print(f"[⚠️] [@{user}] Upload lên Drive thất bại -> KHÔNG tạo bản ghi Supabase cho {rec_basename} (tránh link chết). File local được GIỮ lại.")
+                else:
                     supabase_sync.sync_recording_to_supabase(
                         user=user,
                         filename=rec_basename,
@@ -1152,14 +1243,14 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                         drive_thumb_id=drive_thumb_id,
                         source="api_server"
                     )
-                except Exception as sb_err:
-                    print(f"[!] Lỗi đồng bộ Supabase từ bg_record_worker: {sb_err}")
-                finally:
-                    if thumb_f and os.path.exists(thumb_f):
-                        try:
-                            os.remove(thumb_f)
-                        except Exception:
-                            pass
+            except Exception as sb_err:
+                print(f"[!] Lỗi đồng bộ Supabase từ bg_record_worker: {sb_err}")
+            finally:
+                if thumb_f and os.path.exists(thumb_f):
+                    try:
+                        os.remove(thumb_f)
+                    except Exception:
+                        pass
 
             # Dọn phân đoạn gốc: nội dung đã nằm trong final_rec_file (đã ghép/đã bàn giao).
             # Không xóa ở đây thì mỗi phần sẽ còn 2 bản sao -> đầy ổ cứng và
@@ -1192,12 +1283,16 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                 time.sleep(12)
                 curr_det = recorder_core.check_live_details(user)
 
+            if offline_confirmed:
+                print(f"[🏁] [@{user}] Buổi live đã hoàn tất trọn vẹn và đã gửi lên Drive & Supabase sau 5 phút offline.")
+                break
+
             if not curr_det.get("is_live"):
                 consecutive_offline_checks += 1
                 if consecutive_offline_checks < 3:
                     print(f"[⏳] [@{user}] Chưa xác nhận streamer xuống live (lần {consecutive_offline_checks}/3). Kiểm tra lại...")
                     continue
-                cfg_offline_wait = load_config().get("offline_confirm_seconds", 90)
+                cfg_offline_wait = load_config().get("offline_confirm_seconds", 300)
                 print(f"[⏳] [@{user}] Xác nhận {consecutive_offline_checks} lần streamer ngắt live. Chờ xác nhận offline {cfg_offline_wait//60} phút ({cfg_offline_wait}s)...")
                 offline_checks = max(1, int(cfg_offline_wait / 15))
                 streamer_back = False
@@ -1212,25 +1307,17 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                     recheck = recorder_core.check_live_details(user)
                     if recheck.get("is_live"):
                         streamer_back = True
-                        print(f"[🔴] [@{user}] Streamer ĐÃ LIVE TRỞ LẠI! Tự động ghi hình nối tiếp Phần {part_number}...")
+                        print(f"[🔴] [@{user}] Streamer ĐÃ LIVE TRỞ LẠI! Tự động ghi hình nối tiếp Phần {part_number} (1:00:00 tiếp theo)...")
                         break
                 if streamer_back:
                     consecutive_offline_checks = 0
                     continue
 
-                print(f"[🏁] [@{user}] ĐÃ XÁC NHẬN OFFLINE ĐỦ {cfg_offline_wait//60} PHÚT. Kiểm tra và xuất bản phần ghi sau cùng (nếu còn trong Staging Queue)...")
-                try:
-                    import staging_queue
-                    token = gdrive_manager.get_access_token()
-                    pkg_res = staging_queue.package_and_publish_queue(user, access_token=token)
-                    if pkg_res.get("ok"):
-                        print(f"[✓] [@{user}] Đã xuất bản phần ghi sau cùng từ Staging Queue: {pkg_res.get('filename')}")
-                except Exception as sq_flush_err:
-                    print(f"[!] [@{user}] Lỗi xả Staging Queue sau offline: {sq_flush_err}")
+                print(f"[🏁] [@{user}] ĐÃ XÁC NHẬN OFFLINE ĐỦ {cfg_offline_wait//60} PHÚT. Buổi live đã kết thúc hoàn toàn.")
                 break
             else:
                 consecutive_offline_checks = 0
-                print(f"[⏩] [@{user}] Streamer VẪN ĐANG LIVE! Tự động ghi hình nối tiếp Phần {part_number} (1 tiếng tiếp theo)...")
+                print(f"[⏩] [@{user}] Streamer VẪN ĐANG LIVE! Tự động ghi hình nối tiếp Phần {part_number} (1:00:00 tiếp theo)...")
 
     except Exception as e:
         print(f"[!] Lỗi ghi hình worker: {e}")
@@ -1257,19 +1344,7 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
             except Exception:
                 pass
 
-        # ponytail: mirror cloud_daemon finally — flush staging chỉ khi streamer chưa bị xóa
-        is_user_deleted = bool(stop_event and getattr(stop_event, "user_deleted", False))
-        if not is_user_deleted:
-            try:
-                import staging_queue
-                tok = gdrive_manager.get_access_token()
-                pkg_res = staging_queue.package_and_publish_queue(user, access_token=tok)
-                if pkg_res.get("ok") and pkg_res.get("filename"):
-                    print(f"[✨] [@{user}] Tự động đóng gói & xuất bản Staging Queue: {pkg_res.get('filename')}")
-                elif not pkg_res.get("ok") and pkg_res.get("error"):
-                    print(f"[!] [@{user}] Staging Queue khi kết thúc live: {pkg_res.get('error', '')}")
-            except Exception as flush_err:
-                print(f"[!] [@{user}] Lỗi flush Staging Queue: {flush_err}")
+        # Upload trực tiếp lên Drive, không sử dụng Staging Queue
 
         if rec_lock_cm:
             try:
@@ -1334,7 +1409,7 @@ def start_record(req: RecordRequest, bg_tasks: BackgroundTasks):
                 u_name = it.get("username") if isinstance(it, dict) else str(it)
                 if u_name and u_name.strip().replace("@", "").lower() == user:
                     up_at = it.get("updated_at", 0) if isinstance(it, dict) else 0
-                    if now_ts - up_at < 180:  # ponytail: TTL đồng bộ với zombie cleaner và cloud_daemon (2+ heartbeat cycles ~75s)
+                    if now_ts - up_at < 180:  # ponytail: TTL chống trùng với cloud_daemon (2+ heartbeat cycle 60s); zombie cleaner (api_server.py:316) cho phép tới 600s rồi mới tự dọn
                         return {
                             "message": f"@{user} đang được Cloud Runner ghi hình (heartbeat {now_ts - up_at}s trước).",
                             "is_recording": True,
@@ -1820,6 +1895,12 @@ def stream_video_by_id(file_id: str, request: Request, redirect: bool = True):
     tok = gdrive_manager.get_access_token()
     if not tok:
         raise HTTPException(status_code=500, detail="Không có quyền truy cập Google Drive")
+
+    # CHỈ ép quyền public cho file thuộc tiktok-record/. Nếu thiếu bước này thì endpoint
+    # không auth này có thể set quyền `anyone` cho bất kỳ file Drive nào token nhìn thấy.
+    if not gdrive_manager.is_recorder_owned_file(file_id, access_token=tok):
+        print(f"[🛡️] Từ chối stream file_id không thuộc tiktok-record/: {file_id}")
+        raise HTTPException(status_code=403, detail="file_id không thuộc thư mục ghi hình")
 
     try:
         gdrive_manager.make_file_public(file_id, access_token=tok)

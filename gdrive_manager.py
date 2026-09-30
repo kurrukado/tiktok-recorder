@@ -203,7 +203,13 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
         return False
 
     file_name = os.path.basename(file_path)
-    file_size = os.path.getsize(file_path)
+    try:
+        file_size = os.path.getsize(file_path)
+    except OSError as size_err:
+        # File biến mất giữa lúc caller kiểm tra exists() và lúc này -> trả False
+        # thay vì ném FileNotFoundError làm sập worker đang ghi hình.
+        print(f"  [!] Không đọc được dung lượng {file_name} (file đã biến mất?): {size_err}")
+        return False
     file_size_mb = file_size / (1024 * 1024)
 
     # Chặn tải lên các file video MP4 dung lượng rác lỗi 0:00s
@@ -410,6 +416,86 @@ def upload_file_to_drive(file_path, parent_folder_id, access_token=None):
     except Exception as e:
         print(f"\n  [!] Lỗi khi tải file {file_name}: {e}")
         return False
+
+# Cache kết quả xác minh "file có thuộc tiktok-record/ không" (file_id -> (kết quả, thời điểm))
+_OWNERSHIP_CACHE = {}
+_OWNERSHIP_CACHE_LOCK = threading.Lock()
+_OWNERSHIP_TTL = 600.0
+_MAX_PARENT_HOPS = 8
+
+def is_recorder_owned_file(file_id, access_token=None):
+    """
+    Xác minh file_id nằm trong thư mục `tiktok-record/` (kể cả file con, cháu...).
+
+    Bảo vệ các endpoint nhận file_id từ client (vd: /api/stream-video-id/{file_id})
+    khỏi việc ép quyền `anyone` cho BẤT KỲ file Drive nào cùng refresh token nhìn thấy
+    (streamers.json, active_recordings.json, file riêng tư khác...).
+    """
+    if not file_id or not isinstance(file_id, str) or len(file_id) > 128:
+        return False
+
+    now = time.time()
+    with _OWNERSHIP_CACHE_LOCK:
+        hit = _OWNERSHIP_CACHE.get(file_id)
+    if hit and (now - hit[1]) < _OWNERSHIP_TTL:
+        return hit[0]
+
+    if not access_token:
+        access_token = get_access_token()
+    if not access_token:
+        return False
+
+    headers = {"Authorization": f"Bearer {access_token}"}
+    owned = False
+    try:
+        root_id = find_folder("tiktok-record", access_token=access_token)
+        if not root_id:
+            return False
+
+        seen = set()
+        cur = file_id
+        for _ in range(_MAX_PARENT_HOPS):
+            if not cur or cur in seen:
+                break
+            seen.add(cur)
+            if cur == root_id:
+                owned = True
+                break
+            res = None
+            try:
+                res = requests.get(
+                    f"https://www.googleapis.com/drive/v3/files/{cur}",
+                    headers=headers,
+                    params={"fields": "id,name,parents,trashed"},
+                    timeout=10,
+                )
+                if res.status_code != 200:
+                    return False
+                meta = res.json() or {}
+            except Exception:
+                return False
+            finally:
+                if res is not None:
+                    try:
+                        res.close()
+                    except Exception:
+                        pass
+            if meta.get("trashed"):
+                return False
+            parents = meta.get("parents") or []
+            if not parents:
+                break
+            cur = parents[0]
+    except Exception as verify_err:
+        print(f"  [!] Không xác minh được chủ sở hữu file {file_id}: {verify_err}")
+        return False
+
+    with _OWNERSHIP_CACHE_LOCK:
+        # Giữ TTL đầy đủ nếu đúng, rút ngắn nếu sai (tránh cache nhầm lâu khi lỗi mạng tạm).
+        _OWNERSHIP_CACHE[file_id] = (owned, now if owned else now - _OWNERSHIP_TTL + 30)
+        if len(_OWNERSHIP_CACHE) > 512:
+            _OWNERSHIP_CACHE.clear()
+    return owned
 
 def make_file_public(file_id, access_token=None):
     """Cấp quyền đọc công khai (anyoneWithLink) để tải qua CDN tốc độ cao không cần đăng nhập."""
@@ -639,11 +725,13 @@ def load_active_recordings_from_drive(access_token=None, as_details=False):
             print(f"[!] Lỗi đọc active_recordings.json từ Drive: {e}")
         return []
 
-def set_user_recording_status_drive(user: str, is_recording: bool, access_token=None):
+def set_users_recording_status_drive(users: list, is_recording: bool = True, access_token=None):
     """
-    Cập nhật trạng thái đang quay của một streamer lên Google Drive (Thread-Safe).
+    Cập nhật trạng thái đang quay của danh sách streamer lên Google Drive trong 1 request (Thread-Safe).
     Tự động lưu kèm trường updated_at (epoch timestamp) để theo dõi TTL.
     """
+    if not users:
+        return True
     with _DRIVE_STATUS_LOCK:
         try:
             if not access_token:
@@ -660,8 +748,6 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
             read_failed = False
             with requests.get(url, headers=headers, timeout=8) as res:
                 if res.status_code != 200:
-                    # PHÂN BIỆT "lookup lỗi" với "file chưa tồn tại": rơi vào nhánh tạo mới
-                    # sẽ nhân bản active_recordings.json và reader lấy file cũ -> mất heartbeat.
                     print(f"[!] Không tra được active_recordings.json trên Drive (HTTP {res.status_code}). KHÔNG ghi để tránh mất dữ liệu streamer khác.")
                     return False
                 files = res.json().get("files", [])
@@ -680,16 +766,11 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
                         read_failed = True
 
             if read_failed:
-                # current_raw = [] trong trường hợp này CHƯA PHẢI "không ai quay" mà là
-                # "đọc thất bại". Ghi đè bây giờ sẽ xóa heartbeat của mọi streamer khác
-                # -> cloud_daemon/api_server khởi động ghi hình trùng lặp.
                 print("[!] Đọc active_recordings.json thất bại. Bỏ qua lần cập nhật này để không xóa heartbeat của streamer khác.")
                 return False
 
-            user = user.strip().replace("@", "").lower()
             now_ts = int(time.time())
 
-            # Chuẩn hóa dữ liệu sang danh sách dict với username và updated_at
             normalized_active = []
             for it in current_raw:
                 if isinstance(it, dict) and "username" in it:
@@ -703,17 +784,20 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
                         "updated_at": now_ts
                     })
 
+            clean_users = [str(u).strip().replace("@", "").lower() for u in users if str(u).strip()]
             if is_recording:
-                found = False
-                for entry in normalized_active:
-                    if entry["username"] == user:
-                        entry["updated_at"] = now_ts
-                        found = True
-                        break
-                if not found:
-                    normalized_active.append({"username": user, "updated_at": now_ts})
+                for u in clean_users:
+                    found = False
+                    for entry in normalized_active:
+                        if entry["username"] == u:
+                            entry["updated_at"] = now_ts
+                            found = True
+                            break
+                    if not found:
+                        normalized_active.append({"username": u, "updated_at": now_ts})
             else:
-                normalized_active = [it for it in normalized_active if it["username"] != user]
+                users_set = set(clean_users)
+                normalized_active = [it for it in normalized_active if it["username"] not in users_set]
 
             content_bytes = json.dumps(normalized_active, indent=2, ensure_ascii=False).encode("utf-8")
             if file_id:
@@ -735,6 +819,13 @@ def set_user_recording_status_drive(user: str, is_recording: bool, access_token=
         except Exception as e:
             print(f"[!] Lỗi cập nhật active_recordings lên Drive: {e}")
             return False
+
+def set_user_recording_status_drive(user: str, is_recording: bool, access_token=None):
+    """
+    Cập nhật trạng thái đang quay của một streamer lên Google Drive (Thread-Safe).
+    Tự động lưu kèm trường updated_at (epoch timestamp) để theo dõi TTL.
+    """
+    return set_users_recording_status_drive([user], is_recording=is_recording, access_token=access_token)
 
 def create_streamer_folder_drive(user: str, access_token=None):
     """
