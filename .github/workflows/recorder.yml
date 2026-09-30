@@ -19,7 +19,7 @@ permissions:
 jobs:
   run-recorder:
     runs-on: ubuntu-latest
-    timeout-minutes: 65
+    timeout-minutes: 210
 
     steps:
       - name: Checkout Code
@@ -87,7 +87,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          python -u cloud_daemon.py --duration-minutes 46 --interval 20
+          python -u cloud_daemon.py --duration-minutes 170 --interval 20
 
       - name: Trigger Next Run (Continuous 24-7 Relay)
         if: always()

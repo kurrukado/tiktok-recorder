@@ -682,7 +682,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
 
         def _fail_validation(*_a, **_k):
             v_calls["n"] += 1
-            if v_calls["n"] > 4:
+            if v_calls["n"] > 8:
                 # Chốt chặn: nếu logic break bị hỏng thì fail ngay thay vì treo vô hạn.
                 raise RuntimeError(f"validate_playable_video bị gọi {v_calls['n']} lần -> worker kẹt vòng lặp")
             return (False, "corrupt container", 0.0)
@@ -704,7 +704,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
                 api_server.bg_record_worker("worker_test_user")
             out = buf.getvalue()
 
-        self.assertEqual(v_calls["n"], 4, "Worker phải dừng đúng sau max_consecutive_failures=4 lần lỗi liên tiếp")
+        self.assertEqual(v_calls["n"], 8, "Worker phải dừng đúng sau max_consecutive_failures=8 lần lỗi liên tiếp")
         self.assertIn("Dừng tích lũy", out)
 
         # 2. Sub-only preview: không lấy được link stream -> dừng ở cùng ngưỡng thất bại
@@ -712,7 +712,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
 
         def _no_stream(*_a, **_k):
             cs_calls["n"] += 1
-            if cs_calls["n"] > 4:
+            if cs_calls["n"] > 8:
                 raise RuntimeError(f"check_live_status bị gọi {cs_calls['n']} lần -> worker kẹt vòng lặp")
             return (False, None)
 
@@ -730,7 +730,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
                 api_server.bg_record_worker("vip_worker_user")
             out2 = buf2.getvalue()
 
-        self.assertEqual(cs_calls["n"], 4, "Worker VIP sub-only phải dừng sau max_consecutive_failures=4 lần")
+        self.assertEqual(cs_calls["n"], 8, "Worker VIP sub-only phải dừng sau max_consecutive_failures=8 lần")
         self.assertIn("Không lấy được link stream", out2)
 
     def test_gc_collect_exception_safety_in_api_server(self):

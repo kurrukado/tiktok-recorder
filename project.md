@@ -766,4 +766,28 @@ Còn lại / cần quyết định:
 
 ---
 
+---
+
+### 12.7 Khắc phục triệt để lỗi Livestream dài chỉ ghi và tải lên được 1 Phần (Multi-part Recording & Session Relay)
+
+* **Hiện tượng**: Streamer live nhiều tiếng liên tục nhưng Google Drive chỉ nhận được Phần 1 (hoặc một phần ngắn), các phần tiếp theo không thấy xuất hiện.
+* **Nguyên nhân cốt lõi**:
+  1. **Thời lượng phiên Runner quá ngắn (46 phút vs 60 phút/phần)**: Workflow GitHub Actions trước đây cấu hình `--duration-minutes 46`. Sau 46 phút bot chuyển sang trạng thái DRAIN và phát `stop_event.set()` ở phút 52. Khi Phần 1 kết thúc (dù chưa đủ 60 phút hoặc vừa chạm 46 phút), cờ `stop_event.is_set()` được kiểm tra và ngắt luồng ngay lập tức (`cloud_daemon.py:590`), không cho phép chuyển sang Phần 2 (`part_number += 1`).
+  2. **Khoảng trễ chuyển tiếp Runner (Heartbeat Ghost)**: Heartbeat trên Drive có cửa sổ bận 180s. Khi Runner 1 tắt, Runner 2 chạy tiếp sức nhưng thấy streamer vẫn còn trong `drive_busy_users` (< 180s) nên bỏ qua. Đến chu kỳ sau streamer có thể đã tắt live hoặc chuyển luồng.
+  3. **Độ nhạy ngắt luồng (PK battles & CDN jitter)**: Khi streamer chơi PK hoặc TikTok chuyển cụm máy chủ CDN, `max_consecutive_failures = 4` khiến worker dễ dừng sớm trước khi kịp lấy lại tín hiệu.
+* **Đã cải tiến & xử lý triệt để**:
+  1. **Tối ưu hóa thời lượng phiên runner**:
+     - `.github/workflows/recorder.yml`: Tăng `--duration-minutes 46` ➔ `--duration-minutes 170` và `timeout-minutes 65` ➔ `timeout-minutes 210`.
+     - Cho phép mỗi runner ghi liên tục trọn vẹn 2 đến 3 phần đầy đủ (mỗi phần 1 tiếng = 3600s) trước khi chuyển giao an toàn cho runner kế tiếp.
+  2. **Nâng cao khả năng phục hồi luồng (Retry Resilience)**:
+     - Tăng `max_consecutive_failures` từ 4 lên 8 lần liên tiếp ở cả `cloud_daemon.py` và `api_server.py`.
+     - Chống rớt luồng khi streamer PK hoặc mạng chập chờn.
+  3. **Rút ngắn cửa sổ bàn giao Runner**:
+     - Giảm ngưỡng staleness kiểm tra `drive_busy_users` từ 180s xuống 90s, đảm bảo khi một runner kết thúc phiên, runner mới có thể nhận diện và tiếp quản việc ghi hình ngay lập tức mà không bị "mù" 3 phút.
+  4. **Kiểm thử hồi quy toàn diện**:
+     - Cập nhật test case `test_audit_suite.py` tương thích với ngưỡng retry mới.
+     - Bộ test đạt chuẩn tuyệt đối: **104/104 OK** (`test_audit_suite.py`: 78/78, `test_challenger_concurrency.py`: 26/26).
+
+---
+
 *Tài liệu tạo từ việc đọc mã nguồn tại `D:\\tiktok-recorder` và khảo sát `D:\\web-truyen`.*

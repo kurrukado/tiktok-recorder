@@ -219,7 +219,7 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
     max_vip_attempts = 5
     guest_session = None
     consecutive_failures = 0
-    max_consecutive_failures = 4
+    max_consecutive_failures = 8
 
     # Kiểm tra xem buổi live có phải VIP Sub-only không qua check_live_details
     live_details = recorder_core.check_live_details(user)
@@ -710,8 +710,8 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
     max_seconds = max_minutes * 60
     # Giai đoạn DRAIN: ngưng khởi động luồng mới, chờ luồng đang ghi chốt + upload.
     DRAIN_GRACE_SECONDS = 6 * 60
-    # Chốt an toàn tuyệt đối tính từ lúc bắt đầu DRAIN (GitHub Actions timeout-minutes: 65,
-    # phiên chạy --duration-minutes 46 -> 46 + 10 = 56 phút, vẫn dư dả trước mốc 65 phút).
+    # Chốt an toàn tuyệt đối tính từ lúc bắt đầu DRAIN (GitHub Actions timeout-minutes: 210,
+    # phiên chạy --duration-minutes 170 -> 170 + 10 = 180 phút, vẫn dư dả trước mốc 210 phút).
     hard_limit_seconds = max_seconds + 10 * 60
     drain_started_elapsed = None
 
@@ -831,8 +831,8 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
             for it in drive_details:
                 u_name = it.get("username") if isinstance(it, dict) else str(it)
                 up_at = it.get("updated_at", 0) if isinstance(it, dict) else 0
-                # ponytail: 180s covers >2 heartbeat cycles (~75s), eliminating 10-min blind spot on runner rotation
-                if u_name and (now_ts - up_at < 180):
+                # ponytail: 90s covers 1+ heartbeat cycle (~75s), faster runner rotation after clean exit
+                if u_name and (now_ts - up_at < 90):
                     drive_busy_users.add(u_name.strip().replace("@", "").lower())
         except Exception:
             pass

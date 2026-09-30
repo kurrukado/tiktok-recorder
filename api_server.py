@@ -881,7 +881,7 @@ MAX_CHUNK_SECONDS = 3600  # Đúng 1 tiếng (1h = 3600s), tự động tách vi
 def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Optional[threading.Event] = None):
     part_number = 1
     consecutive_failures = 0
-    max_consecutive_failures = 4
+    max_consecutive_failures = 8
     max_vip_attempts = 5
     # Một lần check live lỗi/False KHÔNG được kết thúc phiên: cần N lần liên tiếp.
     consecutive_offline_checks = 0
