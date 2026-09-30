@@ -507,14 +507,14 @@ app/record/page.js ─────────────────► Supaba
 | Thành phần trong web-truyen | Vai trò | Vị trí |
 | :--- | :--- | :--- |
 | `app/record/page.js` (**1908 dòng**, 87KB) + `page.module.css` | Dashboard: PIN gate, CRUD streamer, trạng thái live, lưới video, modal phát (HTML5 + iframe Drive), cache localStorage → Supabase → API | `app/record/page.js` |
-| `app/api/record/[...path]/route.js` | **Proxy mọi endpoint của tool**: GET/POST/DELETE; tự chọn `TIKTOK_RECORDER_API_URL` → fallback `https://tiktok-api-i0o8.onrender.com/api/...` (`:12`, `:22`); PIN `RECORD_PIN` mặc định `'2026'` (`:317`, `:391`) | `app/api/record/[...path]/route.js` |
+| `app/api/record/[...path]/route.js` | **Proxy mọi endpoint của tool**: GET/POST/DELETE; tự chọn `TIKTOK_RECORDER_API_URL` → ưu tiên `record.kurumieverything.io.vn` (Cloudflare Tunnel) → `localhost:8000` → fallback `tiktok-api-i0o8.onrender.com`; PIN `RECORD_PIN` mặc định `'2026'` | `app/api/record/[...path]/route.js` |
 | Proxy special-cases | `stream-video-id/<id>` (`:55`) → proxy chunk có Range 206 (vượt `Cross-Origin-Resource-Policy` của Drive); `download-drive/<id>` (`:135`) bypass cảnh báo virus >100MB; chặn kéo `video/*` qua server (`:252`) — giữ 0-byte bandwidth | `app/api/record/[...path]/route.js` |
 | `app/api/record/dispatch/route.js` | Kích hoạt phiên ghi trên GitHub Actions: `GITHUB_PAT||WORKFLOW_PAT`, repo mặc định `kurrukado/tiktok-recorder` (`:6-8`) | `app/api/record/dispatch/route.js` |
 | `app/api/record/sync/route.js` | Nhận cron: chấp nhận `CRON_SECRET` hoặc `RECORD_PIN` (`:7-18`) → chạy sync | `app/api/record/sync/route.js` |
 | `scripts/auto-sync-recordings.mjs` | Poll `GET /api/recordings` mỗi **30s** (`POLL_INTERVAL_MS:7`), tải thumbnail, upload `covers/record-thumbnails/...`, upsert `tiktok_recordings` | `scripts/auto-sync-recordings.mjs` |
 | `lib/record-queue.js` (7.5KB) | Hàng đợi tuần tự hoá mọi call API recorder (coalesce, timeout) | `lib/record-queue.js` |
 | `lib/supabase.js` | Client Supabase anon-key (fallback hard-code URL/key `:3-4`) | `lib/supabase.js` |
-| `start-all-services.mjs` / `start.bat` | Khởi động song song `server-anh.mjs:4000` + **`kuruRecord/api_server.py:8000`** (probe `/api/health`) + `auto-sync-recordings.mjs` + cloudflared | root |
+| `start-all-services.mjs` / `start.bat` | Khởi động song song `server-anh.mjs:4000` + **`api_server.py:8000`** (local & Cloudflare Tunnel) + `auto-sync-recordings.mjs` + cloudflared | root |
 | `.github/workflows/recorder.yml` + `repair-watchdog.yml` | Bản sao 2 workflow, `working-directory: ./kuruRecord` | `.github/workflows/` |
 | `ProjectDefination\kuruRecord.md` (rev 3.4.0) | Spec A-Z của hệ thống record (topology, DDL, pipeline, invariants) | `ProjectDefination/` |
 | `.agents/skills/kuru-audit` | Skill audit 5 assertion (zero bandwidth, queue, memory, bitstream, Supabase) | `.agents/skills/` |
@@ -720,6 +720,23 @@ Còn lại / cần quyết định:
 * **Chưa xác nhận được từ ảnh** — cần user cho biết ảnh chụp ở đoạn nào của file
   (đầu / giữa / sau upload) và file `.mp4` gốc nếu có, để phân biệt giữa bắt-mới-GOP,
   file đã qua `sanitize_mp4_bitstream`, hay segment khác độ phân giải bị ghép.
+
+---
+
+### 12.4 Vá lỗi nạp Cookie 18+/AI và Lỗi kết nối API Recorder từ Web ("Lỗi API Recorder")
+
+1. **Lỗi Cookie Native Live API (Stream 18+ và AI)**:
+   * **Nguyên nhân**: `load_cookies()` trước đây chỉ được gọi ở Method 1 (Scrape HTML), trong khi Method 0 (Native API) chạy trước và bị gọi ẩn danh không có cookie -> TikTok trả về lỗi `4003110` hoặc coi là offline với live 18+/AI.
+   * **Đã sửa**: Đưa `if cookies is None: cookies = load_cookies()` lên đầu cả `check_live_details()` và `get_stream_urls()`. Nâng cấp `load_cookies()` tự động tìm kiếm đa đường dẫn: `cookies.json` local -> `D:\web-truyen\kuruRecord\cookies.json` -> env `TIKTOK_SESSION_ID` -> `config.json`.
+2. **Lỗi `POST /api/users` dính cache offline cũ**:
+   * **Nguyên nhân**: Frontend thêm streamer khi vừa live nhưng `get_user_live_details_cached()` trả về cache offline 60s trước đó -> không tự động bật record ngay.
+   * **Đã sửa**: Bổ sung `with LIVE_CACHE_LOCK: LIVE_CACHE.pop(user, None)` để ép truy vấn tươi từ TikTok ngay lúc thêm streamer.
+3. **Lỗi "Lỗi API Recorder" & Treo kết nối trên Web**:
+   * **Nguyên nhân**: Web Next.js cấu hình gọi Render (`https://tiktok-api-i0o8.onrender.com`). Render Free bị ngủ đông sau 15p không dùng, mất 50-70s khởi động lại trong khi proxy timeout chỉ 25s -> web báo lỗi timeout / ngoại tuyến.
+   * **Đã sửa**:
+     * Định tuyến Cloudflare Tunnel `https://record.kurumieverything.io.vn` trỏ trực tiếp về `127.0.0.1:8000` (được cấu hình trong `~/.cloudflared/config.yml`).
+     * Cập nhật Next.js proxy `route.js` trong `web-truyen` thêm các candidate ưu tiên: Tunnel `record.kurumieverything.io.vn` và `http://127.0.0.1:8000` trước khi fallback sang Render.
+     * Cập nhật `D:\web-truyen\start.bat` và `start-all-services.mjs` tự động bật kèm `python d:\tiktok-recorder\api_server.py` trên Port 8000.
 
 ---
 
