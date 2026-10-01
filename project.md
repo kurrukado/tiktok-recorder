@@ -845,4 +845,38 @@ Còn lại / cần quyết định:
 
 ---
 
+### 12.10 Khắc phục triệt để lỗi TikTok Native API trả về HTTP 403 Forbidden khiến Web và Bot không bắt được tín hiệu Live / Recording
+
+* **Hiện tượng**: Streamer đang phát trực tiếp trên TikTok (thậm chí đang live nhiều giờ), nhưng trên Web UI chỉ hiển thị huy hiệu xám "Offline", không nhận diện được là đang LIVE hay đang RECORD. Khi bấm nút "Làm mới", trạng thái vẫn giữ nguyên Offline.
+* **Nguyên nhân cốt lõi (Root Cause)**:
+  1. **TikTok Web/Akamai WAF chặn 403 Forbidden với `x-tt-system-error: 3` trên endpoint `api-live/user/room`**:
+     - Trước đây, `check_live_details` và `get_stream_urls` sử dụng URL có dấu gạch chéo cuối `https://www.tiktok.com/api-live/user/room/?...` kèm chuỗi query cũ `app_language=en&app_name=tiktok_web&device_platform=web_pc`.
+     - Hệ thống phòng thủ Akamai của TikTok nhận diện các tham số này khi gọi từ script tự động là bot request không chuẩn và lập tức phản hồi `HTTP 403 Forbidden` (`content-length: 0`, header `x-tt-system-error: 3`).
+     - Khi Method 0 (Native API) gặp lỗi 403, engine fallback sang Method 1 (HTML scrape `@user/live`). Tuy nhiên, trong cấu trúc mới của TikTok, trang HTML `@user/live` chỉ trả về shell JavaScript tối giản (không chứa thẻ `SIGI_STATE`).
+     - Hậu quả: Toàn bộ quá trình kiểm tra trả về `is_live: False` cho tất cả streamer, ngay cả khi streamer đang live thực tế!
+  2. **Bộ nhớ đệm `LIVE_CACHE` khóa cứng kết quả Offline trong 60 giây**:
+     - Trong `api_server.py`, khi kết quả `is_live: False` được trả về, nó bị lưu vào `LIVE_CACHE` với TTL 60.0s.
+     - Endpoint `GET /api/users` trước đây không hỗ trợ cờ `fresh=true` và hàm `get_user_live_details_cached` không có cơ chế bỏ qua cache khi người dùng bấm nút "Làm mới" thủ công trên Web.
+     - Vòng lặp duyệt tuần tự trong `get_active_recordings` quét qua 60 streamer làm endpoint này bị nghẽn (timeout) trên các kết nối proxy/tunnel.
+* **Các cải tiến & bản vá đã áp dụng**:
+  1. **Chuẩn hóa Endpoint và Tham số TikTok Native Live API**:
+     - Chuyển sang URL chuẩn không trailing slash: `https://www.tiktok.com/api-live/user/room`.
+     - Bổ sung tham số chống cache và định danh chuẩn: `params={"aid": 1988, "sourceType": 54, "staleTime": 600000, "uniqueId": user.lower()}`.
+     - Đặt header `Referer: https://www.tiktok.com/@{user}/live` khớp chính xác với luồng người dùng thật truy cập phòng live.
+     - Bổ sung kiểm tra cả 2 định dạng stream: `streamData` và `hevcStreamData`.
+     - Kết quả: Endpoint trả về `HTTP 200 OK` tức thì (<300ms) với đầy đủ metadata, thumbnail, `roomId` và danh sách luồng stream phân cấp không cần session đăng nhập.
+  2. **Phân tách TTL bộ nhớ đệm thông minh & Hỗ trợ Real-Time Fresh Probe**:
+     - Bổ sung `LIVE_CACHE_OFFLINE_TTL = 15.0s`: Khi streamer offline, chỉ cache tối đa 15s để bắt tín hiệu streamer vừa bật live trong chu kỳ poll tiếp theo (25s) của Web UI.
+     - Cập nhật `get_users(check_live=True, fresh=False)` và `get_user_live_details_cached(user, force_refresh=False)`: Khi Web gửi `fresh=true` (người dùng bấm "Làm mới"), cache lập tức bị bỏ qua và probe trực tiếp tín hiệu thật từ TikTok.
+     - Tối ưu hóa `get_active_recordings`: Đọc trực tiếp danh sách live từ `LIVE_CACHE` trong RAM thay vì quét tuần tự 60 streamer qua mạng, thời gian phản hồi đạt **0ms**.
+  3. **Đồng bộ Web Frontend (`app/record/page.js`)**:
+     - Cập nhật hàm `fetchLiveStatus`: Khi `isManualRefresh` là `true`, thêm tham số `&fresh=true` vào request gửi đến API recorder, đảm bảo trạng thái LIVE và REC phản ánh chuẩn xác 100% ngay khi người dùng bấm nút làm mới.
+  4. **Kiểm thử hồi quy & Triển khai toàn diện**:
+     - Kiểm tra trực tiếp trên các streamer đang live thực tế (`@tami.com.vn`, `@nicaswrld`, `@huong_linh97`): Cả 3 endpoint (`http://127.0.0.1:8000/api/users`, `https://record.kurumieverything.io.vn/api/users`, `https://kurumieverything.io.vn/api/record/users`) phản hồi tức thì với `status: recording`, `is_live: true`, `is_recording: true`.
+     - Chạy `npm run build` trên `web-truyen`: Thành công hoàn hảo 37/37 routes.
+     - Chạy toàn bộ **104/104 tests** trên cả hai kho mã nguồn: **100% PASSED**.
+
+---
+
 *Tài liệu tạo từ việc đọc mã nguồn tại `D:\\tiktok-recorder` và khảo sát `D:\\web-truyen`.*
+

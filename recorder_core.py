@@ -227,19 +227,28 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
 
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     try:
-        api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
-        for imp in ["safari15_5", "chrome136"]:
+        api_url = "https://www.tiktok.com/api-live/user/room"
+        api_params = {
+            "aid": 1988,
+            "sourceType": 54,
+            "staleTime": 600000,
+            "uniqueId": user.lower(),
+        }
+        api_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+            "Referer": f"https://www.tiktok.com/@{user}/live",
+            "Accept": "*/*",
+        }
+        for imp in ["chrome136", "safari15_5", None]:
             api_res = None
             try:
                 req_kwargs = {
-                    "impersonate": imp,
+                    "params": api_params,
                     "timeout": 6,
-                    "headers": {
-                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                        "Referer": "https://www.tiktok.com/",
-                        "Accept": "*/*",
-                    }
+                    "headers": api_headers,
                 }
+                if imp:
+                    req_kwargs["impersonate"] = imp
                 if proxy:
                     req_kwargs["proxies"] = {"http": proxy, "https": proxy}
                 if cookies:
@@ -651,19 +660,35 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     if user:
         try:
-            api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
-            req_kwargs = {"timeout": 7}
+            api_url = "https://www.tiktok.com/api-live/user/room"
+            api_params = {
+                "aid": 1988,
+                "sourceType": 54,
+                "staleTime": 600000,
+                "uniqueId": user.lower(),
+            }
+            api_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                "Referer": f"https://www.tiktok.com/@{user}/live",
+                "Accept": "*/*",
+            }
+            req_kwargs = {"params": api_params, "headers": api_headers, "timeout": 7}
             if proxy:
                 req_kwargs["proxies"] = {"http": proxy, "https": proxy}
             if cookies:
                 req_kwargs["cookies"] = cookies
-            for imp in ["safari15_5", "chrome136"]:
+            for imp in ["chrome136", "safari15_5", None]:
                 api_res = None
                 try:
-                    api_res = requests.get(api_url, impersonate=imp, **req_kwargs)
+                    kwargs = dict(req_kwargs)
+                    if imp:
+                        kwargs["impersonate"] = imp
+                    api_res = requests.get(api_url, **kwargs)
                     if api_res.status_code == 200:
                         d = api_res.json().get("data", {}).get("liveRoom", {})
                         sd_str = d.get("streamData", {}).get("pull_data", {}).get("stream_data")
+                        if not sd_str:
+                            sd_str = d.get("hevcStreamData", {}).get("pull_data", {}).get("stream_data")
                         if sd_str:
                             c_urls = parse_sdk_stream_data(sd_str)
                             if c_urls:

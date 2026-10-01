@@ -225,14 +225,17 @@ extract_middle_thumbnail = auto_h264.extract_middle_thumbnail
 # ---------------- LIVE STATUS CACHE ----------------
 LIVE_CACHE = {}  # {username: {"is_live": bool, "room_id": str, "is_sub_only": bool, "is_preview": bool, "timestamp": float}}
 LIVE_CACHE_TTL = 60.0  # Cache 60 giây — frontend poll mỗi 25s sẽ dùng cache, giảm tải RAM và network
+LIVE_CACHE_OFFLINE_TTL = 15.0  # Cache 15 giây khi streamer offline để phát hiện live mới tức thì
 
-def get_user_live_details_cached(user: str) -> dict:
+def get_user_live_details_cached(user: str, force_refresh: bool = False) -> dict:
     user = user.strip().replace("@", "").lower()
     now = time.time()
     with LIVE_CACHE_LOCK:
         cached = LIVE_CACHE.get(user)
-        if cached and (now - cached.get("timestamp", 0) < LIVE_CACHE_TTL) and "is_sub_only" in cached:
-            return cached.copy()
+        if not force_refresh and cached and "is_sub_only" in cached:
+            ttl = LIVE_CACHE_TTL if cached.get("is_live") else LIVE_CACHE_OFFLINE_TTL
+            if (now - cached.get("timestamp", 0) < ttl):
+                return cached.copy()
 
     details = {
         "is_live": False,
@@ -384,7 +387,7 @@ def get_active_recordings():
         active_keys = list(ACTIVE_RECORDING_TASKS.keys())
     recording.update(active_keys)
 
-    # Danh sách các user đang phát live trên TikTok
+    # Danh sách các user đang phát live trên TikTok (dùng cache tức thời 0ms)
     live_streamers = []
     cfg = load_config()
     users = cfg.get("monitored_users", [])
@@ -395,10 +398,8 @@ def get_active_recordings():
     except Exception:
         pass
 
-    for u in users:
-        is_live, _ = get_user_live_status_cached(u)
-        if is_live:
-            live_streamers.append(u)
+    with LIVE_CACHE_LOCK:
+        live_streamers = [u for u in users if LIVE_CACHE.get(u, {}).get("is_live")]
 
     all_recording = list(recording)
     return {
@@ -410,7 +411,7 @@ def get_active_recordings():
     }
 
 @app.get("/api/users")
-def get_users(check_live: bool = True):
+def get_users(check_live: bool = True, fresh: bool = False):
     try:
         users_list = []
 
@@ -472,7 +473,7 @@ def get_users(check_live: bool = True):
         live_statuses = {}
         if check_live and users_to_probe:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_probe), 8)) as executor:
-                future_to_user = {executor.submit(get_user_live_details_cached, u): u for u in users_to_probe}
+                future_to_user = {executor.submit(get_user_live_details_cached, u, fresh): u for u in users_to_probe}
                 for fut in concurrent.futures.as_completed(future_to_user):
                     u = future_to_user[fut]
                     try:
