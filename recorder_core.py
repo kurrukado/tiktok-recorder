@@ -135,19 +135,23 @@ def load_cookies():
             except Exception:
                 pass
 
-    env_session = os.environ.get("TIKTOK_SESSION_ID", "").strip()
-    if env_session:
-        return {"sessionid_ss": env_session, "sessionid": env_session}
+    if not cookies:
+        env_session = os.environ.get("TIKTOK_SESSION_ID", "").strip()
+        if env_session:
+            cookies = {"sessionid_ss": env_session, "sessionid": env_session}
 
-    try:
-        cfg = load_config()
-        cfg_session = (cfg.get("tiktok_session_id") or cfg.get("sessionid_ss") or "").strip()
-        if cfg_session:
-            return {"sessionid_ss": cfg_session, "sessionid": cfg_session}
-    except Exception:
-        pass
+    if not cookies:
+        try:
+            cfg = load_config()
+            cfg_session = (cfg.get("tiktok_session_id") or cfg.get("sessionid_ss") or "").strip()
+            if cfg_session:
+                cookies = {"sessionid_ss": cfg_session, "sessionid": cfg_session}
+        except Exception:
+            pass
 
-    return {}
+    # Luôn gán tt-target-idc để tránh Akamai EdgeSuite Access Denied trên TikTok Native Live API
+    cookies.setdefault("tt-target-idc", "useast1a")
+    return cookies
 
 def save_cookies(cookies_dict):
     tmp_path = COOKIES_FILE + ".tmp"
@@ -224,6 +228,8 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
 
     if cookies is None:
         cookies = load_cookies()
+    if isinstance(cookies, dict):
+        cookies.setdefault("tt-target-idc", "useast1a")
 
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     try:
@@ -656,6 +662,8 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
     """
     if cookies is None:
         cookies = load_cookies()
+    if isinstance(cookies, dict):
+        cookies.setdefault("tt-target-idc", "useast1a")
 
     # 0. Phương thức Ưu Tiên Số 1: TikTok Native Live API với TLS impersonation
     if user:
