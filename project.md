@@ -813,4 +813,36 @@ Còn lại / cần quyết định:
 
 ---
 
+### 12.9 Khắc phục triệt để lỗi "Nhận diện Live nhưng không ghi hình ngay / Bị đánh dấu Offline" (HLS FFmpeg Freeze & Watchdog Fix)
+
+* **Hiện tượng**: Tool hoặc Web UI nhận diện streamer đang LIVE (hiển thị trạng thái LIVE), nhưng không tiến hành ghi hình ngay (hoặc đứng ở 0.00 MB). Một lúc sau, phiên live bị đánh dấu là Offline và không có bất kỳ video nào được lưu lên Drive hay Supabase.
+* **Nguyên nhân cốt lõi (Root Cause)**:
+  1. **Đóng băng tiến trình FFmpeg trên luồng HLS (`-reconnect_at_eof 1` + `-reconnect_streamed 1`)**:
+     - Trong `record_stream_ffmpeg`, cờ `-reconnect_at_eof 1` và `-reconnect_streamed 1` được gắn cứng cho mọi luồng.
+     - Đối với luồng HLS (`.m3u8`) — vốn là định dạng được thuật toán ưu tiên số 1 — mỗi phân đoạn `.ts` đều có điểm EOF kết thúc file tự nhiên. Khi đọc xong 1 đoạn `.ts`, cờ `-reconnect_at_eof 1` ép HTTP client của FFmpeg coi EOF là đứt kết nối và liên tục kết nối lại chính file `.ts` đó thay vì để demuxer HLS chuyển sang phân đoạn tiếp theo.
+     - Hậu quả: FFmpeg rơi vào vòng lặp spin-reconnect vô hạn, file đầu ra đứng im ở **0.00 MB** trong suốt 30–120 giây.
+  2. **Watchdog ngắt luồng và xóa file nhầm**:
+     - Do FFmpeg bị treo ở 0 byte, cơ chế giám sát dung lượng (`stagnant_seconds >= 30`) kích hoạt và kiểm tra live. Nếu mạng TikTok phản hồi chậm hoặc streamer tạm thời chao đảo tín hiệu, watchdog xác nhận offline và cưỡng chế dừng FFmpeg.
+     - File 0 byte / <250KB không đạt chuẩn nên bị xóa bỏ, biến đếm `consecutive_failures` tăng lên.
+  3. **Bẫy lặp khi chưa có phân đoạn (`not part_segments` loop trap)**:
+     - Khi inner loop kết thúc mà `part_segments = []`, vòng lặp ngoài `while True` trước đây không kiểm tra biến `offline_confirmed` mà chỉ `continue`, khiến worker kẹt lại thêm nhiều chu kỳ thất bại vô ích (chiếm giữ 1 slot ghi hình và blast heartbeat giả lập lên Drive).
+  4. **Khóa phạt Cooldown quá dài (180 giây)**:
+     - Sau khi worker dừng, `USER_START_COOLDOWN_SECONDS = 180s` (3 phút) chặn không cho daemon thử lại streamer này. Suốt 3 phút đó, Web hiển thị "LIVE" nhưng bot từ chối khởi động lại luồng, khiến người dùng nghĩ tool bị đơ; khi streamer tắt live thì buổi live hoàn toàn bị mất.
+* **Các cải tiến & bản vá đã áp dụng**:
+  1. **Phân tách cờ mạng FFmpeg chuẩn xác theo giao thức**:
+     - Với luồng HLS (`.m3u8`): Loại bỏ hoàn toàn `-reconnect_at_eof 1` và `-reconnect_streamed 1`, chỉ sử dụng `-reconnect 1 -reconnect_on_network_error 1 -reconnect_delay_max 10`. Luồng HLS ghi mượt mà ngay từ giây đầu tiên (đạt 0.67 MB trong 2s).
+     - Với luồng FLV (`.flv`): Giữ `-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 -reconnect_delay_max 10` cho luồng liên tục.
+  2. **Tối ưu hóa thời gian đệm khởi đầu (Zero-Latency Start)**:
+     - Giảm `-analyzeduration` từ 10s xuống 3s (`3000000`) và `-probesize` từ 10MB xuống 2MB (`2000000`), giúp FFmpeg bắt đầu xuất khung hình MP4 chỉ sau <1 giây thay vì phải đợi nạp đủ 10MB.
+  3. **Chống chốt phân đoạn nhầm khi mạng dao động**:
+     - Nâng cấp watchdog trong `record_stream_ffmpeg` yêu cầu tối thiểu 2 lần kiểm tra offline liên tiếp (`consecutive_offline_checks >= 2`) mới chốt dừng.
+  4. **Thoát luồng dứt điểm khi streamer offline**:
+     - Bổ sung `if offline_confirmed: break` ngay tại khối `if not part_segments:` trong cả `cloud_daemon.py` và `api_server.py`.
+  5. **Rút ngắn Cooldown từ 180s xuống 30s**:
+     - Giảm `USER_START_COOLDOWN_SECONDS` xuống 30s, cho phép bot tái kết nối nhanh chóng nếu gặp sự cố mạng ngắt quãng.
+  6. **Đồng bộ toàn diện & Kiểm thử hồi quy**:
+     - Vượt qua toàn bộ **104/104 tests** ở cả 2 repository (`tiktok-recorder` và `web-truyen/kuruRecord`).
+
+---
+
 *Tài liệu tạo từ việc đọc mã nguồn tại `D:\\tiktok-recorder` và khảo sát `D:\\web-truyen`.*

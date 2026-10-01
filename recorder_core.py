@@ -915,20 +915,37 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
     print(f"[+] Bắt đầu thu tín hiệu livestream từ máy chủ TikTok...")
     print(f"[*] Nhấn [Ctrl + C] bất kỳ lúc nào để dừng và lưu video.\n")
 
+    is_hls = ".m3u8" in stream_url.lower()
+
     cmd = [
         FFMPEG_PATH,
         "-y",
         "-stdin",
-        "-rw_timeout", "60000000",
-        "-reconnect", "1",
-        "-reconnect_at_eof", "1",
-        "-reconnect_streamed", "1",
-        "-reconnect_on_network_error", "1",
-        "-reconnect_delay_max", "15",
+        "-rw_timeout", "15000000",
+    ]
+    if is_hls:
+        # Luồng HLS/m3u8: Tuyệt đối KHÔNG dùng -reconnect_at_eof 1 hoặc -reconnect_streamed 1
+        # vì mỗi phân đoạn .ts đều có điểm EOF tự nhiên; các cờ này ép HTTP reconnect lặp lại
+        # cùng 1 file .ts khiến FFmpeg bị đóng băng 0-byte (stuck loop).
+        cmd.extend([
+            "-reconnect", "1",
+            "-reconnect_on_network_error", "1",
+            "-reconnect_delay_max", "10",
+        ])
+    else:
+        # Luồng FLV: stream liên tục không ngắt quãng
+        cmd.extend([
+            "-reconnect", "1",
+            "-reconnect_streamed", "1",
+            "-reconnect_on_network_error", "1",
+            "-reconnect_delay_max", "10",
+        ])
+
+    cmd.extend([
         "-correct_ts_overflow", "1",
         "-fflags", "+genpts+discardcorrupt+nobuffer",
-        "-analyzeduration", "10000000",
-        "-probesize", "10000000",
+        "-analyzeduration", "3000000",
+        "-probesize", "2000000",
         "-headers", (
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n"
             "Referer: https://www.tiktok.com/\r\n"
@@ -942,7 +959,7 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
         "-dn",
         "-max_interleave_delta", "0",
         "-avoid_negative_ts", "make_zero",
-    ]
+    ])
     if duration:
         cmd.extend(["-t", str(duration)])
     cmd.append(output_filename)
@@ -1033,7 +1050,12 @@ def record_stream_ffmpeg(stream_url, output_filename=None, target_user="islizanx
                     last_live_check_time = now
                     try:
                         st_check, _ = check_live_status(target_user)
-                        offline_confirmed = not st_check
+                        if not st_check:
+                            consecutive_offline_checks += 1
+                            if consecutive_offline_checks >= 2:
+                                offline_confirmed = True
+                        else:
+                            consecutive_offline_checks = 0
                     except Exception:
                         # Lỗi kiểm tra = "không rõ", KHÔNG phải "đã offline"
                         print(f"\n[!] [@{target_user}] Không kiểm tra được trạng thái live (lỗi mạng tạm thời). Không chốt phân đoạn vì lý do này.")

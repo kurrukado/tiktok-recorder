@@ -1102,6 +1102,9 @@ def bg_record_worker(user: str, duration: Optional[int] = None, stop_event: Opti
                         break
 
             if not part_segments:
+                if offline_confirmed:
+                    print(f"[🏁] [@{user}] Streamer đã xác nhận offline hoàn toàn. Kết thúc luồng ghi hình.")
+                    break
                 if consecutive_failures >= max_consecutive_failures:
                     break
                 if is_sub_only and part_number >= max_vip_attempts:

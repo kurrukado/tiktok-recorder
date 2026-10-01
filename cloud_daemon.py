@@ -174,7 +174,7 @@ RECORDERS_LOCK = threading.Lock()
 # Chống "hot loop": nếu luồng ghi hình của 1 streamer bị tắt ngay sau khi khởi động
 # (ffmpeg lỗi, mạng lỗi, ...) thì mỗi vòng lặp ~15s sẽ khởi động lại + gửi 1 tin
 # Telegram -> spam không kiểm soát. Chờ đủ thời gian này rồi mới khởi động lại.
-USER_START_COOLDOWN_SECONDS = 180
+USER_START_COOLDOWN_SECONDS = 30
 _USER_START_COOLDOWN = {}       # {user: last_start_ts}
 
 
@@ -428,6 +428,9 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                         break
 
             if not part_segments:
+                if offline_confirmed:
+                    log(f"🏁 [@{user}] Streamer đã xác nhận offline hoàn toàn. Kết thúc luồng ghi hình.")
+                    break
                 if consecutive_failures >= max_consecutive_failures:
                     log(f"⏸️ [@{user}] Gặp {consecutive_failures} lỗi liên tiếp. Dừng luồng ghi hình.")
                     break
