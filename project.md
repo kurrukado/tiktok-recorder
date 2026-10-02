@@ -878,5 +878,47 @@ Còn lại / cần quyết định:
 
 ---
 
+### 12.11 Khắc phục triệt để lỗi "Streamer đang Live nhưng trên Web không hiển thị Live / Recording" (Supabase Multi-Sync & Load Cookies UnboundLocalError Fix)
+
+* **Hiện tượng**: Streamer đang phát trực tiếp và bot GitHub Actions đang ghi hình thực tế (`huong_linh97`, `beune_inin`,...), nhưng trên Web UI tại `kurumieverything.io.vn/record` streamer vẫn hiển thị huy hiệu xám `Offline`, không thấy nhãn `● LIVE` hay `● REC`.
+* **Nguyên nhân cốt lõi (Root Causes)**:
+  1. **Lỗi `UnboundLocalError` trong `recorder_core.py` trên môi trường Cloud (Render / Containers)**:
+     - Trong hàm `load_cookies()`, biến `cookies = {}` chỉ được khởi tạo bên trong khối `if os.path.exists(cp)`.
+     - Trên Render (và các môi trường không commit file `cookies.json`), vòng lặp kiểm tra file bị bỏ qua khiến biến `cookies` hoàn toàn chưa được định nghĩa khi đến dòng `if not cookies:`.
+     - Hậu quả: Mọi lời gọi `check_live_details()` và `check_live_status()` trên Render đều văng `UnboundLocalError: cannot access local variable 'cookies' where it is not associated with a value`, dẫn đến kết quả trả về luôn là `is_live: False` cho 100% streamer!
+  2. **Render không có cấu hình Google Drive Refresh Token**:
+     - Danh sách streamer đang quay (`active_recordings`) trước đây chỉ được lưu trên Google Drive file `tiktok-record/active_recordings.json`.
+     - Do file `config.json` nằm trong `.gitignore` và Render Dashboard chưa cấu hình biến `GDRIVE_REFRESH_TOKEN`, `gdrive_manager.load_active_recordings_from_drive()` trên Render trả về rỗng (`[]`).
+     - Khi kết hợp với lỗi (1), Render coi như không có streamer nào đang live hoặc đang quay.
+  3. **Tunnel Local 502 Bad Gateway khi `api_server.py` chưa bật**:
+     - Cloudflare Tunnel `record.kurumieverything.io.vn` trỏ về `127.0.0.1:8000`. Khi tiến trình API local chưa khởi chạy, Cloudflare phản hồi HTTP 502 Bad Gateway và web fallback sang Render bị dính 2 lỗi trên.
+  4. **Hao hụt Metadata khi streamer nằm trong `active_users`**:
+     - `users_to_probe` loại bỏ streamer đang ghi hình để tránh query TikTok lặp lại, nhưng logic gán dữ liệu sau đó lại thiếu cơ chế lấy `room_id`, `nickname`, `avatar_thumb` từ Supabase hoặc cache trước đó, khiến `room_id` bị trả về `None`.
+  5. **Web Frontend `app/record/page.js` chỉ `select('username')` từ Supabase**:
+     - Hàm `syncFromSupabase` ban đầu chỉ lấy cột `username` và mặc định `is_live: false, is_recording: false` trong lần load đầu (0ms).
+* **Các cải tiến & bản vá đã áp dụng**:
+  1. **Vá lỗi `load_cookies()` & Bổ sung Fallback Chuẩn**:
+     - Khởi tạo `cookies = {}` ngay đầu hàm `load_cookies()`, xử lý an toàn mọi trường hợp file không tồn tại.
+     - Luôn bảo đảm gán `tt-target-idc: useast1a`.
+     - Bổ sung fallback `urllib.request` cho cả `check_live_details` và `get_stream_urls` khi `curl_cffi` gặp trục trặc.
+  2. **Mở rộng Schema Supabase & Đồng bộ Trạng thái Trực tiếp Đa tầng**:
+     - Bổ sung các cột `is_live`, `is_recording`, `room_id`, `nickname`, `avatar_thumb`, `status`, `last_live_at` vào bảng `tiktok_streamers` trên Supabase với chính sách công khai an toàn.
+     - Cập nhật `supabase_sync.py`: bổ sung `fetch_streamers_details_from_supabase`, `update_streamer_status_supabase`, `get_active_recordings_from_supabase`.
+     - `cloud_daemon.py`: Tự động cập nhật `is_recording=True, is_live=True, status="recording"` lên Supabase ngay khi bắt đầu quay và mỗi chu kỳ heartbeat; cập nhật `status="offline"` khi streamer kết thúc live.
+     - `api_server.py`: Tích hợp đọc `active_users` từ CẢ Google Drive LẪN Supabase, tự động đồng bộ tín hiệu live mới phát hiện lên Supabase chạy ngầm.
+  3. **Nâng cấp Web Frontend (`app/record/page.js`)**:
+     - Chuyển `supabase.from('tiktok_streamers').select('*')` giúp trang nạp tức thì (0ms) trạng thái LIVE và REC chuẩn xác ngay từ Database trước khi chu kỳ poll API kết thúc.
+     - Tính toán `isRec` và `isLive` nhất quán trên toàn bộ các luồng dữ liệu (DB sync, server poll, manual fresh).
+  4. **Kiểm tra Xác thực & Triển khai Toàn diện**:
+     - Cả 4 endpoint đồng nhất phản hồi trạng thái:
+       - `http://127.0.0.1:8000/api/users` -> `is_live: true, is_recording: true, status: recording`.
+       - `https://record.kurumieverything.io.vn/api/users` -> `is_live: true, is_recording: true, status: recording`.
+       - `https://tiktok-api-i0o8.onrender.com/api/users` -> `is_live: true, is_recording: true, status: recording`.
+       - `https://kurumieverything.io.vn/api/record/users` -> `is_live: true, is_recording: true, status: recording`.
+     - Chạy `npm run build` trên `web-truyen`: Thành công hoàn hảo 37/37 routes.
+     - Chạy toàn bộ **104/104 tests**: **100% PASSED**.
+
+---
+
 *Tài liệu tạo từ việc đọc mã nguồn tại `D:\\tiktok-recorder` và khảo sát `D:\\web-truyen`.*
 
