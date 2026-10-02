@@ -47,7 +47,6 @@ def load_config():
     return {}
 
 def get_access_token(force_refresh=False):
-    global _CACHED_ACCESS_TOKEN
     with _TOKEN_LOCK:
         now = time.time()
         # ponytail: Chống stampede khi nhiều thread đồng thời gặp 401 và force_refresh

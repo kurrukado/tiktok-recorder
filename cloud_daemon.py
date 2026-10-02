@@ -16,6 +16,7 @@ CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 import recorder_core
 import gdrive_manager
 import notifier
+import supabase_sync
 
 # ponytail: centralized in recorder_core to break circular dependency with staging_queue
 concat_mp4_segments = recorder_core.concat_mp4_segments

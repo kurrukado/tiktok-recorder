@@ -506,7 +506,7 @@ def get_users(check_live: bool = True, fresh: bool = False):
         users_to_probe = list(users) if fresh else [u for u in users if u not in active_users]
         live_statuses = {}
         if check_live and users_to_probe:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_probe), 20)) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_probe), 8)) as executor:
                 future_to_user = {executor.submit(get_user_live_details_cached, u, fresh): u for u in users_to_probe}
                 for fut in concurrent.futures.as_completed(future_to_user):
                     u = future_to_user[fut]
@@ -789,7 +789,6 @@ def delete_user(username: str, delete_files: bool = True):
                 print(f"[API] Lỗi xóa dữ liệu Supabase của {user}: {sb_err}")
 
             # Invalidate và dọn dẹp cache danh sách video trong RAM của API server
-            global _RECORDINGS_CACHE
             with _RECORDINGS_CACHE_LOCK:
                 _RECORDINGS_CACHE["timestamp"] = 0
                 _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if (v.get("user") != user and v.get("username") != user)]
@@ -1596,7 +1595,6 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
     """
     Quét danh sách toàn bộ video và thumbnail đã lưu trên Google Drive bằng ThreadPool song song.
     """
-    global _RECORDINGS_CACHE
     now = time.time()
     with _RECORDINGS_CACHE_LOCK:
         if not force_refresh and (now - _RECORDINGS_CACHE["timestamp"] < 60) and _RECORDINGS_CACHE["data"]:
