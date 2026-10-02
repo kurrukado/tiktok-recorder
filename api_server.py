@@ -327,13 +327,17 @@ def clean_zombie_recordings(live_statuses=None):
             else:
                 is_live, _ = get_user_live_status_cached(u)
 
-            if not is_live:
-                print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (quá 10p không heartbeat & Offline). Đang dọn dẹp...")
-                try:
-                    threading.Thread(target=gdrive_manager.set_user_recording_status_drive, args=(u, False), daemon=True).start()
-                except Exception:
-                    pass
-                zombies_cleaned.append(u)
+                if not is_live:
+                    print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (quá 10p không heartbeat & Offline). Đang dọn dẹp...")
+                    try:
+                        threading.Thread(target=gdrive_manager.set_user_recording_status_drive, args=(u, False), daemon=True).start()
+                    except Exception:
+                        pass
+                    try:
+                        threading.Thread(target=supabase_sync.update_streamer_status_supabase, args=(u, False, False, None, None, None, "offline"), daemon=True).start()
+                    except Exception:
+                        pass
+                    zombies_cleaned.append(u)
 
         return zombies_cleaned
     except Exception as e:
@@ -353,6 +357,11 @@ def health_check():
     try:
         drive_act = gdrive_manager.load_active_recordings_from_drive() or []
         active.update(drive_act)
+    except Exception:
+        pass
+    try:
+        supa_act = supabase_sync.get_active_recordings_from_supabase() or []
+        active.update(supa_act)
     except Exception:
         pass
     with RECORDING_LOCK:
@@ -381,6 +390,11 @@ def get_active_recordings():
     try:
         drive_act = gdrive_manager.load_active_recordings_from_drive() or []
         recording.update(drive_act)
+    except Exception:
+        pass
+    try:
+        supa_act = supabase_sync.get_active_recordings_from_supabase() or []
+        recording.update(supa_act)
     except Exception:
         pass
     with RECORDING_LOCK:
@@ -417,12 +431,25 @@ def get_users(check_live: bool = True, fresh: bool = False):
 
         # 1. Nguồn dữ liệu số 1: Supabase Database (đồng bộ tức thì từ Web)
         supa_users = []
+        supa_streamers_map = {}
         try:
             supa_users = supabase_sync.fetch_streamers_from_supabase()
             if supa_users:
                 users_list.extend(supa_users)
         except Exception as e:
             print(f"[!] Lỗi nạp streamers từ Supabase: {e}")
+
+        try:
+            supa_details = supabase_sync.fetch_streamers_details_from_supabase()
+            if supa_details:
+                for sd in supa_details:
+                    u = sd.get("username")
+                    if u:
+                        supa_streamers_map[u] = sd
+                        if u not in users_list:
+                            users_list.append(u)
+        except Exception:
+            pass
 
         # 2. Nguồn dữ liệu số 2: Google Drive
         drive_users = []
@@ -463,16 +490,23 @@ def get_users(check_live: bool = True, fresh: bool = False):
                 active_users.update(drive_act)
         except Exception:
             pass
+        # Bổ sung active recordings từ Supabase (bảo đảm nhận diện ngay cả khi máy chủ không có Google Drive token, vd Render)
+        try:
+            for u, sd in supa_streamers_map.items():
+                if sd.get("is_recording"):
+                    active_users.add(u)
+        except Exception:
+            pass
         with RECORDING_LOCK:
             active_keys = list(ACTIVE_RECORDING_TASKS.keys())
         active_users.update(active_keys)
         
-        # Chỉ probe live status đối với các streamer CHƯA có trong active_users
-        # (Streamer đã nằm trong active_users chắc chắn đang quay & live, không cần scrape chậm)
-        users_to_probe = [u for u in users if u not in active_users]
+        # Probe live status: Khi fresh=True, probe toàn bộ streamer.
+        # Khi fresh=False, probe các streamer chưa có trong active_users
+        users_to_probe = list(users) if fresh else [u for u in users if u not in active_users]
         live_statuses = {}
         if check_live and users_to_probe:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_probe), 8)) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_probe), 20)) as executor:
                 future_to_user = {executor.submit(get_user_live_details_cached, u, fresh): u for u in users_to_probe}
                 for fut in concurrent.futures.as_completed(future_to_user):
                     u = future_to_user[fut]
@@ -489,16 +523,34 @@ def get_users(check_live: bool = True, fresh: bool = False):
         except Exception:
             pass
 
+        # Tự động đồng bộ trạng thái live mới phát hiện lên Supabase chạy nền
+        if live_statuses:
+            def _bg_sync_supa_live(live_map):
+                for usr, d_info in live_map.items():
+                    if d_info.get("is_live"):
+                        supabase_sync.update_streamer_status_supabase(
+                            usr,
+                            is_live=True,
+                            room_id=d_info.get("room_id"),
+                            nickname=d_info.get("nickname"),
+                            avatar_thumb=d_info.get("avatar_thumb"),
+                            status="live"
+                        )
+            threading.Thread(target=_bg_sync_supa_live, args=(live_statuses,), daemon=True).start()
+
         result = []
         for u in users:
             is_recording = (u in active_users)
-            det = live_statuses.get(u, {})
-            is_live = det.get("is_live", False) or is_recording
-            room_id = det.get("room_id")
-            is_sub_only = det.get("is_sub_only", False)
-            is_preview = det.get("is_preview", False)
-            avatar_thumb = det.get("avatar_thumb")
-            nickname = det.get("nickname")
+            det = live_statuses.get(u) or LIVE_CACHE.get(u, {})
+            sd = supa_streamers_map.get(u, {})
+
+            is_live = det.get("is_live", False) or is_recording or sd.get("is_live", False)
+            room_id = det.get("room_id") or sd.get("room_id")
+            avatar_thumb = det.get("avatar_thumb") or sd.get("avatar_thumb")
+            nickname = det.get("nickname") or sd.get("nickname")
+            is_sub_only = det.get("is_sub_only", False) or sd.get("is_sub_only", False)
+            is_preview = det.get("is_preview", False) or sd.get("is_preview", False)
+
             if is_recording:
                 status_str = "recording"
                 is_live = True
@@ -506,6 +558,7 @@ def get_users(check_live: bool = True, fresh: bool = False):
                 status_str = "live"
             else:
                 status_str = "offline"
+
             result.append({
                 "username": u,
                 "nickname": nickname,
@@ -809,8 +862,19 @@ def test_live_diagnostic(username: str):
         r_nat = None
         try:
             from curl_cffi import requests as c_req
-            api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
-            r_nat = c_req.get(api_url, impersonate="safari15_5", timeout=7)
+            api_url = "https://www.tiktok.com/api-live/user/room"
+            api_params = {
+                "aid": 1988,
+                "sourceType": 54,
+                "staleTime": 600000,
+                "uniqueId": user.lower(),
+            }
+            api_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                "Referer": f"https://www.tiktok.com/@{user}/live",
+                "Accept": "*/*",
+            }
+            r_nat = c_req.get(api_url, params=api_params, headers=api_headers, cookies={"tt-target-idc": "useast1a"}, impersonate="chrome136", timeout=7)
             out["native_api"] = {
                 "status_code": r_nat.status_code,
                 "text_len": len(r_nat.text),

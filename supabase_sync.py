@@ -61,6 +61,86 @@ def fetch_streamers_from_supabase() -> list:
         print(f"[SUPABASE-SYNC] [!] Lỗi nạp streamers từ Supabase: {e}")
     return []
 
+def fetch_streamers_details_from_supabase() -> list:
+    """Đọc toàn bộ thông tin và trạng thái live/record của các streamer từ table 'tiktok_streamers'."""
+    try:
+        headers = get_supabase_headers()
+        url = f"{SUPABASE_URL}/rest/v1/tiktok_streamers?select=*&order=id.asc"
+        with requests.get(url, headers=headers, timeout=10) as res:
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list):
+                    result = []
+                    for d in data:
+                        u = d.get("username", "").strip().replace("@", "").lower()
+                        if u:
+                            result.append({
+                                "username": u,
+                                "is_live": bool(d.get("is_live")),
+                                "is_recording": bool(d.get("is_recording")),
+                                "room_id": d.get("room_id") or None,
+                                "nickname": d.get("nickname") or None,
+                                "avatar_thumb": d.get("avatar_thumb") or None,
+                                "status": d.get("status") or ("recording" if d.get("is_recording") else ("live" if d.get("is_live") else "offline")),
+                                "last_live_at": d.get("last_live_at") or None,
+                            })
+                    return result
+    except Exception as e:
+        print(f"[SUPABASE-SYNC] [!] Lỗi nạp streamers chi tiết từ Supabase: {e}")
+    return []
+
+def update_streamer_status_supabase(user: str, is_live: Optional[bool] = None, is_recording: Optional[bool] = None,
+                                   room_id: Optional[str] = None, nickname: Optional[str] = None,
+                                   avatar_thumb: Optional[str] = None, status: Optional[str] = None) -> bool:
+    """Cập nhật trạng thái trực tiếp của streamer vào Supabase DB."""
+    try:
+        user = user.strip().replace("@", "").lower()
+        if not user:
+            return False
+        payload = {"updated_at": datetime.now(timezone.utc).isoformat()}
+        if is_live is not None:
+            payload["is_live"] = is_live
+            if is_live:
+                payload["last_live_at"] = payload["updated_at"]
+        if is_recording is not None:
+            payload["is_recording"] = is_recording
+        if room_id is not None:
+            payload["room_id"] = str(room_id) if room_id else None
+        if nickname is not None:
+            payload["nickname"] = nickname
+        if avatar_thumb is not None:
+            payload["avatar_thumb"] = avatar_thumb
+        if status is not None:
+            payload["status"] = status
+        elif is_recording:
+            payload["status"] = "recording"
+        elif is_live:
+            payload["status"] = "live"
+        elif is_live is False and is_recording is False:
+            payload["status"] = "offline"
+
+        headers = get_supabase_headers()
+        url = f"{SUPABASE_URL}/rest/v1/tiktok_streamers?username=eq.{user}"
+        with requests.patch(url, headers=headers, json=payload, timeout=8) as res:
+            return res.status_code in (200, 204)
+    except Exception as e:
+        print(f"[SUPABASE-SYNC] [!] Lỗi cập nhật trạng thái @{user} lên Supabase: {e}")
+        return False
+
+def get_active_recordings_from_supabase() -> list:
+    """Lấy danh sách các username hiện đang được ghi hình từ Supabase DB."""
+    try:
+        headers = get_supabase_headers()
+        url = f"{SUPABASE_URL}/rest/v1/tiktok_streamers?is_recording=eq.true&select=username"
+        with requests.get(url, headers=headers, timeout=8) as res:
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list):
+                    return [d["username"].strip().replace("@", "").lower() for d in data if "username" in d and d["username"]]
+    except Exception as e:
+        print(f"[SUPABASE-SYNC] [!] Lỗi đọc active recordings từ Supabase: {e}")
+    return []
+
 def add_streamer_to_supabase(user: str) -> bool:
     """Thêm streamer vào table 'tiktok_streamers' trên Supabase."""
     try:

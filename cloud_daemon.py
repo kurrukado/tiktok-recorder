@@ -213,6 +213,12 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
         gdrive_manager.create_streamer_folder_drive(user)
     except Exception:
         pass
+    try:
+        supabase_sync.update_streamer_status_supabase(
+            user, is_live=True, is_recording=True, room_id=initial_room_id, status="recording"
+        )
+    except Exception:
+        pass
 
     part_number = 1
     current_room_id = initial_room_id
@@ -223,6 +229,20 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
 
     # Kiểm tra xem buổi live có phải VIP Sub-only không qua check_live_details
     live_details = recorder_core.check_live_details(user)
+    if live_details.get("room_id"):
+        current_room_id = live_details.get("room_id")
+    try:
+        supabase_sync.update_streamer_status_supabase(
+            user,
+            is_live=True,
+            is_recording=True,
+            room_id=current_room_id,
+            nickname=live_details.get("nickname"),
+            avatar_thumb=live_details.get("avatar_thumb"),
+            status="recording"
+        )
+    except Exception:
+        pass
     is_sub_only = live_details.get("is_sub_only", False)
     if is_sub_only:
         log(f"🔒 [@{user}] Phát hiện phòng live VIP Sub-Only / Paid Event! Kích hoạt chế độ VIP Sub-Only Quick Watchdog & Session Rotation.")
@@ -679,6 +699,10 @@ def streamer_recording_worker(user, initial_room_id, auto_discover=True, stop_ev
                 gdrive_manager.set_user_recording_status_drive(user, False)
             except Exception:
                 pass
+            try:
+                supabase_sync.update_streamer_status_supabase(user, is_live=False, is_recording=False, status="offline")
+            except Exception:
+                pass
 
         # Upload trực tiếp lên Drive, không sử dụng Staging Queue
         # Dọn dẹp file tạm nếu streamer bị xóa
@@ -750,10 +774,15 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                 ACTIVE_RECORDERS.pop(u, None)
             active_now = list(ACTIVE_RECORDERS.keys())
 
-        # Gửi Heartbeat lên Google Drive cho tất cả các streamer đang quay thực tế (batch 1 request)
+        # Gửi Heartbeat lên Google Drive và Supabase cho tất cả các streamer đang quay thực tế (batch 1 request)
         if session_count % 2 == 0 and active_now:
             try:
                 gdrive_manager.set_users_recording_status_drive(active_now, True)
+            except Exception:
+                pass
+            try:
+                for an in active_now:
+                    supabase_sync.update_streamer_status_supabase(an, is_recording=True, is_live=True, status="recording")
             except Exception:
                 pass
 
@@ -799,6 +828,10 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                     info["stop_event"].set()
                 try:
                     gdrive_manager.set_user_recording_status_drive(u, False)
+                except Exception:
+                    pass
+                try:
+                    supabase_sync.update_streamer_status_supabase(u, is_recording=False, is_live=False, status="offline")
                 except Exception:
                     pass
                 ACTIVE_RECORDERS.pop(u, None)
