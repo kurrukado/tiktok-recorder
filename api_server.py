@@ -272,8 +272,8 @@ def get_user_live_details_cached(user: str, force_refresh: bool = False) -> dict
             LIVE_CACHE[user] = details.copy()
     return details.copy()
 
-def get_user_live_status_cached(user: str):
-    d = get_user_live_details_cached(user)
+def get_user_live_status_cached(user: str, force_refresh: bool = False):
+    d = get_user_live_details_cached(user, force_refresh=force_refresh)
     return d["is_live"], d["room_id"]
 
 def is_local_recorder_running_for_user(user: str) -> bool:
@@ -299,9 +299,9 @@ def clean_zombie_recordings(live_statuses=None):
     """
     try:
         drive_details = gdrive_manager.load_active_recordings_from_drive(as_details=True) or []
-        supa_active = []
+        supa_details = []
         try:
-            supa_active = supabase_sync.get_active_recordings_from_supabase() or []
+            supa_details = supabase_sync.get_active_recordings_from_supabase(as_details=True) or []
         except Exception:
             pass
 
@@ -315,11 +315,25 @@ def clean_zombie_recordings(live_statuses=None):
             if u:
                 candidates[u] = item.get("updated_at", 0) if isinstance(item, dict) else 0
 
-        # Nguồn 2: Supabase tiktok_streamers (is_recording = true)
-        for su in supa_active:
-            u = su.strip().replace("@", "").lower()
-            if u and u not in candidates:
-                candidates[u] = 0
+        # Nguồn 2: Supabase tiktok_streamers (is_recording = true) kèm updated_at
+        for s_item in supa_details:
+            u = s_item.get("username") if isinstance(s_item, dict) else str(s_item)
+            u = u.strip().replace("@", "").lower()
+            if not u:
+                continue
+            up_raw = s_item.get("updated_at") if isinstance(s_item, dict) else None
+            up_ts = 0
+            if up_raw:
+                try:
+                    from datetime import datetime, timezone
+                    dt = datetime.fromisoformat(str(up_raw).replace("Z", "+00:00"))
+                    up_ts = int(dt.timestamp())
+                except Exception:
+                    up_ts = 0
+            if u not in candidates:
+                candidates[u] = up_ts
+            else:
+                candidates[u] = max(candidates[u], up_ts)
 
         if not candidates:
             return []
@@ -330,28 +344,33 @@ def clean_zombie_recordings(live_statuses=None):
             if is_local_recorder_running_for_user(u):
                 continue
 
-            # Heartbeat check: Nếu vừa cập nhật trong 5 phút -> Cloud Runner đang chạy
-            if updated_at and (now_ts - updated_at) < 300:
+            # Heartbeat check: Nếu vừa cập nhật trong 3 phút (180s) -> Cloud Runner đang chạy
+            if updated_at and (now_ts - updated_at) < 180:
                 continue
 
-            # Kiểm tra trạng thái thực tế trên TikTok
+            # Kiểm tra trạng thái thực tế trên TikTok (BUỘC PHẢI FRESH để không bị đánh lừa bởi RAM cache cũ)
             is_live = False
             if live_statuses and u in live_statuses:
                 val = live_statuses[u]
                 is_live = val.get("is_live", False) if isinstance(val, dict) else (val[0] if isinstance(val, (tuple, list)) else bool(val))
             else:
-                is_live, _ = get_user_live_status_cached(u)
+                is_live, _ = get_user_live_status_cached(u, force_refresh=True)
 
             if not is_live:
                 print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (Offline trên TikTok & không recorder cục bộ). Đang dọn dẹp...")
                 try:
-                    threading.Thread(target=gdrive_manager.set_user_recording_status_drive, args=(u, False), daemon=True).start()
+                    gdrive_manager.set_user_recording_status_drive(u, False)
                 except Exception:
                     pass
                 try:
-                    threading.Thread(target=supabase_sync.update_streamer_status_supabase, args=(u, False, False, None, None, None, "offline"), daemon=True).start()
+                    supabase_sync.update_streamer_status_supabase(u, is_live=False, is_recording=False, status="offline")
                 except Exception:
                     pass
+                with LIVE_CACHE_LOCK:
+                    if u in LIVE_CACHE:
+                        LIVE_CACHE[u]["is_live"] = False
+                        LIVE_CACHE[u]["room_id"] = None
+                        LIVE_CACHE[u]["timestamp"] = time.time()
                 zombies_cleaned.append(u)
 
         return zombies_cleaned
@@ -541,23 +560,40 @@ def get_users(check_live: bool = True, fresh: bool = False):
         try:
             for u, sd in supa_streamers_map.items():
                 if sd.get("is_recording"):
-                    active_users.add(u)
+                    up_str = sd.get("updated_at")
+                    is_fresh = True
+                    if up_str:
+                        try:
+                            from datetime import datetime, timezone
+                            dt = datetime.fromisoformat(str(up_str).replace("Z", "+00:00"))
+                            is_fresh = (datetime.now(timezone.utc) - dt).total_seconds() < 180
+                        except Exception:
+                            is_fresh = True
+                    if is_fresh:
+                        active_users.add(u)
         except Exception:
             pass
         with RECORDING_LOCK:
             active_keys = list(ACTIVE_RECORDING_TASKS.keys())
         active_users.update(active_keys)
         
-        # Tự động nạp cache từ Supabase (nơi GitHub Actions cập nhật thời gian thực 20s/lần)
+        # Tự động nạp cache từ Supabase:
+        # Chỉ nạp avatar_thumb & nickname để làm giàu dữ liệu hiển thị hoặc offline status.
+        # KHÔNG nạp is_live=True mù quáng vào LIVE_CACHE để tránh tạo vòng lặp ma (Zombie Loop)
         if supa_streamers_map:
             with LIVE_CACHE_LOCK:
                 now_ts = time.time()
                 for su, s_data in supa_streamers_map.items():
                     cached_val = LIVE_CACHE.get(su)
-                    if not cached_val or (now_ts - cached_val.get("timestamp", 0) > 30):
+                    if cached_val:
+                        if not cached_val.get("avatar_thumb") and s_data.get("avatar_thumb"):
+                            cached_val["avatar_thumb"] = s_data.get("avatar_thumb")
+                        if not cached_val.get("nickname") and s_data.get("nickname"):
+                            cached_val["nickname"] = s_data.get("nickname")
+                    elif not s_data.get("is_live"):
                         LIVE_CACHE[su] = {
-                            "is_live": bool(s_data.get("is_live")),
-                            "room_id": s_data.get("room_id"),
+                            "is_live": False,
+                            "room_id": None,
                             "is_sub_only": False,
                             "is_preview": False,
                             "avatar_thumb": s_data.get("avatar_thumb"),
@@ -615,12 +651,25 @@ def get_users(check_live: bool = True, fresh: bool = False):
             det = live_statuses.get(u) or LIVE_CACHE.get(u, {})
             sd = supa_streamers_map.get(u, {})
 
+            # Chỉ tin cậy trạng thái live từ Supabase nếu bản ghi tươi mới (< 180s)
+            sd_live = False
+            if sd.get("is_live"):
+                up_str = sd.get("updated_at")
+                if up_str:
+                    try:
+                        from datetime import datetime, timezone
+                        dt = datetime.fromisoformat(str(up_str).replace("Z", "+00:00"))
+                        if (datetime.now(timezone.utc) - dt).total_seconds() < 180:
+                            sd_live = True
+                    except Exception:
+                        sd_live = False
+
             # Streamer offline trên TikTok và không có recorder cục bộ -> dứt khoát offline
             if not is_local_recorder_running_for_user(u) and det and not det.get("is_live", False):
                 is_recording = False
                 is_live = False
             else:
-                is_live = det.get("is_live", False) or is_recording or sd.get("is_live", False)
+                is_live = det.get("is_live", False) or is_recording or sd_live
 
             room_id = det.get("room_id") or sd.get("room_id")
             avatar_thumb = det.get("avatar_thumb") or sd.get("avatar_thumb")

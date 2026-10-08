@@ -83,6 +83,7 @@ def fetch_streamers_details_from_supabase() -> list:
                                 "avatar_thumb": d.get("avatar_thumb") or None,
                                 "status": d.get("status") or ("recording" if d.get("is_recording") else ("live" if d.get("is_live") else "offline")),
                                 "last_live_at": d.get("last_live_at") or None,
+                                "updated_at": d.get("updated_at") or None,
                             })
                     return result
     except Exception as e:
@@ -127,15 +128,20 @@ def update_streamer_status_supabase(user: str, is_live: Optional[bool] = None, i
         print(f"[SUPABASE-SYNC] [!] Lỗi cập nhật trạng thái @{user} lên Supabase: {e}")
         return False
 
-def get_active_recordings_from_supabase() -> list:
-    """Lấy danh sách các username hiện đang được ghi hình từ Supabase DB."""
+def get_active_recordings_from_supabase(as_details: bool = False) -> list:
+    """Lấy danh sách các username (hoặc dict chi tiết gồm username và updated_at) hiện đang được ghi hình từ Supabase DB."""
     try:
         headers = get_supabase_headers()
-        url = f"{SUPABASE_URL}/rest/v1/tiktok_streamers?is_recording=eq.true&select=username"
+        url = f"{SUPABASE_URL}/rest/v1/tiktok_streamers?is_recording=eq.true&select=username,updated_at"
         with requests.get(url, headers=headers, timeout=8) as res:
             if res.status_code == 200:
                 data = res.json()
                 if isinstance(data, list):
+                    if as_details:
+                        return [{
+                            "username": d["username"].strip().replace("@", "").lower(),
+                            "updated_at": d.get("updated_at")
+                        } for d in data if "username" in d and d["username"]]
                     return [d["username"].strip().replace("@", "").lower() for d in data if "username" in d and d["username"]]
     except Exception as e:
         print(f"[SUPABASE-SYNC] [!] Lỗi đọc active recordings từ Supabase: {e}")

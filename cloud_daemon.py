@@ -7,8 +7,10 @@ import re
 import threading
 import shutil
 import gc
+import sys
+import atexit
+import signal
 from config_lock import config_transaction
-
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -171,6 +173,35 @@ MAX_CONCURRENT_RECORDERS = 10  # Tối đa 10 streamer ghi hình cùng lúc
 MAX_CHUNK_SECONDS = 3600       # Đúng 1 tiếng (1h = 3600s), tự động tách video và up lên Cloud
 ACTIVE_RECORDERS = {}          # {user: {"thread": Thread, "start_time": float}}
 RECORDERS_LOCK = threading.Lock()
+
+def _emergency_cleanup_on_exit():
+    try:
+        with RECORDERS_LOCK:
+            active = list(ACTIVE_RECORDERS.keys())
+        for u in active:
+            try:
+                gdrive_manager.set_user_recording_status_drive(u, False)
+            except Exception:
+                pass
+            try:
+                supabase_sync.update_streamer_status_supabase(u, is_recording=False, is_live=False, status="offline")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+atexit.register(_emergency_cleanup_on_exit)
+
+def _handle_termination(signum, frame):
+    log(f"[!] Nhận tín hiệu kết thúc từ hệ thống ({signum}). Đang dọn dẹp trạng thái...")
+    _emergency_cleanup_on_exit()
+    sys.exit(0)
+
+try:
+    signal.signal(signal.SIGTERM, _handle_termination)
+    signal.signal(signal.SIGINT, _handle_termination)
+except Exception:
+    pass
 
 # Chống "hot loop": nếu luồng ghi hình của 1 streamer bị tắt ngay sau khi khởi động
 # (ffmpeg lỗi, mạng lỗi, ...) thì mỗi vòng lặp ~15s sẽ khởi động lại + gửi 1 tin
@@ -946,6 +977,14 @@ def run_daemon(max_minutes=210, interval=25, auto_discover=True):
                 log(f"  [!] Luồng @{u} VẪN CHƯA kết thúc sau khi chờ — video của luồng này có thể chưa upload xong.")
             else:
                 log(f"  [✓] Luồng @{u} đã hoàn tất.")
+            try:
+                gdrive_manager.set_user_recording_status_drive(u, False)
+            except Exception:
+                pass
+            try:
+                supabase_sync.update_streamer_status_supabase(u, is_recording=False, is_live=False, status="offline")
+            except Exception:
+                pass
 
     log("[✓] Phiên làm việc kết thúc thành công.")
 
