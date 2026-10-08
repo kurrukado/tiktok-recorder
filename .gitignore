@@ -46,3 +46,5 @@ _tiktok_recorder/
 github_recorder/
 gradio_space/
 huggingface_space/
+.pytest_cache/
+test_*_user/

@@ -294,43 +294,62 @@ def is_local_recorder_running_for_user(user: str) -> bool:
 
 def clean_zombie_recordings(live_statuses=None):
     """
-    Tự động quét và dọn dẹp các user bị kẹt trạng thái ma (Zombie Recording) trong active_recordings.json
+    Tự động quét và dọn dẹp các user bị kẹt trạng thái ma (Zombie Recording) trong Drive & Supabase
     nếu họ offline trên TikTok và không có PID recorder cục bộ nào đang chạy.
     """
     try:
         drive_details = gdrive_manager.load_active_recordings_from_drive(as_details=True) or []
-        if not drive_details:
-            return []
+        supa_active = []
+        try:
+            supa_active = supabase_sync.get_active_recordings_from_supabase() or []
+        except Exception:
+            pass
 
         now_ts = int(time.time())
-        zombies_cleaned = []
+        candidates = {}
+
+        # Nguồn 1: Google Drive active_recordings.json
         for item in drive_details:
             u = item.get("username") if isinstance(item, dict) else str(item)
             u = u.strip().replace("@", "").lower()
-            if not u:
-                continue
+            if u:
+                candidates[u] = item.get("updated_at", 0) if isinstance(item, dict) else 0
 
-            # Nếu đang có PID cục bộ chạy thì không phải zombie
+        # Nguồn 2: Supabase tiktok_streamers (is_recording = true)
+        for su in supa_active:
+            u = su.strip().replace("@", "").lower()
+            if u and u not in candidates:
+                candidates[u] = 0
+
+        if not candidates:
+            return []
+
+        zombies_cleaned = []
+        for u, updated_at in candidates.items():
+            # Nếu đang có tiến trình ghi hình cục bộ trên máy này -> không phải zombie
             if is_local_recorder_running_for_user(u):
                 continue
 
-            # Heartbeat check: Nếu vừa mới được cập nhật trong 10 phút thì chắc chắn đang chạy trên Cloud Runner
-            updated_at = item.get("updated_at", 0) if isinstance(item, dict) else 0
-            if updated_at and (now_ts - updated_at) < 600:
+            # Heartbeat check: Nếu vừa cập nhật trong 5 phút -> Cloud Runner đang chạy
+            if updated_at and (now_ts - updated_at) < 300:
                 continue
 
-            # Nếu quá 10 phút không có heartbeat, kiểm tra trực tiếp trên TikTok
+            # Kiểm tra trạng thái thực tế trên TikTok
             is_live = False
             if live_statuses and u in live_statuses:
                 val = live_statuses[u]
-                is_live = val.get("is_live", False) if isinstance(val, dict) else val[0]
+                is_live = val.get("is_live", False) if isinstance(val, dict) else (val[0] if isinstance(val, (tuple, list)) else bool(val))
             else:
                 is_live, _ = get_user_live_status_cached(u)
 
             if not is_live:
-                print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (quá 10p không heartbeat & Offline). Đang dọn dẹp...")
+                print(f"[🧟 Zombie Cleaner] Phát hiện streamer @{u} bị kẹt trạng thái ma (Offline trên TikTok & không recorder cục bộ). Đang dọn dẹp...")
                 try:
                     threading.Thread(target=gdrive_manager.set_user_recording_status_drive, args=(u, False), daemon=True).start()
+                except Exception:
+                    pass
+                try:
+                    threading.Thread(target=supabase_sync.update_streamer_status_supabase, args=(u, False, False, None, None, None, "offline"), daemon=True).start()
                 except Exception:
                     pass
                 zombies_cleaned.append(u)
@@ -340,6 +359,27 @@ def clean_zombie_recordings(live_statuses=None):
         print(f"[!] Lỗi dọn dẹp Zombie Recording: {e}")
         return []
 
+def extract_tiktok_username(raw: str) -> str:
+    """Trích xuất và chuẩn hóa TikTok username từ link hoặc chuỗi nhập liệu bất kỳ."""
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    # 1. Tìm pattern /@username
+    m = re.search(r"/@([a-zA-Z0-9_.-]+)", s)
+    if m:
+        return m.group(1).lower()
+    # 2. Nếu là URL tiktok.com/username
+    if "tiktok.com" in s:
+        s = s.split("?")[0].split("#")[0].rstrip("/")
+        parts = s.split("/")
+        if parts:
+            cand = parts[-1].lstrip("@")
+            if cand and not cand.endswith(".com"):
+                return re.sub(r"[^a-z0-9_.-]", "", cand.lower())
+    # 3. Chuỗi thường
+    s = s.strip().lstrip("@").strip().lower()
+    return re.sub(r"[^a-z0-9_.-]", "", s)
+
 class AddUserRequest(BaseModel):
     username: str
 
@@ -348,11 +388,17 @@ class RecordRequest(BaseModel):
     duration_seconds: Optional[int] = None
 
 @app.get("/api/health")
+@app.get("/api/status")
 def health_check():
     active = set()
     try:
         drive_act = gdrive_manager.load_active_recordings_from_drive() or []
         active.update(drive_act)
+    except Exception:
+        pass
+    try:
+        supa_act = supabase_sync.get_active_recordings_from_supabase() or []
+        active.update(supa_act)
     except Exception:
         pass
     with RECORDING_LOCK:
@@ -381,6 +427,11 @@ def get_active_recordings():
     try:
         drive_act = gdrive_manager.load_active_recordings_from_drive() or []
         recording.update(drive_act)
+    except Exception:
+        pass
+    try:
+        supa_act = supabase_sync.get_active_recordings_from_supabase() or []
+        recording.update(supa_act)
     except Exception:
         pass
     with RECORDING_LOCK:
@@ -417,12 +468,25 @@ def get_users(check_live: bool = True, fresh: bool = False):
 
         # 1. Nguồn dữ liệu số 1: Supabase Database (đồng bộ tức thì từ Web)
         supa_users = []
+        supa_streamers_map = {}
         try:
             supa_users = supabase_sync.fetch_streamers_from_supabase()
             if supa_users:
                 users_list.extend(supa_users)
         except Exception as e:
             print(f"[!] Lỗi nạp streamers từ Supabase: {e}")
+
+        try:
+            supa_details = supabase_sync.fetch_streamers_details_from_supabase()
+            if supa_details:
+                for sd in supa_details:
+                    u = sd.get("username")
+                    if u:
+                        supa_streamers_map[u] = sd
+                        if u not in users_list:
+                            users_list.append(u)
+        except Exception:
+            pass
 
         # 2. Nguồn dữ liệu số 2: Google Drive
         drive_users = []
@@ -456,6 +520,16 @@ def get_users(check_live: bool = True, fresh: bool = False):
                     pass
             threading.Thread(target=_bg_drive_folder_sync, args=(users, set(supa_users) - set(drive_users)), daemon=True).start()
 
+        # Tự động đồng bộ lên Supabase nếu Drive có streamer mới (chạy nền để không block GET API)
+        if d_users is not None and (set(drive_users) - set(supa_users)):
+            def _bg_supa_sync(missing_u):
+                for mu in missing_u:
+                    try:
+                        supabase_sync.add_streamer_to_supabase(mu)
+                    except Exception:
+                        pass
+            threading.Thread(target=_bg_supa_sync, args=(set(drive_users) - set(supa_users),), daemon=True).start()
+
         active_users = set()
         try:
             drive_act = gdrive_manager.load_active_recordings_from_drive()
@@ -463,13 +537,23 @@ def get_users(check_live: bool = True, fresh: bool = False):
                 active_users.update(drive_act)
         except Exception:
             pass
+        # Bổ sung active recordings từ Supabase (bảo đảm nhận diện ngay cả khi máy chủ không có Google Drive token, vd Render)
+        try:
+            for u, sd in supa_streamers_map.items():
+                if sd.get("is_recording"):
+                    active_users.add(u)
+        except Exception:
+            pass
         with RECORDING_LOCK:
             active_keys = list(ACTIVE_RECORDING_TASKS.keys())
         active_users.update(active_keys)
         
-        # Chỉ probe live status đối với các streamer CHƯA có trong active_users
-        # (Streamer đã nằm trong active_users chắc chắn đang quay & live, không cần scrape chậm)
-        users_to_probe = [u for u in users if u not in active_users]
+        # Probe live status: Khi fresh=True, probe toàn bộ streamer.
+        # Khi fresh=False, probe các streamer chưa có recorder cục bộ
+        local_rec_users = set()
+        with RECORDING_LOCK:
+            local_rec_users.update(ACTIVE_RECORDING_TASKS.keys())
+        users_to_probe = list(users) if fresh else [u for u in users if u not in local_rec_users]
         live_statuses = {}
         if check_live and users_to_probe:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_probe), 8)) as executor:
@@ -489,16 +573,40 @@ def get_users(check_live: bool = True, fresh: bool = False):
         except Exception:
             pass
 
+        # Tự động đồng bộ trạng thái live mới phát hiện lên Supabase chạy nền
+        if live_statuses:
+            def _bg_sync_supa_live(live_map):
+                for usr, d_info in live_map.items():
+                    if d_info.get("is_live"):
+                        supabase_sync.update_streamer_status_supabase(
+                            usr,
+                            is_live=True,
+                            room_id=d_info.get("room_id"),
+                            nickname=d_info.get("nickname"),
+                            avatar_thumb=d_info.get("avatar_thumb"),
+                            status="live"
+                        )
+            threading.Thread(target=_bg_sync_supa_live, args=(live_statuses,), daemon=True).start()
+
         result = []
         for u in users:
             is_recording = (u in active_users)
-            det = live_statuses.get(u, {})
-            is_live = det.get("is_live", False) or is_recording
-            room_id = det.get("room_id")
-            is_sub_only = det.get("is_sub_only", False)
-            is_preview = det.get("is_preview", False)
-            avatar_thumb = det.get("avatar_thumb")
-            nickname = det.get("nickname")
+            det = live_statuses.get(u) or LIVE_CACHE.get(u, {})
+            sd = supa_streamers_map.get(u, {})
+
+            # Streamer offline trên TikTok và không có recorder cục bộ -> dứt khoát offline
+            if not is_local_recorder_running_for_user(u) and det and not det.get("is_live", False):
+                is_recording = False
+                is_live = False
+            else:
+                is_live = det.get("is_live", False) or is_recording or sd.get("is_live", False)
+
+            room_id = det.get("room_id") or sd.get("room_id")
+            avatar_thumb = det.get("avatar_thumb") or sd.get("avatar_thumb")
+            nickname = det.get("nickname") or sd.get("nickname")
+            is_sub_only = det.get("is_sub_only", False) or sd.get("is_sub_only", False)
+            is_preview = det.get("is_preview", False) or sd.get("is_preview", False)
+
             if is_recording:
                 status_str = "recording"
                 is_live = True
@@ -506,6 +614,7 @@ def get_users(check_live: bool = True, fresh: bool = False):
                 status_str = "live"
             else:
                 status_str = "offline"
+
             result.append({
                 "username": u,
                 "nickname": nickname,
@@ -576,87 +685,104 @@ def get_memory_usage():
 
 @app.post("/api/users")
 def add_user(req: AddUserRequest, bg_tasks: BackgroundTasks):
-    user = os.path.basename(req.username.strip().replace("@", "").lower())
+    user = extract_tiktok_username(req.username)
     if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên tài khoản không hợp lệ")
-    
-    with config_transaction():
-        cfg = load_config()
-        users = cfg.get("monitored_users", [])
-        try:
-            drive_users = gdrive_manager.load_streamers_from_drive()
-            if drive_users is not None and isinstance(drive_users, list):
-                users = drive_users
-        except Exception:
-            pass
 
-        already_in = (user in users)
-        if not already_in:
-            users.insert(0, user)
-            cfg["monitored_users"] = users
-            save_config(cfg)
-            try:
-                gdrive_manager.save_streamers_to_drive(users)
-            except Exception:
-                pass
+    users_list = []
+    # 1. Nguồn Supabase
+    try:
+        supa_users = supabase_sync.fetch_streamers_from_supabase()
+        if supa_users:
+            users_list.extend(supa_users)
+    except Exception:
+        pass
 
+    # 2. Nguồn Google Drive
+    try:
+        drive_users = gdrive_manager.load_streamers_from_drive()
+        if drive_users is not None and isinstance(drive_users, list):
+            users_list.extend([u.strip().replace("@", "").lower() for u in drive_users if u.strip()])
+    except Exception:
+        pass
+
+    # 3. Nguồn Local config
+    cfg = load_config()
+    cfg_users = cfg.get("monitored_users", [])
+    if cfg_users:
+        users_list.extend(cfg_users)
+
+    # Khử trùng lặp
+    users = list(dict.fromkeys([u.strip().replace("@", "").lower() for u in users_list if u.strip()]))
+    already_in = (user in users)
+    if not already_in:
+        users.insert(0, user)
+
+    # Cập nhật config local
+    try:
+        with config_transaction():
+            c = load_config()
+            c["monitored_users"] = users
+            save_config(c)
+    except Exception:
+        pass
+
+    # Đồng bộ tức thì lên Supabase Database
     try:
         supabase_sync.add_streamer_to_supabase(user)
     except Exception:
         pass
 
-    # TỰ ĐỘNG TẠO THƯ MỤC TRÊN GOOGLE DRIVE
-    gdrive_status = "Chưa kết nối Google Drive"
-    folder_id = None
-    try:
-        ok, res_info = gdrive_manager.create_streamer_folder_drive(user)
-        if ok:
-            folder_id = res_info
-            gdrive_status = f"Đã tạo thành công thư mục 'tiktok-record/{user}/' trên Google Drive"
-        else:
-            gdrive_status = f"Không thể tạo folder Drive: {res_info}"
-    except Exception as e:
-        gdrive_status = f"Lỗi tạo folder Drive: {e}"
+    # Tác vụ nặng (lưu Drive, tạo thư mục Drive, check live và kích hoạt quay) chạy nền để phản hồi HTTP ngay tức thì (~50ms)
+    def _bg_post_add_tasks(usr, all_u):
+        try:
+            gdrive_manager.save_streamers_to_drive(all_u)
+        except Exception:
+            pass
+        try:
+            gdrive_manager.create_streamer_folder_drive(usr)
+        except Exception:
+            pass
+        try:
+            with LIVE_CACHE_LOCK:
+                LIVE_CACHE.pop(usr, None)
+            live_details = get_user_live_details_cached(usr, fresh=True)
+            if live_details.get("is_live"):
+                has_ffmpeg = bool(shutil.which("ffmpeg") or (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)))
+                if has_ffmpeg:
+                    with RECORDING_LOCK:
+                        if usr not in ACTIVE_RECORDING_TASKS:
+                            stop_evt = threading.Event()
+                            ACTIVE_RECORDING_TASKS[usr] = {"start_time": time.time(), "stop_event": stop_evt}
+                            try:
+                                gdrive_manager.set_user_recording_status_drive(usr, True)
+                            except Exception:
+                                pass
+                            threading.Thread(target=bg_record_worker, args=(usr, None, stop_evt), daemon=True).start()
+        except Exception:
+            pass
 
-    # TỰ ĐỘNG KÍCH HOẠT GHI HÌNH NGAY NẾU STREAMER ĐANG LIVE
-    recording_started = False
-    try:
-        with LIVE_CACHE_LOCK:
-            LIVE_CACHE.pop(user, None)
-        live_details = get_user_live_details_cached(user)
-        if live_details.get("is_live"):
-            has_ffmpeg = bool(shutil.which("ffmpeg") or (FFMPEG_PATH and os.path.exists(FFMPEG_PATH)))
-            if has_ffmpeg and bg_tasks:
-                with RECORDING_LOCK:
-                    if user not in ACTIVE_RECORDING_TASKS:
-                        stop_evt = threading.Event()
-                        ACTIVE_RECORDING_TASKS[user] = {"start_time": time.time(), "stop_event": stop_evt}
-                        try:
-                            gdrive_manager.set_user_recording_status_drive(user, True)
-                        except Exception:
-                            pass
-                        bg_tasks.add_task(bg_record_worker, user, None, stop_evt)
-                        recording_started = True
-    except Exception:
-        pass
-
-    if recording_started:
-        msg = f"@{user} đang phát trực tiếp! Đã tự động bắt đầu ghi hình ngay lập tức."
+    if bg_tasks:
+        bg_tasks.add_task(_bg_post_add_tasks, user, users)
     else:
-        msg = f"@{user} đã có trong danh sách theo dõi" if already_in else f"Đã thêm @{user} vào danh sách theo dõi"
+        threading.Thread(target=_bg_post_add_tasks, args=(user, users), daemon=True).start()
+
+    msg = f"@{user} đã có trong danh sách theo dõi" if already_in else f"Đã thêm @{user} vào danh sách theo dõi"
 
     return {
+        "ok": True,
+        "status": "success",
         "message": msg,
         "username": user,
-        "is_recording": recording_started,
-        "gdrive_status": gdrive_status,
-        "gdrive_folder_id": folder_id,
+        "is_recording": False,
+        "gdrive_status": "Đang chuẩn bị thư mục Google Drive trong nền",
+        "gdrive_folder_id": None,
         "users": users
     }
 
 @app.delete("/api/users/{username}")
 def delete_user(username: str, delete_files: bool = True):
-    user = os.path.basename(username.strip().replace("@", "").lower())
+    user = extract_tiktok_username(username)
     if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên streamer không hợp lệ")
     with config_transaction():
@@ -736,7 +862,6 @@ def delete_user(username: str, delete_files: bool = True):
                 print(f"[API] Lỗi xóa dữ liệu Supabase của {user}: {sb_err}")
 
             # Invalidate và dọn dẹp cache danh sách video trong RAM của API server
-            global _RECORDINGS_CACHE
             with _RECORDINGS_CACHE_LOCK:
                 _RECORDINGS_CACHE["timestamp"] = 0
                 _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if (v.get("user") != user and v.get("username") != user)]
@@ -745,6 +870,8 @@ def delete_user(username: str, delete_files: bool = True):
         LIVE_CACHE.pop(user, None)
 
     return {
+        "ok": True,
+        "status": "success",
         "message": f"Đã xóa @{user} khỏi danh sách theo dõi cùng toàn bộ folder và dữ liệu trên Drive",
         "username": user,
         "gdrive_status": gdrive_status,
@@ -809,8 +936,19 @@ def test_live_diagnostic(username: str):
         r_nat = None
         try:
             from curl_cffi import requests as c_req
-            api_url = f"https://www.tiktok.com/api-live/user/room/?aid=1988&app_language=en&app_name=tiktok_web&device_platform=web_pc&uniqueId={user}&sourceType=54"
-            r_nat = c_req.get(api_url, impersonate="safari15_5", timeout=7)
+            api_url = "https://www.tiktok.com/api-live/user/room"
+            api_params = {
+                "aid": 1988,
+                "sourceType": 54,
+                "staleTime": 600000,
+                "uniqueId": user.lower(),
+            }
+            api_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36",
+                "Referer": f"https://www.tiktok.com/@{user}/live",
+                "Accept": "*/*",
+            }
+            r_nat = c_req.get(api_url, params=api_params, headers=api_headers, cookies={"tt-target-idc": "useast1a"}, impersonate="chrome136", timeout=7)
             out["native_api"] = {
                 "status_code": r_nat.status_code,
                 "text_len": len(r_nat.text),
@@ -1532,7 +1670,6 @@ def list_recordings_from_drive(access_token=None, force_refresh=False):
     """
     Quét danh sách toàn bộ video và thumbnail đã lưu trên Google Drive bằng ThreadPool song song.
     """
-    global _RECORDINGS_CACHE
     now = time.time()
     with _RECORDINGS_CACHE_LOCK:
         if not force_refresh and (now - _RECORDINGS_CACHE["timestamp"] < 60) and _RECORDINGS_CACHE["data"]:

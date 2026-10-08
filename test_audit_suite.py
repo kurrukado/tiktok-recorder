@@ -12,6 +12,10 @@ import time
 import recorder_core
 from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
+import urllib.request
+
+# Unit tests run offline: mock urllib.request.urlopen to prevent unmocked real TikTok network calls
+urllib.request.urlopen = MagicMock(side_effect=Exception("urllib disabled in unit tests"))
 
 class TestAuditMemoryOptimizations(unittest.TestCase):
 
@@ -605,6 +609,8 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
         # Simulate generate_guest_session raising exception
         with patch("recorder_core.generate_guest_session", side_effect=RuntimeError("TikTok Rate Limit 429 / Captcha")), \
              patch("recorder_core.check_live_details", return_value={"is_live": True, "is_sub_only": True, "room_id": "111"}), \
+             patch("recorder_core.check_live_status", return_value=(True, "111")), \
+             patch("supabase_sync.update_streamer_status_supabase"), \
              patch("gdrive_manager.set_user_recording_status_drive"), \
              patch("gdrive_manager.create_streamer_folder_drive"), \
              patch.object(time, "sleep"):
@@ -742,11 +748,14 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
 
         # 1. get_users raises unexpected exception during user fetching
         with patch("supabase_sync.fetch_streamers_from_supabase", side_effect=TypeError("Unexpected mock failure")), \
+             patch("supabase_sync.fetch_streamers_details_from_supabase", return_value=[]), \
+             patch("gdrive_manager.load_streamers_from_drive", return_value=["test_u1"]), \
+             patch("gdrive_manager.load_active_recordings_from_drive", return_value=set()), \
              patch("api_server.clean_zombie_recordings", side_effect=RuntimeError("Zombie cleaner crash")), \
              patch("gc.collect") as mock_gc:
 
             try:
-                api_server.get_users()
+                api_server.get_users(check_live=False)
             except Exception:
                 pass
             mock_gc.assert_called()
@@ -1459,7 +1468,10 @@ class TestPonytailQueueAndBackendFixes(unittest.TestCase):
         ]
 
         with patch("api_server.get_user_live_details_cached", return_value=mock_details), \
-             patch("gdrive_manager.load_active_recordings_from_drive", return_value=drive_active):
+             patch("gdrive_manager.load_active_recordings_from_drive", return_value=drive_active), \
+             patch("gdrive_manager.load_streamers_from_drive", return_value=["cloud_active_user"]), \
+             patch("gdrive_manager.save_streamers_to_drive"), \
+             patch("gdrive_manager.create_streamer_folder_drive"):
             resp = client.post("/api/record/start", json={"username": "cloud_active_user", "duration_seconds": 3600})
             self.assertEqual(resp.status_code, 200)
             data = resp.json()

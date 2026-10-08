@@ -117,6 +117,7 @@ def save_config_fields(updates):
         save_config(cfg)
 
 def load_cookies():
+    cookies = {}
     cookie_paths = [
         COOKIES_FILE,
         os.path.join(os.path.dirname(BASE_DIR), "web-truyen", "kuruRecord", "cookies.json")
@@ -126,12 +127,11 @@ def load_cookies():
             try:
                 with open(cp, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                    cookies = {}
                     for k, v in data.items():
                         if v:
                             cookies[k] = str(v).strip()
                     if cookies:
-                        return cookies
+                        break
             except Exception:
                 pass
 
@@ -150,7 +150,10 @@ def load_cookies():
             pass
 
     # Luôn gán tt-target-idc để tránh Akamai EdgeSuite Access Denied trên TikTok Native Live API
-    cookies.setdefault("tt-target-idc", "useast1a")
+    if isinstance(cookies, dict):
+        cookies.setdefault("tt-target-idc", "useast1a")
+    else:
+        cookies = {"tt-target-idc": "useast1a"}
     return cookies
 
 def save_cookies(cookies_dict):
@@ -270,7 +273,7 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
                         user_data = data.get("user")
                         user_data = user_data if isinstance(user_data, dict) else {}
                         status = live_room.get("status")
-                        room_id = user_data.get("roomId") or live_room.get("roomId")
+                        room_id = user_data.get("roomId") or live_room.get("roomId") or data.get("roomId") or live_room.get("streamId")
 
                         if isinstance(user_data, dict):
                             details["avatar_thumb"] = user_data.get("avatarThumb") or user_data.get("avatarMedium") or user_data.get("avatarLarger")
@@ -284,7 +287,7 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
                             details["is_live"] = True
                             details["room_id"] = str(room_id)
                             return details
-                        elif status == 4:
+                        elif status is not None and status != 2:
                             details["is_live"] = False
                             details["room_id"] = None
                             return details
@@ -296,6 +299,42 @@ def check_live_details(user: str, cookies: Optional[dict] = None, proxy: Optiona
                         api_res.close()
                     except Exception:
                         pass
+
+        # Fallback với standard urllib nếu curl_cffi gặp sự cố
+        try:
+            import urllib.request
+            import urllib.parse
+            u_params = urllib.parse.urlencode(api_params)
+            u_url = f"{api_url}?{u_params}"
+            u_headers = dict(api_headers)
+            cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items()) if cookies else "tt-target-idc=useast1a"
+            u_headers["Cookie"] = cookie_str
+            u_req = urllib.request.Request(u_url, headers=u_headers)
+            with urllib.request.urlopen(u_req, timeout=6) as u_res:
+                if u_res.status == 200:
+                    u_json = json.loads(u_res.read().decode("utf-8", errors="replace"))
+                    if isinstance(u_json, dict):
+                        data = u_json.get("data") or {}
+                        live_room = data.get("liveRoom") or {}
+                        user_data = data.get("user") or {}
+                        status = live_room.get("status")
+                        room_id = user_data.get("roomId") or live_room.get("roomId") or data.get("roomId") or live_room.get("streamId")
+                        if isinstance(user_data, dict):
+                            details["avatar_thumb"] = user_data.get("avatarThumb") or user_data.get("avatarMedium") or user_data.get("avatarLarger")
+                            details["nickname"] = user_data.get("nickname")
+                        if live_room.get("liveSubOnly") or live_room.get("subOnly"):
+                            details["is_sub_only"] = True
+                            details["is_preview"] = True
+                        if status == 2 and room_id:
+                            details["is_live"] = True
+                            details["room_id"] = str(room_id)
+                            return details
+                        elif status is not None and status != 2:
+                            details["is_live"] = False
+                            details["room_id"] = None
+                            return details
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -709,6 +748,30 @@ def get_stream_urls(room_id, user, cookies=None, session=None, proxy=None):
                             api_res.close()
                         except Exception:
                             pass
+
+            # Fallback với standard urllib nếu curl_cffi gặp sự cố
+            try:
+                import urllib.request
+                import urllib.parse
+                u_params = urllib.parse.urlencode(api_params)
+                u_url = f"{api_url}?{u_params}"
+                u_headers = dict(api_headers)
+                cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items()) if cookies else "tt-target-idc=useast1a"
+                u_headers["Cookie"] = cookie_str
+                u_req = urllib.request.Request(u_url, headers=u_headers)
+                with urllib.request.urlopen(u_req, timeout=7) as u_res:
+                    if u_res.status == 200:
+                        u_json = json.loads(u_res.read().decode("utf-8", errors="replace"))
+                        d = u_json.get("data", {}).get("liveRoom", {})
+                        sd_str = d.get("streamData", {}).get("pull_data", {}).get("stream_data")
+                        if not sd_str:
+                            sd_str = d.get("hevcStreamData", {}).get("pull_data", {}).get("stream_data")
+                        if sd_str:
+                            c_urls = parse_sdk_stream_data(sd_str)
+                            if c_urls:
+                                return c_urls
+            except Exception:
+                pass
         except Exception:
             pass
 
