@@ -905,6 +905,13 @@ async def delete_recordings_batch(request: Request, bg_tasks: BackgroundTasks = 
             except Exception as e:
                 print(f"[API] Lỗi xóa file Drive song song: {e}")
 
+        # Xóa ảnh thumbnail cover tương ứng trên Supabase Storage
+        if usr and fnames:
+            try:
+                supabase_sync.delete_thumbnails_from_supabase(usr, fnames)
+            except Exception as e:
+                print(f"[API] Lỗi xóa thumbnail Supabase: {e}")
+
         if usr and fnames:
             u_dir = os.path.join(".", usr)
             if os.path.exists(u_dir):

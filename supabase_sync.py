@@ -448,3 +448,26 @@ def delete_streamer_data_supabase(user: str) -> bool:
     except Exception as e:
         print(f"[SUPABASE-SYNC] [!] Ngoại lệ khi xóa dữ liệu streamer {user} trên Supabase: {e}")
         return False
+
+def delete_thumbnails_from_supabase(user: str, filenames: list) -> bool:
+    """
+    Xóa danh sách ảnh thumbnail của các video tương ứng trong Supabase Storage bucket 'covers/record-thumbnails/{user}/{clean_name}.jpg'.
+    """
+    if not user or not filenames:
+        return False
+    try:
+        user = user.strip().replace("@", "").lower()
+        headers = get_supabase_headers()
+        prefixes = [f"record-thumbnails/{user}/{clean_filename(fn)}.jpg" for fn in filenames if fn]
+        if not prefixes:
+            return True
+        del_url = f"{SUPABASE_URL}/storage/v1/object/{STORAGE_BUCKET}"
+        with requests.delete(del_url, headers=headers, json={"prefixes": prefixes}, timeout=10) as res:
+            if res.status_code in (200, 204):
+                print(f"[SUPABASE-SYNC] [✓] Đã xóa {len(prefixes)} thumbnail của @{user} trong Supabase Storage")
+                return True
+        return False
+    except Exception as e:
+        print(f"[SUPABASE-SYNC] [!] Lỗi xóa thumbnail trong Storage: {e}")
+        return False
+
