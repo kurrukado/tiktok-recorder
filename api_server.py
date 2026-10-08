@@ -781,28 +781,21 @@ def add_user(req: AddUserRequest, bg_tasks: BackgroundTasks):
     }
 
 @app.delete("/api/users/{username}")
-def delete_user(username: str, delete_files: bool = True):
+def delete_user(username: str, delete_files: bool = True, bg_tasks: BackgroundTasks = None):
     user = extract_tiktok_username(username)
     if not user or user in (".", ".."):
         raise HTTPException(status_code=400, detail="Tên streamer không hợp lệ")
+
+    # 1. Cập nhật config.json cục bộ ngay lập tức
     with config_transaction():
         cfg = load_config()
         cfg_users = cfg.get("monitored_users", [])
         if user in cfg_users:
             cfg["monitored_users"] = [u for u in cfg_users if u != user]
             save_config(cfg)
-
         users = cfg.get("monitored_users", [])
-        try:
-            drive_users = gdrive_manager.load_streamers_from_drive()
-            if drive_users is not None and isinstance(drive_users, list):
-                clean_drive = [u.strip().replace("@", "").lower() for u in drive_users if u.strip() and u.strip().replace("@", "").lower() != user]
-                users = clean_drive
-                gdrive_manager.save_streamers_to_drive(clean_drive)
-        except Exception as d_err:
-            print(f"[API] Lỗi cập nhật streamers.json trên Drive: {d_err}")
 
-    # Dừng tiến trình ghi hình nếu đang hoạt động
+    # 2. Ngắt luồng quay cục bộ ngay lập tức nếu đang quay
     with RECORDING_LOCK:
         task_info = ACTIVE_RECORDING_TASKS.pop(user, None)
         if task_info and isinstance(task_info, dict):
@@ -810,76 +803,73 @@ def delete_user(username: str, delete_files: bool = True):
             if se:
                 se.user_deleted = True
                 se.set()
+
+    # 3. Xóa dữ liệu Supabase ngay lập tức (streamers & recordings)
     try:
-        gdrive_manager.set_user_recording_status_drive(user, False)
-    except Exception:
-        pass
+        supabase_sync.delete_streamer_data_supabase(user)
+    except Exception as sb_err:
+        print(f"[API] Lỗi xóa dữ liệu Supabase của {user}: {sb_err}")
 
-    if task_info and isinstance(task_info, dict):
-        t = task_info.get("thread")
-        if t and hasattr(t, 'join'):
-            t.join(timeout=10)
-        else:
-            time.sleep(3)
+    # 4. Invalidate RAM caches ngay lập tức
+    with LIVE_CACHE_LOCK:
+        LIVE_CACHE.pop(user, None)
+    with _RECORDINGS_CACHE_LOCK:
+        _RECORDINGS_CACHE["timestamp"] = 0
+        _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if (v.get("user") != user and v.get("username") != user)]
 
-    # Xóa thư mục trên Drive cùng toàn bộ dữ liệu bên trong (mặc định luôn xóa sạch)
-    gdrive_status = "Đã xóa toàn bộ thư mục và file trên Drive"
-    drive_delete_ok = True
-    if delete_files:
+    # 5. Các tác vụ nặng (xóa Drive, cập nhật streamers.json Drive, xóa files) chạy ngầm
+    def _bg_delete_streamer_cloud(usr, del_files, t_info):
         try:
-            drive_delete_ok, gdrive_status = gdrive_manager.delete_streamer_folder_drive(user)
-        except Exception as e:
-            drive_delete_ok = False
-            gdrive_status = f"Lỗi xóa folder Drive: {e}"
+            if t_info and isinstance(t_info, dict):
+                t = t_info.get("thread")
+                if t and hasattr(t, 'join') and t.is_alive():
+                    t.join(timeout=6)
+        except Exception:
+            pass
 
-        if not drive_delete_ok:
-            # Drive CHƯA xác nhận đã xóa -> GIỮ file local và bản ghi Supabase.
-            # Xóa local lúc này sẽ mất vĩnh viễn bản sao duy nhất trong khi video vẫn còn trên Drive.
-            print(f"[API] Không xóa được dữ liệu Drive của {user}: {gdrive_status}. GIỮ file local & Supabase.")
-        else:
-            worker_alive = False
-            if task_info and isinstance(task_info, dict):
-                t = task_info.get("thread")
-                worker_alive = bool(t and hasattr(t, "is_alive") and t.is_alive())
-            if worker_alive:
-                # Worker vẫn còn chạy (đang validate/upload) -> không được rmtree giữa chừng.
-                gdrive_status += " (Worker still running: GIỮ thư mục local cho tới khi luồng kết thúc)"
-                print(f"[API] Luồng ghi hình của {user} vẫn đang chạy sau 10s. KHÔNG xóa thư mục local.")
-            else:
-                local_dir = os.path.join(BASE_DIR, user)
+        try:
+            gdrive_manager.set_user_recording_status_drive(usr, False)
+        except Exception:
+            pass
+
+        try:
+            drive_users = gdrive_manager.load_streamers_from_drive()
+            if drive_users is not None and isinstance(drive_users, list):
+                clean_drive = [u.strip().replace("@", "").lower() for u in drive_users if u.strip() and u.strip().replace("@", "").lower() != usr]
+                gdrive_manager.save_streamers_to_drive(clean_drive)
+        except Exception as d_err:
+            print(f"[API] Lỗi cập nhật streamers.json trên Drive: {d_err}")
+
+        if del_files:
+            try:
+                gdrive_manager.delete_streamer_folder_drive(usr)
+            except Exception as e:
+                print(f"[API] Lỗi xóa folder Drive của {usr}: {e}")
+
+            try:
+                local_dir = os.path.join(BASE_DIR, usr)
                 resolved_dir = os.path.abspath(local_dir)
                 base_resolved = os.path.abspath(BASE_DIR)
                 if resolved_dir != base_resolved and resolved_dir.startswith(base_resolved) and os.path.exists(resolved_dir):
-                    try:
-                        shutil.rmtree(resolved_dir, ignore_errors=True)
-                    except Exception:
-                        pass
+                    shutil.rmtree(resolved_dir, ignore_errors=True)
+            except Exception:
+                pass
 
-            # Xóa dữ liệu Supabase (bảng recordings, streamers và thumbnail Storage)
-            try:
-                supabase_sync.delete_streamer_data_supabase(user)
-            except Exception as sb_err:
-                print(f"[API] Lỗi xóa dữ liệu Supabase của {user}: {sb_err}")
-
-            # Invalidate và dọn dẹp cache danh sách video trong RAM của API server
-            with _RECORDINGS_CACHE_LOCK:
-                _RECORDINGS_CACHE["timestamp"] = 0
-                _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if (v.get("user") != user and v.get("username") != user)]
-
-    with LIVE_CACHE_LOCK:
-        LIVE_CACHE.pop(user, None)
+    if bg_tasks:
+        bg_tasks.add_task(_bg_delete_streamer_cloud, user, delete_files, task_info)
+    else:
+        threading.Thread(target=_bg_delete_streamer_cloud, args=(user, delete_files, task_info), daemon=True).start()
 
     return {
         "ok": True,
         "status": "success",
-        "message": f"Đã xóa @{user} khỏi danh sách theo dõi cùng toàn bộ folder và dữ liệu trên Drive",
+        "message": f"Đã xóa @{user} khỏi danh sách theo dõi thành công",
         "username": user,
-        "gdrive_status": gdrive_status,
         "users": users
     }
 
 @app.delete("/api/recordings")
-async def delete_recordings_batch(request: Request):
+async def delete_recordings_batch(request: Request, bg_tasks: BackgroundTasks = None):
     try:
         req = await request.json()
     except Exception:
@@ -889,48 +879,55 @@ async def delete_recordings_batch(request: Request):
     drive_file_ids = req.get("drive_file_ids") or []
     user = (req.get("user") or "").strip().replace("@", "").lower()
 
-    deleted_drive = 0
-    for fid in drive_file_ids:
-        if fid:
-            try:
-                if gdrive_manager.delete_file_drive(fid):
-                    deleted_drive += 1
-            except Exception:
-                pass
-
-    if user and filenames:
-        u_dir = os.path.join(".", user)
-        if os.path.exists(u_dir):
-            for fn in filenames:
-                safe_fn = os.path.basename(fn)
-                lp = os.path.join(u_dir, safe_fn)
-                if os.path.exists(lp):
-                    try:
-                        os.remove(lp)
-                    except Exception:
-                        pass
-
+    # 1. Xóa Supabase database records ngay lập tức
     if filenames:
         try:
             headers = supabase_sync.get_supabase_headers()
             quoted_names = ",".join([f'"{fn}"' for fn in filenames])
             del_url = f"{supabase_sync.SUPABASE_URL}/rest/v1/tiktok_recordings?filename=in.({quoted_names})"
-            requests.delete(del_url, headers=headers, timeout=10)
+            requests.delete(del_url, headers=headers, timeout=5)
         except Exception as e:
             print(f"[API] Lỗi xóa bản ghi Supabase: {e}")
 
+    # 2. Invalidate cache RAM ngay lập tức
     with _RECORDINGS_CACHE_LOCK:
         _RECORDINGS_CACHE["timestamp"] = 0
         if filenames:
             fn_set = set(filenames)
             _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if v.get("filename") not in fn_set]
 
+    # 3. Tác vụ xóa file Drive & local chạy ngầm đa luồng cực nhanh
+    def _bg_delete_files(fids, usr, fnames):
+        if fids:
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(fids), 8)) as executor:
+                    list(executor.map(gdrive_manager.delete_file_drive, fids))
+            except Exception as e:
+                print(f"[API] Lỗi xóa file Drive song song: {e}")
+
+        if usr and fnames:
+            u_dir = os.path.join(".", usr)
+            if os.path.exists(u_dir):
+                for fn in fnames:
+                    safe_fn = os.path.basename(fn)
+                    lp = os.path.join(u_dir, safe_fn)
+                    if os.path.exists(lp):
+                        try:
+                            os.remove(lp)
+                        except Exception:
+                            pass
+
+    if bg_tasks:
+        bg_tasks.add_task(_bg_delete_files, drive_file_ids, user, filenames)
+    else:
+        threading.Thread(target=_bg_delete_files, args=(drive_file_ids, user, filenames), daemon=True).start()
+
     return {
         "ok": True,
         "status": "success",
         "message": f"Đã xóa {len(filenames)} video thành công!",
         "deleted_count": len(filenames),
-        "deleted_drive_count": deleted_drive
+        "deleted_drive_count": len(drive_file_ids)
     }
 
 @app.get("/api/stream/{username}")
