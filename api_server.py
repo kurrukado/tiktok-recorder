@@ -548,12 +548,33 @@ def get_users(check_live: bool = True, fresh: bool = False):
             active_keys = list(ACTIVE_RECORDING_TASKS.keys())
         active_users.update(active_keys)
         
+        # Tự động nạp cache từ Supabase (nơi GitHub Actions cập nhật thời gian thực 20s/lần)
+        if supa_streamers_map:
+            with LIVE_CACHE_LOCK:
+                now_ts = time.time()
+                for su, s_data in supa_streamers_map.items():
+                    cached_val = LIVE_CACHE.get(su)
+                    if not cached_val or (now_ts - cached_val.get("timestamp", 0) > 30):
+                        LIVE_CACHE[su] = {
+                            "is_live": bool(s_data.get("is_live")),
+                            "room_id": s_data.get("room_id"),
+                            "is_sub_only": False,
+                            "is_preview": False,
+                            "avatar_thumb": s_data.get("avatar_thumb"),
+                            "nickname": s_data.get("nickname"),
+                            "timestamp": now_ts,
+                        }
+
         # Probe live status: Khi fresh=True, probe toàn bộ streamer.
-        # Khi fresh=False, probe các streamer chưa có recorder cục bộ
+        # Khi fresh=False, chỉ probe các streamer chưa có trong cache để tránh làm nghẽn máy chủ
         local_rec_users = set()
         with RECORDING_LOCK:
             local_rec_users.update(ACTIVE_RECORDING_TASKS.keys())
-        users_to_probe = list(users) if fresh else [u for u in users if u not in local_rec_users]
+        if fresh:
+            users_to_probe = list(users)
+        else:
+            with LIVE_CACHE_LOCK:
+                users_to_probe = [u for u in users if (u not in LIVE_CACHE and u not in local_rec_users)]
         live_statuses = {}
         if check_live and users_to_probe:
             with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(users_to_probe), 8)) as executor:

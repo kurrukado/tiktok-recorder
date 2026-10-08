@@ -1196,7 +1196,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
         with patch("requests.post", side_effect=[resp_500, resp_502, resp_201]) as mock_post, \
              patch("time.sleep", side_effect=lambda s: sleep_delays.append(s)):
 
-            success = supabase_sync.sync_recording_to_supabase("retry_user", "stream_rec.mp4", size_bytes=500 * 1024)
+            success = supabase_sync.sync_recording_to_supabase("retry_user", "stream_rec.mp4", size_bytes=500 * 1024, drive_file_id="dummy_fid")
             self.assertTrue(success)
             self.assertEqual(mock_post.call_count, 3)
             self.assertEqual(sleep_delays, [1.0, 2.0])
@@ -1206,7 +1206,7 @@ class TestAuditMemoryOptimizations(unittest.TestCase):
         with patch("requests.post", side_effect=[resp_500, resp_500, resp_500]) as mock_post2, \
              patch("time.sleep", side_effect=lambda s: sleep_delays.append(s)):
 
-            failed = supabase_sync.sync_recording_to_supabase("retry_user", "stream_rec.mp4", size_bytes=500 * 1024)
+            failed = supabase_sync.sync_recording_to_supabase("retry_user", "stream_rec.mp4", size_bytes=500 * 1024, drive_file_id="dummy_fid")
             self.assertFalse(failed)
             self.assertEqual(mock_post2.call_count, 3)
             self.assertEqual(sleep_delays, [1.0, 2.0])
