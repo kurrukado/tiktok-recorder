@@ -878,6 +878,61 @@ def delete_user(username: str, delete_files: bool = True):
         "users": users
     }
 
+@app.delete("/api/recordings")
+async def delete_recordings_batch(request: Request):
+    try:
+        req = await request.json()
+    except Exception:
+        req = {}
+
+    filenames = req.get("filenames") or []
+    drive_file_ids = req.get("drive_file_ids") or []
+    user = (req.get("user") or "").strip().replace("@", "").lower()
+
+    deleted_drive = 0
+    for fid in drive_file_ids:
+        if fid:
+            try:
+                if gdrive_manager.delete_file_drive(fid):
+                    deleted_drive += 1
+            except Exception:
+                pass
+
+    if user and filenames:
+        u_dir = os.path.join(".", user)
+        if os.path.exists(u_dir):
+            for fn in filenames:
+                safe_fn = os.path.basename(fn)
+                lp = os.path.join(u_dir, safe_fn)
+                if os.path.exists(lp):
+                    try:
+                        os.remove(lp)
+                    except Exception:
+                        pass
+
+    if filenames:
+        try:
+            headers = supabase_sync.get_supabase_headers()
+            quoted_names = ",".join([f'"{fn}"' for fn in filenames])
+            del_url = f"{supabase_sync.SUPABASE_URL}/rest/v1/tiktok_recordings?filename=in.({quoted_names})"
+            requests.delete(del_url, headers=headers, timeout=10)
+        except Exception as e:
+            print(f"[API] Lỗi xóa bản ghi Supabase: {e}")
+
+    with _RECORDINGS_CACHE_LOCK:
+        _RECORDINGS_CACHE["timestamp"] = 0
+        if filenames:
+            fn_set = set(filenames)
+            _RECORDINGS_CACHE["data"] = [v for v in _RECORDINGS_CACHE.get("data", []) if v.get("filename") not in fn_set]
+
+    return {
+        "ok": True,
+        "status": "success",
+        "message": f"Đã xóa {len(filenames)} video thành công!",
+        "deleted_count": len(filenames),
+        "deleted_drive_count": deleted_drive
+    }
+
 @app.get("/api/stream/{username}")
 def get_stream_url(username: str):
     user = username.strip().replace("@", "").lower()
