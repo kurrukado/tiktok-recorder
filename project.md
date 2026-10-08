@@ -26,25 +26,31 @@
 
 ## 1. TỔNG QUAN & NGUYÊN TẮC HOẠT ĐỘNG
 
-Tool là **hệ thống ghi hình livestream TikTok tự động, chạy 24/7**, chuẩn H.264/AVC,
+Tool là **hệ thống ghi hình livestream TikTok tự động, chạy 24/7 trên đám mây**, chuẩn H.264/AVC,
 không re-encode (copy stream), tự đóng gói phân đoạn, upload Google Drive và đồng
 bộ metadata vào Supabase.
 
-Ba chế độ vận hành:
+> [!IMPORTANT]
+> **HỆ THỐNG VẬN HÀNH 100% TỰ ĐỘNG KHI TẮT MÁY TÍNH CÁ NHÂN:**
+> Người dùng **không cần bật máy tính cá nhân**. Toàn bộ pipeline ghi hình chạy độc lập 24/7 trên **GitHub Actions Cloud**, cơ sở dữ liệu và storage chạy trên **Supabase Cloud**, và Web API chạy trên **Vercel Edge**. Máy tính cá nhân chỉ là tùy chọn phụ khi cần debug code tại chỗ.
 
-| Chế độ | Lệnh | Mục đích |
+Các thành phần vận hành:
+
+| Thành phần | Môi trường | Mục đích |
 | :--- | :--- | :--- |
-| **Cloud Runner (GitHub Actions)** | `python -u cloud_daemon.py --duration-minutes 46 --interval 20` | Chạy free 24/7 trên Public Repo, relay tự kích hoạt phiên kế tiếp |
-| **Local Daemon (máy cá nhân)** | `run_cloud_daemon.bat` | Tận dụng GPU NVENC, watchdog tự khởi động lại sau 5s |
-| **REST API Server** | `python api_server.py` → `uvicorn` `0.0.0.0:8000` | Cung cấp API cho website điều khiển/đọc dữ liệu |
+| **Cloud Runner (Chính)** | GitHub Actions (Ubuntu 24.04) | Chạy 24/7 vĩnh viễn miễn phí (Public Repo), Continuous Relay quét Supabase mỗi 20s, tự thu khi streamer live |
+| **Web API & Gateway** | Vercel Edge Serverless | Cung cấp REST API cho web, tự động chuyển mạch (Cloud Failover) sang Supabase trong 0.05s nếu máy local tắt |
+| **Local Daemon (Tùy chọn)** | Máy cá nhân (`run_cloud_daemon.bat`) | Dành riêng cho dev/debug cục bộ hoặc khi người dùng chủ động muốn dùng thêm GPU rời NVENC |
 
 Nguyên tắc cốt lõi:
 
+* **100% Cloud-First**: Tắt máy tính cá nhân đi ngủ, hệ thống vẫn ghi hình và cập nhật Supabase 24/7.
+* **Serverless Cloud Failover**: Web trên Vercel luôn xanh (Online) 24/7 nhờ cơ chế tự chuyển mạch trực tiếp vào Supabase Cloud khi local offline.
+* **Dọn dẹp sạch sẽ Supabase Storage**: Tự động xóa file ảnh thumbnail `.jpg` trong bucket `covers` khi xóa streamer hoặc video, không để lại file rác.
 * **Không re-encode**: `-c:v copy -c:a copy` → CPU thấp, chất lượng nguyên bản.
 * **Ưu tiên HLS H.264 (MPEG-TS)**, FLV chỉ là fallback → tránh lỗi NAL unit/FLV header.
 * **Chia mốc 1 giờ/part** (`MAX_CHUNK_SECONDS = 3600`) + **Upload trực tiếp Drive** → mỗi segment đủ 1h upload ngay lên Drive, segment cuối upload sau khi xác nhận offline 5 phút.
-* **Auto-record khi add user**: thêm streamer qua web → tool tự kiểm tra live → ghi hình ngay lập tức nếu đang live.
-* **Giới hạn ghi hình**: 1080p (upscale nếu cần), FPS nguyên gốc, tối đa 1:00:00/segment.
+* **Auto-record khi add user**: thêm streamer qua web → runner nhận diện sau tối đa 20s → ghi hình ngay lập tức nếu đang live.
 * **Zero-bandwidth playback**: website chỉ redirect/`Range 206` sang Google Edge CDN, không kéo binary qua server trung gian.
 * **Self-healing**: watchdog 6 lần/ngày sửa bitstream + bù thumbnail.
 * **Chống trùng giữa nhiều runner**: heartbeat trên Drive (TTL 180s) + khóa liên tiến trình `streamer_recording_lock`.

@@ -1,23 +1,33 @@
 # TikTok 24/7 Auto Recorder (Cloud Multi-Stream Engine)
 
-Hệ thống ghi hình tự động TikTok Live 24/7 trên nền tảng **GitHub Actions** (hoàn toàn miễn phí, không giới hạn thời gian trên Public Repository), đồng bộ dữ liệu vào **Supabase** và lưu trữ video trên **Google Drive**.
+Hệ thống ghi hình tự động TikTok Live 24/7 vận hành **100% trên đám mây (GitHub Actions + Supabase + Google Drive + Vercel)** — **HOÀN TOÀN TỰ ĐỘNG, KHÔNG CẦN MỞ MÁY TÍNH CÁ NHÂN**.
+
+> [!IMPORTANT]
+> **TẮT MÁY TÍNH CÁ NHÂN HỆ THỐNG VẪN CHẠY 24/7 LIÊN TỤC!**
+> Quá trình theo dõi streamer, phát hiện live sau 20s, thu luồng H.264, lưu Google Drive 5TB, đồng bộ Supabase và điều khiển qua Web hoàn toàn chạy độc lập trên đám mây. Bạn có thể tắt máy tính đi ngủ thoải mái.
 
 ---
 
 ## 🚀 Tính năng Nổi bật
 
-* **Ghi hình 24/7 Không Giới Hạn:**
-  - Chạy liên tục trên GitHub Actions với cơ chế Continuous Relay (tự kích hoạt phiên tiếp theo trước khi hết phiên) kết hợp lưới an toàn Cron (`*/50 * * * *`).
+* ☁️ **Vận Hành 100% Đám Mây 24/7 (Không Phụ Thuộc Máy Local):**
+  - Chạy liên tục trên GitHub Actions với cơ chế Continuous Relay kết hợp lưới an toàn Cron (`*/50 * * * *`).
   - Hỗ trợ ghi đồng thời lên đến **10 streamer cùng lúc**.
-* **Zero-Loss Staging Queue:**
+  - Hoàn toàn miễn phí, không giới hạn số phút (Unlimited Minutes trên Public Repository).
+* ⚡ **Serverless Cloud Failover 24/7 Trên Web:**
+  - Web API (Vercel) tự động chuyển mạch trong 0.05 giây sang Supabase Cloud khi máy tính cá nhân tắt, đảm bảo trạng thái Web luôn trực tuyến (Online) 24/7.
+* 🗑️ **Dọn Sạch 100% Cover Thumbnail Supabase Storage:**
+  - Xóa streamer: Tự động dọn sạch thư mục ảnh `record-thumbnails/{user}/` trong bucket `covers` trên Supabase Storage cùng với dữ liệu database.
+  - Xóa video: Tự động xóa file `.jpg` thumbnail tương ứng trong bucket `covers` song song với việc xóa file trên Google Drive.
+* 📦 **Zero-Loss Staging Queue:**
   - Tự động chia nhỏ video thành các phân đoạn ngắn tải lên Google Drive Staging Queue để chống mất mát dữ liệu khi streamer ngắt kết nối đột ngột hoặc runner hết giờ.
   - Tự động ghép nối video hoàn chỉnh và upload thumbnail khi kết thúc live.
-* **Chuẩn hóa H.264 & Chống Lỗi Bitstream:**
+* 🛡️ **Chuẩn hóa H.264 & Chống Lỗi Bitstream:**
   - Ưu tiên luồng HLS H.264 MPEG-TS, loại bỏ nguy cơ lỗi header NAL Unit FLV (`01 64 00 1f...`).
   - Tự động gắn cờ `+faststart` (moov box ở đầu file) để trình duyệt web phát ngay lập tức.
-* **Tự Phục hồi (Self-Healing Watchdog):**
+* 🩺 **Tự Phục hồi (Self-Healing Watchdog):**
   - Workflow chạy định kỳ mỗi 6 giờ (`0 */6 * * *`) tự động vá lỗi bitstream và bù thumbnail vào Supabase Storage nếu có phiên bị gián đoạn.
-* **Tích hợp Supabase & Web API:**
+* 🌐 **Tích hợp Supabase & Web API:**
   - Đồng bộ danh sách theo dõi qua bảng `tiktok_streamers`.
   - Lưu trữ thông tin video và link thumbnail công khai qua bảng `tiktok_recordings`.
 
@@ -66,21 +76,17 @@ Website chỉ cần đọc bảng `tiktok_recordings` từ Supabase:
 
 ---
 
-## 🧪 Kiểm thử Cục bộ (Local Verification)
+## 🧪 Kiểm thử Cục bộ (Tùy chọn dành cho Lập trình / Debug)
+
+> *Lưu ý: Bạn không cần chạy các lệnh này nếu chỉ muốn sử dụng hệ thống. Hệ thống đã tự động chạy 24/7 trên GitHub Actions.*
 
 ```bash
 # Cài đặt thư viện
 pip install -r requirements.txt
 
-# Chạy bộ kiểm thử toàn diện (78 bài test)
+# Chạy bộ kiểm thử toàn diện (78 bài test đạt chuẩn)
 python -B -m unittest test_audit_suite.py
 
-# Chạy bộ kiểm thử đa luồng và đồng thời (26 bài test)
-python -B -m unittest test_challenger_concurrency.py
-
-# Chạy trọn vẹn cả hai bộ: 104/104 bài test
-python -B -m unittest test_audit_suite test_challenger_concurrency
-
-# Chạy daemon ghi hình tại máy cá nhân (hỗ trợ GPU NVENC)
+# (Tùy chọn) Chạy thử daemon ghi hình tại máy cá nhân với GPU NVENC
 run_cloud_daemon.bat
 ```

@@ -1,18 +1,20 @@
-# 📖 HƯỚNG DẪN SỬ DỤNG HỆ THỐNG TIKTOK RECORDER 24/7 & CLOUD API (v66)
+# 📖 HƯỚNG DẪN SỬ DỤNG HỆ THỐNG TIKTOK RECORDER 24/7 & CLOUD API (v67)
 
-Hệ thống tự động theo dõi và ghi hình livestream TikTok chuẩn HD H.264 (AVC), tự động đóng gói qua **Staging Queue**, đồng bộ dữ liệu vào **Supabase** và lưu trữ video vĩnh viễn trên **Google Drive**.
+Hệ thống tự động theo dõi và ghi hình livestream TikTok chuẩn HD H.264 (AVC), tự động đóng gói qua **Staging Queue**, đồng bộ dữ liệu vào **Supabase** và lưu trữ video vĩnh viễn trên **Google Drive 5TB**.
 
-Hệ thống hoạt động **hoàn toàn miễn phí 24/7 trên đám mây (GitHub Actions Public Repository - Không giới hạn quota 2.000 phút)**, hỗ trợ chạy song song tại máy cá nhân với GPU NVIDIA NVENC và cung cấp API kết nối trực tiếp với website.
+> [!IMPORTANT]
+> **HỆ THỐNG HOẠT ĐỘNG 100% TỰ ĐỘNG TRÊN ĐÁM MÂY — KỂ CẢ KHI TẮT MÁY TÍNH CÁ NHÂN!**
+> Bạn **KHÔNG CẦN** bật máy tính cá nhân. Toàn bộ tiến trình theo dõi, ghi hình, chuyển đổi video, upload Google Drive và Web API đều chạy 24/7 độc lập trên nền tảng **GitHub Actions Cloud** (hoàn toàn miễn phí, không giới hạn số phút) kết hợp cùng **Supabase Cloud** và **Vercel Edge**.
 
 ---
 
 ## 📑 MỤC LỤC
-1. [Kiến trúc Hệ thống 24/7 Không Giới Hạn Quota](#1-kiến-trúc-hệ-thống-247-không-giới-hạn-quota)
+1. [Kiến trúc Hệ thống Đám Mây 24/7 (Không Cần Bật Máy Tính)](#1-kiến-trúc-hệ-thống-đám-mây-247-không-cần-bật-máy-tính)
 2. [Các Tính Năng Nổi Bật](#2-các-tính-năng-nổi-bật)
 3. [Cấu Trúc Lưu Trữ (Google Drive & Supabase)](#3-cấu-trúc-lưu-trữ-google-drive--supabase)
 4. [Vận hành 24/7 trên GitHub Actions (Cloud Runner)](#4-vận-hành-247-trên-github-actions-cloud-runner)
-5. [Vận hành Cục bộ trên Máy tính Cá nhân (GPU NVENC)](#5-vận-hành-cục-bộ-trên-máy-tính-cá-nhân-gpu-nvenc)
-6. [Tích hợp API vào Website & Ứng dụng](#6-tích-hợp-api-vào-website--ứng-dụng)
+5. [Môi trường Kiểm thử Cục bộ (Tùy chọn dành cho Lập trình / Debug)](#5-môi-trường-kiểm-thử-cục-bộ-tùy-chọn-dành-cho-lập-trình--debug)
+6. [Tích hợp Web API & Chế độ Chuyển mạch Đám mây Serverless 24/7](#6-tích-hợp-web-api--chế-độ-chuyển-mạch-đám-mây-serverless-247)
 7. [Xem Video Trực Tuyến & Tải Tốc Độ Cao (Google Edge CDN)](#7-xem-video-trực-tuyến--tải-tốc-độ-cao-google-edge-cdn)
 8. [Giải thích Chi tiết Các File trong Mã Nguồn](#8-giải-thích-chi-tiết-các-file-trong-mã-nguồn)
 9. [Cập nhật Cookie TikTok Khi Cần](#9-cập-nhật-cookie-tiktok-khi-cần)
@@ -65,6 +67,9 @@ Hệ thống hoạt động **hoàn toàn miễn phí 24/7 trên đám mây (Git
 
 ## 2. CÁC TÍNH NĂNG NỔI BẬT
 
+* ☁️ **Hoạt Động 100% Đám Mây 24/7 (Không Phụ Thuộc Máy Tính Cá Nhân):**
+  - Quét danh sách streamer mỗi 20 giây và tự động ghi hình trên GitHub Actions Cloud.
+  - Người dùng có thể tắt máy tính hoàn toàn, hệ thống vẫn duy trì ghi hình, upload Google Drive và cập nhật Supabase 24/7.
 * ♾️ **100% Unlimited Minutes (Public Repo):**
   - Chạy trên GitHub Actions ở chế độ **Public Repository** được hưởng chính sách **Không giới hạn phút chạy miễn phí** của GitHub (giải quyết triệt để hạn mức 2.000 phút/tháng của repo Private).
   - Toàn bộ thông tin nhạy cảm (`GDRIVE_REFRESH_TOKEN`, `SUPABASE_KEY`...) được bảo vệ tuyệt đối qua **GitHub Secrets**, `.gitignore` ngăn chặn 100% rò rỉ mã bí mật.
@@ -72,14 +77,19 @@ Hệ thống hoạt động **hoàn toàn miễn phí 24/7 trên đám mây (Git
   - Cơ chế nhận diện luồng thông minh: Luôn ưu tiên luồng chuẩn **HLS H.264 (MPEG-TS)** thay vì FLV.
   - Tích hợp bộ tiền xử lý **ISO/IEC 14496-15 AVCC Bitstream Sanitizer** trong `auto_h264.py`: Tự động loại bỏ mã rác `01 64 00 1f...` do TikTok nhúng vào đầu keyframe, giải quyết dứt điểm lỗi màn hình đen hoặc thông báo *"Video file is processing slowly due to exceeding upload quota limits"* trên Google Drive.
 * 📦 **Zero-Loss Staging Queue:**
-  - Tự động chia nhỏ video thành các phân đoạn ngắn lưu trữ tạm trong thư mục `staging/` trên Google Drive. Khi streamer ngắt kết nối đột ngột hoặc runner hết phiên 46 phút, không bao giờ bị mất video.
+  - Tự động chia nhỏ video thành các phân đoạn ngắn lưu trữ tạm trong thư mục `staging/` trên Google Drive. Khi streamer ngắt kết nối đột ngột hoặc runner hết phiên, không bao giờ bị mất video.
   - Tự động ghép nối video hoàn chỉnh ngay khi live kết thúc, trích xuất ảnh thumbnail chính giữa video và truyền `drive_thumb_id` lên Supabase.
+* 🗑️ **Dọn Sạch 100% Cover Thumbnail Supabase Storage Khi Xóa:**
+  - Khi xóa streamer: Tự động quét và dọn sạch toàn bộ thư mục ảnh thumbnail `record-thumbnails/{user}/` trong bucket `covers` trên Supabase Storage, đồng thời xóa bản ghi trong database.
+  - Khi xóa video lẻ hoặc hàng loạt: Tự động xóa chính xác file ảnh `.jpg` tương ứng trong bucket `covers`, không để lại rác bộ nhớ.
+* ⚡ **Serverless Cloud Failover 24/7 Trên Web:**
+  - Web API trên Vercel tự động nhận diện và chuyển mạch sang Supabase Cloud trong 0.05 giây nếu máy tính cá nhân tắt, giữ trạng thái trực tuyến (Online) 24/7 liên tục.
 * 🩺 **Watchdog Tự Lành (Self-Healing Engine):**
   - Workflow `.github/workflows/repair-watchdog.yml` chạy tự động mỗi 6 giờ (`0 */6 * * *`) kích hoạt `repair_cloud_videos_engine.py --today`.
   - Tự động rà soát mọi bản ghi trong ngày, sửa chữa bitstream in-place trên Google Drive và bù thumbnail vào Supabase Storage nếu có phiên bị lỗi mạng.
 * ⚡ **Live-End Watchdog & Tách File 1 Tiếng:**
   - Tự động nhận biết phòng live tắt sóng chỉ trong 15-30 giây.
-  - Hỗ trợ tách file 1 giờ (`MAX_CHUNK_SECONDS = 3600`) cho các phiên phát trực tiếp xuyên đêm, tránh tràn bộ nhớ đệm ổ cứng.
+  - Hỗ trợ tách file 1 giờ (`MAX_CHUNK_SECONDS = 3600`) cho các phiên phát trực tiếp xuyên đêm, tránh tràn bộ nhớ đệm.
 * 🌐 **Google Edge CDN Tua Video Tức Thì (HTTP Range 206):**
   - Tự động gán cờ `+faststart` (đưa atom `moov` lên đầu file) cho phép trình duyệt HTML5 phát ngay lập tức và tua mượt mà đến mọi giây của video.
 
@@ -136,57 +146,47 @@ Vào **Settings** ➔ **Secrets and variables** ➔ **Actions** ➔ Bấm **New 
 
 ---
 
-## 5. VẬN HÀNH CỤC BỘ TRÊN MÁY TÍNH CÁ NHÂN (GPU NVENC)
+## 5. MÔI TRƯỜNG KIỂM THỬ CỤC BỘ (TÙY CHỌN DÀNH CHO LẬP TRÌNH / DEBUG)
 
-Nếu bạn muốn chạy ghi hình trực tiếp tại máy tính cá nhân để tận dụng card đồ họa rời NVIDIA:
+> [!NOTE]
+> **HỆ THỐNG KHÔNG YÊU CẦU BẬT MÁY TÍNH CÁ NHÂN ĐỂ HOẠT ĐỘNG!**
+> Việc chạy cục bộ chỉ là **tùy chọn phụ** phục vụ mục đích kiểm thử code khi lập trình (dev/debug) hoặc khi bạn chủ động muốn dùng thêm GPU rời NVIDIA (NVENC).
+> Trong chế độ hoạt động bình thường, toàn bộ tiến trình ghi hình tự động chạy trên **GitHub Actions Cloud** và Web API chạy trên **Vercel Edge + Supabase Cloud**. Bạn hoàn toàn có thể tắt máy tính cá nhân đi ngủ.
+
+Nếu cần chạy thử nghiệm hoặc gỡ lỗi cục bộ trên máy tính cá nhân:
 1. Cài đặt thư viện Python:
    ```cmd
    pip install -r requirements.txt
    ```
-2. Cấu hình file `config.json` (tham khảo mẫu `config.example.json`).
-3. Khởi động daemon tự phục hồi:
+2. Chạy bộ kiểm thử 78 test cases:
+   ```cmd
+   python test_audit_suite.py
+   ```
+3. Chạy daemon ghi hình thử nghiệm với GPU:
    ```cmd
    run_cloud_daemon.bat
    ```
-   *File batch này tích hợp sẵn bộ canh chừng (Watchdog), tự động khởi động lại sau 5 giây nếu gặp sự cố mạng.*
 
 ---
 
-## 6. TÍCH HỢP API VÀO WEBSITE & ỨNG DỤNG
+## 6. TÍCH HỢP WEB API & CHẾ ĐỘ CHUYỂN MẠCH ĐÁM MÂY SERVERLESS 24/7
 
-### Cách 1: Serverless qua Supabase API (Khuyên dùng - 0 Giây Chờ Đợi)
-Website của bạn không cần dựng server trung gian, gọi trực tiếp Supabase REST API:
+Website Kuru Hub (`web-truyen`) được thiết kế theo kiến trúc **Cloud-First & Zero-Downtime**:
 
-```javascript
-import { createClient } from '@supabase/supabase-js';
+### 1. Cơ chế Tự Động Chuyển Mạch Đám Mây (Serverless Cloud Failover)
+* **Khi máy tính cá nhân BẬT:** Web API tự động định tuyến về máy tính cá nhân (qua Cloudflare Tunnel) để tối ưu độ trễ.
+* **Khi máy tính cá nhân TẮT:** Web API trên Vercel tự động nhận diện và chuyển mạch sang **Supabase Cloud trong 0.05 giây**:
+  - Không gây timeout hay lỗi `502 Ngoại tuyến`.
+  - Hiển thị trực tuyến 24/7 (`mode: cloud_supabase_247`).
+  - Cho phép xem streamer, kiểm tra live status, thêm/xóa streamer bình thường.
 
-const supabase = createClient('SUPABASE_URL', 'SUPABASE_KEY');
+### 2. Quản lý Streamer & Xóa Dữ Liệu Sạch Sẽ (Cả DB lẫn Storage Covers)
+* **Thêm streamer mới:** Lưu vào Supabase bảng `tiktok_streamers`. Runner đám mây trên GitHub Actions tự động quét và thu sau tối đa 20 giây.
+* **Xóa streamer:** Xóa khỏi `tiktok_streamers`, `tiktok_recordings`, đồng thời **xóa sạch toàn bộ ảnh thumbnail** trong bucket `covers` trên Supabase Storage (`record-thumbnails/{user}/`).
+* **Xóa video đã ghi:** Xóa hàng tương ứng trong `tiktok_recordings`, xóa video trên Google Drive và **xóa sạch file ảnh thumbnail `.jpg`** tương ứng trong bucket `covers`.
 
-// 1. Thêm streamer mới cần theo dõi
-async function addStreamer(username) {
-  const clean = username.trim().replace('@', '').toLowerCase();
-  await supabase.from('tiktok_streamers').upsert({ username: clean });
-  console.log(`Đã thêm @${clean}. Bot sẽ tự động quét và ghi sau tối đa 20 giây!`);
-}
-
-// 2. Xóa streamer
-async function removeStreamer(username) {
-  const clean = username.trim().replace('@', '').toLowerCase();
-  await supabase.from('tiktok_streamers').delete().eq('username', clean);
-}
-
-// 3. Lấy danh sách video mới nhất
-async function getRecordings() {
-  const { data } = await supabase
-    .from('tiktok_recordings')
-    .select('*')
-    .order('created_at', { ascending: false });
-  return data;
-}
-```
-
-### Cách 2: Kích hoạt Ghi hình Tức thì qua GitHub Actions Dispatch API
-Gửi request từ Next.js / Node.js backend:
+### 3. Kích hoạt Ghi hình Tức thì qua GitHub Actions Dispatch API
+Gửi request từ Next.js / Node.js backend khi cần ép runner khởi chạy ngay lập tức:
 ```javascript
 await fetch('https://api.github.com/repos/kurrukado/tiktok-recorder/actions/workflows/recorder.yml/dispatches', {
   method: 'POST',
